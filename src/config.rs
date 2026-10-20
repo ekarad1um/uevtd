@@ -1,0 +1,633 @@
+//! Configuration: schema with defaults, validation, atomic persistence, and
+//! live distribution to components through a `watch` channel.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Map, Value};
+use tokio::sync::watch;
+use tracing::info;
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub inbound: Inbound,
+    pub storage: Storage,
+    pub outbound: Outbound,
+    pub api: Api,
+    pub log: Log,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Inbound {
+    pub path: PathBuf,
+    pub mode: Mode,
+    pub max_message_bytes: usize,
+    pub max_connections: usize,
+}
+
+impl Default for Inbound {
+    fn default() -> Self {
+        Self {
+            path: "/run/uevtd/in.sock".into(),
+            mode: Mode(0o660),
+            max_message_bytes: 1 << 20,
+            max_connections: 64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Storage {
+    pub path: PathBuf,
+    pub max_bytes: u64,
+    pub segment_bytes: u64,
+    /// 0 syncs after every batch; otherwise at most once per interval.
+    pub sync_interval_ms: u64,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            path: "/var/lib/uevtd".into(),
+            max_bytes: 256 << 20,
+            segment_bytes: 8 << 20,
+            sync_interval_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Outbound {
+    pub channels: BTreeMap<String, Channel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Channel {
+    Http(Http),
+    Mqtt(Mqtt),
+}
+
+impl Channel {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Channel::Http(c) => c.enabled,
+            Channel::Mqtt(c) => c.enabled,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Channel::Http(_) => "http",
+            Channel::Mqtt(_) => "mqtt",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Http {
+    pub enabled: bool,
+    pub url: String,
+    pub method: String,
+    pub headers: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+impl Default for Http {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: String::new(),
+            method: "POST".into(),
+            headers: BTreeMap::new(),
+            timeout_ms: 10_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mqtt {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub topic: String,
+    pub client_id: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub qos: u8,
+    pub retain: bool,
+    pub keep_alive_s: u64,
+    /// Maximum unacknowledged publishes in flight.
+    pub inflight: u16,
+    /// Payloads larger than this are rejected instead of published.
+    pub max_packet_bytes: usize,
+}
+
+impl Default for Mqtt {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: String::new(),
+            port: 1883,
+            tls: false,
+            topic: String::new(),
+            client_id: "uevtd".into(),
+            username: None,
+            password: None,
+            qos: 1,
+            retain: false,
+            keep_alive_s: 30,
+            inflight: 32,
+            max_packet_bytes: 1 << 20,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Api {
+    pub path: PathBuf,
+    pub mode: Mode,
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Self {
+            path: "/run/uevtd/api.sock".into(),
+            mode: Mode(0o660),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Log {
+    /// `tracing` filter directives, e.g. `info` or `info,uevtd::storage=debug`.
+    pub filter: String,
+    pub format: LogFormat,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            filter: "info".into(),
+            format: LogFormat::Text,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+/// Unix permission bits, written as an octal string such as `"0660"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mode(pub u32);
+
+impl Serialize for Mode {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{:04o}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        u32::from_str_radix(&text, 8)
+            .ok()
+            .filter(|m| *m <= 0o777)
+            .map(Mode)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "invalid mode {text:?}; expected octal such as \"0660\""
+                ))
+            })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("invalid JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+}
+
+fn ensure(ok: bool, message: impl FnOnce() -> String) -> Result<(), Error> {
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(message()))
+    }
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<(), Error> {
+        let inbound = &self.inbound;
+        ensure(!inbound.path.as_os_str().is_empty(), || {
+            "inbound.path must not be empty".into()
+        })?;
+        ensure(!self.api.path.as_os_str().is_empty(), || {
+            "api.path must not be empty".into()
+        })?;
+        ensure(inbound.path != self.api.path, || {
+            "inbound.path and api.path must differ".into()
+        })?;
+        ensure((1..=64 << 20).contains(&inbound.max_message_bytes), || {
+            "inbound.max_message_bytes must be between 1 and 67108864".into()
+        })?;
+        ensure(inbound.max_connections >= 1, || {
+            "inbound.max_connections must be at least 1".into()
+        })?;
+
+        let storage = &self.storage;
+        ensure(!storage.path.as_os_str().is_empty(), || {
+            "storage.path must not be empty".into()
+        })?;
+        ensure(storage.segment_bytes >= 64 << 10, || {
+            "storage.segment_bytes must be at least 65536".into()
+        })?;
+        ensure(storage.max_bytes >= 2 * storage.segment_bytes, || {
+            "storage.max_bytes must be at least twice storage.segment_bytes".into()
+        })?;
+
+        for (name, channel) in &self.outbound.channels {
+            validate_name(name)?;
+            match channel {
+                Channel::Http(c) => validate_http(name, c)?,
+                Channel::Mqtt(c) => validate_mqtt(name, c)?,
+            }
+        }
+
+        tracing_subscriber::EnvFilter::try_new(&self.log.filter)
+            .map_err(|e| Error::Invalid(format!("log.filter: {e}")))?;
+        Ok(())
+    }
+
+    /// Copy with secrets replaced, for logging.
+    pub fn redacted(&self) -> Config {
+        let mut copy = self.clone();
+        for channel in copy.outbound.channels.values_mut() {
+            match channel {
+                Channel::Http(c) => {
+                    for (name, value) in c.headers.iter_mut() {
+                        let lower = name.to_ascii_lowercase();
+                        if ["authorization", "token", "key", "secret", "cookie"]
+                            .iter()
+                            .any(|s| lower.contains(s))
+                        {
+                            *value = "***".into();
+                        }
+                    }
+                }
+                Channel::Mqtt(c) => {
+                    if c.password.is_some() {
+                        c.password = Some("***".into());
+                    }
+                }
+            }
+        }
+        copy
+    }
+
+    /// Fields that differ from the configuration the process started with and
+    /// only take effect after a restart.
+    pub fn restart_required(&self, boot: &Config) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.storage.path != boot.storage.path {
+            fields.push("storage.path");
+        }
+        if self.log.format != boot.log.format {
+            fields.push("log.format");
+        }
+        fields
+    }
+
+    fn changed_sections(&self, other: &Config) -> Vec<&'static str> {
+        let mut sections = Vec::new();
+        if self.inbound != other.inbound {
+            sections.push("inbound");
+        }
+        if self.storage != other.storage {
+            sections.push("storage");
+        }
+        if self.outbound != other.outbound {
+            sections.push("outbound");
+        }
+        if self.api != other.api {
+            sections.push("api");
+        }
+        if self.log != other.log {
+            sections.push("log");
+        }
+        sections
+    }
+}
+
+fn validate_name(name: &str) -> Result<(), Error> {
+    let mut chars = name.chars();
+    let ok = name.len() <= 64
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    ensure(ok, || {
+        format!("channel name {name:?} must match [A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}")
+    })
+}
+
+fn validate_http(name: &str, c: &Http) -> Result<(), Error> {
+    let url = reqwest::Url::parse(&c.url)
+        .map_err(|e| Error::Invalid(format!("channel {name}: url: {e}")))?;
+    ensure(matches!(url.scheme(), "http" | "https"), || {
+        format!("channel {name}: url must use http or https")
+    })?;
+    reqwest::Method::from_bytes(c.method.to_ascii_uppercase().as_bytes())
+        .map_err(|e| Error::Invalid(format!("channel {name}: method: {e}")))?;
+    for (k, v) in &c.headers {
+        reqwest::header::HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| Error::Invalid(format!("channel {name}: header {k:?}: {e}")))?;
+        reqwest::header::HeaderValue::from_str(v)
+            .map_err(|e| Error::Invalid(format!("channel {name}: header {k:?}: {e}")))?;
+    }
+    ensure(c.timeout_ms >= 1, || {
+        format!("channel {name}: timeout_ms must be at least 1")
+    })
+}
+
+fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
+    ensure(!c.host.is_empty(), || {
+        format!("channel {name}: host must not be empty")
+    })?;
+    ensure(c.port != 0, || {
+        format!("channel {name}: port must not be 0")
+    })?;
+    ensure(
+        !c.topic.is_empty() && rumqttc::valid_topic(&c.topic),
+        || format!("channel {name}: topic must be a non-empty publish topic without wildcards"),
+    )?;
+    ensure(!c.client_id.is_empty(), || {
+        format!("channel {name}: client_id must not be empty")
+    })?;
+    ensure(c.qos <= 2, || {
+        format!("channel {name}: qos must be 0, 1 or 2")
+    })?;
+    ensure(c.keep_alive_s >= 1, || {
+        format!("channel {name}: keep_alive_s must be at least 1")
+    })?;
+    ensure(c.inflight >= 1, || {
+        format!("channel {name}: inflight must be at least 1")
+    })?;
+    ensure(c.max_packet_bytes >= 1, || {
+        format!("channel {name}: max_packet_bytes must be at least 1")
+    })
+}
+
+/// Reads and validates the configuration file.
+pub fn load(path: &Path) -> Result<Config, Error> {
+    let text = fs::read_to_string(path)?;
+    let config: Config = serde_json::from_str(&text)?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// Like [`load`], but a missing file yields the defaults, which are written
+/// to the path so the effective configuration is visible on disk.
+pub fn load_or_init(path: &Path) -> Result<Config, Error> {
+    if path.exists() {
+        return load(path);
+    }
+    let config = Config::default();
+    config.validate()?;
+    save(path, &config)?;
+    info!(path = %path.display(), "configuration file not found; wrote defaults");
+    Ok(config)
+}
+
+/// Writes the configuration atomically: temp file (mode 0600), fsync, rename,
+/// directory fsync.
+pub fn save(path: &Path, config: &Config) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    fs::create_dir_all(&dir)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.json");
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    serde_json::to_writer_pretty(&mut file, config).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    File::open(&dir)?.sync_all()?;
+    Ok(())
+}
+
+/// RFC 7386 JSON merge patch.
+pub fn merge_patch(target: &mut Value, patch: &Value) {
+    match patch {
+        Value::Object(patch) => {
+            if !target.is_object() {
+                *target = Value::Object(Map::new());
+            }
+            let target = target.as_object_mut().expect("object");
+            for (key, value) in patch {
+                if value.is_null() {
+                    target.remove(key);
+                } else {
+                    merge_patch(target.entry(key.clone()).or_insert(Value::Null), value);
+                }
+            }
+        }
+        _ => *target = patch.clone(),
+    }
+}
+
+/// The live configuration: the current value, its file, and a channel that
+/// components watch for changes.
+pub struct Store {
+    path: PathBuf,
+    tx: watch::Sender<Arc<Config>>,
+    write: Mutex<()>,
+}
+
+impl Store {
+    pub fn new(path: PathBuf, config: Config) -> Self {
+        let (tx, _) = watch::channel(Arc::new(config));
+        Self {
+            path,
+            tx,
+            write: Mutex::new(()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn current(&self) -> Arc<Config> {
+        self.tx.borrow().clone()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<Arc<Config>> {
+        self.tx.subscribe()
+    }
+
+    /// Validates, persists and publishes a new configuration.
+    pub fn update(&self, config: Config) -> Result<Arc<Config>, Error> {
+        config.validate()?;
+        let _guard = self.write.lock().unwrap();
+        if *self.current() == config {
+            return Ok(self.current());
+        }
+        save(&self.path, &config)?;
+        Ok(self.publish(config))
+    }
+
+    /// Re-reads the file and publishes it without writing it back.
+    pub fn reload(&self) -> Result<Arc<Config>, Error> {
+        let _guard = self.write.lock().unwrap();
+        let config = load(&self.path)?;
+        if *self.current() == config {
+            return Ok(self.current());
+        }
+        Ok(self.publish(config))
+    }
+
+    fn publish(&self, config: Config) -> Arc<Config> {
+        let changed = self.current().changed_sections(&config);
+        let config = Arc::new(config);
+        self.tx.send_replace(config.clone());
+        info!(sections = ?changed, "configuration updated");
+        config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(url: &str) -> Channel {
+        Channel::Http(Http {
+            url: url.into(),
+            ..Http::default()
+        })
+    }
+
+    #[test]
+    fn defaults_are_valid_and_round_trip() {
+        let config = Config::default();
+        config.validate().unwrap();
+        let text = serde_json::to_string_pretty(&config).unwrap();
+        assert!(text.contains("\"mode\": \"0660\""));
+        assert_eq!(serde_json::from_str::<Config>(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn channels_are_tagged_and_strict() {
+        let text = r#"{"outbound":{"channels":{"a":{"type":"http","url":"http://h/x"},
+            "b":{"type":"mqtt","host":"h","topic":"t"}}}}"#;
+        let config: Config = serde_json::from_str(text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.outbound.channels.len(), 2);
+        assert!(
+            serde_json::from_str::<Config>(
+                r#"{"outbound":{"channels":{"a":{"type":"http","url":"http://h","bogus":1}}}}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<Config>(r#"{"inbound":{"mode":"999"}}"#).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_bad_values() {
+        let mut config = Config::default();
+        config.storage.max_bytes = config.storage.segment_bytes;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config
+            .outbound
+            .channels
+            .insert("bad name".into(), http("http://h/"));
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config
+            .outbound
+            .channels
+            .insert("a".into(), http("ftp://h/"));
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.outbound.channels.insert(
+            "m".into(),
+            Channel::Mqtt(Mqtt {
+                host: "h".into(),
+                topic: "a/#".into(),
+                ..Mqtt::default()
+            }),
+        );
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.log.filter = "uevtd=nolevel".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn merge_patch_follows_rfc7386() {
+        let mut doc = serde_json::json!({"a": {"b": 1, "c": 2}, "d": [1]});
+        merge_patch(
+            &mut doc,
+            &serde_json::json!({"a": {"b": null, "e": 3}, "d": 4}),
+        );
+        assert_eq!(doc, serde_json::json!({"a": {"c": 2, "e": 3}, "d": 4}));
+    }
+
+    #[test]
+    fn store_persists_and_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = Store::new(path.clone(), load_or_init(&path).unwrap());
+        let mut rx = store.subscribe();
+        let mut next = Config::default();
+        next.outbound
+            .channels
+            .insert("a".into(), http("http://h/x"));
+        store.update(next.clone()).unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(**rx.borrow_and_update(), next);
+        assert_eq!(load(&path).unwrap(), next);
+        assert_eq!(store.redacted_for_test(), next.redacted());
+    }
+
+    impl Store {
+        fn redacted_for_test(&self) -> Config {
+            self.current().redacted()
+        }
+    }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "uevtd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Message forwarding daemon: Unix socket in, durable log, HTTP/MQTT out"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+crc32fast = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
+rustls-platform-verifier = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,44 @@
+{
+  "inbound": {
+    "path": "/run/uevtd/in.sock",
+    "mode": "0660",
+    "max_message_bytes": 1048576,
+    "max_connections": 64
+  },
+  "storage": {
+    "path": "/var/lib/uevtd",
+    "max_bytes": 268435456,
+    "segment_bytes": 8388608,
+    "sync_interval_ms": 0
+  },
+  "outbound": {
+    "channels": {
+      "ingest": {
+        "type": "http",
+        "enabled": true,
+        "url": "https://collector.example/ingest",
+        "method": "POST",
+        "headers": { "Authorization": "Bearer replace-me" },
+        "timeout_ms": 10000
+      },
+      "broker": {
+        "type": "mqtt",
+        "enabled": false,
+        "host": "broker.example",
+        "port": 8883,
+        "tls": true,
+        "topic": "devices/42/events",
+        "client_id": "uevtd-42",
+        "username": null,
+        "password": null,
+        "qos": 1,
+        "retain": false,
+        "keep_alive_s": 30,
+        "inflight": 32,
+        "max_packet_bytes": 1048576
+      }
+    }
+  },
+  "api": { "path": "/run/uevtd/api.sock", "mode": "0660" },
+  "log": { "filter": "info", "format": "text" }
+}
