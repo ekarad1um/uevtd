@@ -14,10 +14,10 @@ const DEFAULT_CONFIG: &str = "/etc/uevtd/config.json";
 const USAGE: &str = "\
 usage: uevtd [--config PATH]
 
-  --config PATH   configuration file (default: /etc/uevtd/config.json);
-                  written with defaults when it does not exist
-  --version       print the version
-  --help          print this help";
+  -c, --config PATH   configuration file (default: /etc/uevtd/config.json);
+                      written with defaults when it does not exist
+  -V, --version       print the version
+  -h, --help          print this help";
 
 fn main() -> ExitCode {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
@@ -54,6 +54,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        error!(%info, "panic");
+        default_hook(info);
+    }));
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

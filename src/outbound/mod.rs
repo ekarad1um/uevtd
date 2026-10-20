@@ -174,17 +174,22 @@ async fn stop(name: &str, channel: Running) {
 
 /// The persisted cursor, or the current head for a channel without one. A
 /// fresh start is persisted immediately so the backlog that accumulates before
-/// the first delivery survives a restart.
+/// the first delivery survives a restart. A cursor past the head (the log was
+/// repaired by hand) is reset to the head, so new records are not skipped.
 async fn initial_cursor(storage: &Arc<Storage>, name: &str) -> u64 {
     let fallback = storage.head_seq() + 1;
     let (storage, name) = (storage.clone(), name.to_string());
     let task = tokio::task::spawn_blocking(move || {
+        let head = storage.head_seq();
         match storage.load_cursor(&name) {
-            Ok(Some(seq)) => return seq,
+            Ok(Some(seq)) if seq <= head + 1 => return seq,
+            Ok(Some(seq)) => {
+                warn!(channel = %name, cursor = seq, head, "cursor is past the head; starting at head")
+            }
             Ok(None) => {}
             Err(e) => warn!(channel = %name, error = %e, "unreadable cursor; starting at head"),
         }
-        let start = storage.head_seq() + 1;
+        let start = head + 1;
         if let Err(e) = storage.save_cursor(&name, start) {
             warn!(channel = %name, error = %e, "could not persist initial cursor");
         }
@@ -341,6 +346,23 @@ impl CursorStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Limits;
+
+    #[tokio::test]
+    async fn initial_cursor_is_persisted_and_never_past_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
+        assert_eq!(initial_cursor(&storage, "fresh").await, 1);
+        assert_eq!(storage.load_cursor("fresh").unwrap(), Some(1));
+        storage.save_cursor("ahead", 50).unwrap();
+        assert_eq!(initial_cursor(&storage, "ahead").await, 1);
+        assert_eq!(storage.load_cursor("ahead").unwrap(), Some(1));
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

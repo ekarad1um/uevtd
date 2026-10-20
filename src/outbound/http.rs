@@ -46,8 +46,9 @@ pub async fn run(
             }
         }
     };
-    info!(url = %template.url, method = %template.method, "forwarding over http");
+    info!(url = %config::redacted_url(&cfg.url), method = %template.method, "forwarding over http");
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let records = tokio::select! {
             records = feed.next(BATCH) => records,
@@ -117,9 +118,9 @@ async fn deliver(
             _ = token.cancelled() => return false,
         };
         let failure = match sent {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status = response.status();
-                let _ = response.bytes().await;
+                while let Ok(Some(_)) = response.chunk().await {}
                 if status.is_success() {
                     if attempt > 0 {
                         info!(

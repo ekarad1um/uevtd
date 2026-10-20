@@ -92,7 +92,10 @@ Notes:
   it is exceeded, so retained data stays within one `segment_bytes` of the limit.
   `max_bytes` must be at least `2 * segment_bytes`.
 - `storage.sync_interval_ms = 0` fsyncs after every write batch (group commit
-  during bursts); a positive value syncs at most once per interval.
+  during bursts); a positive value syncs at most once per interval. Records are
+  forwarded and queryable only once synced, so a positive interval adds up to
+  that much latency and a crash can lose at most the unsynced tail, never a
+  record that was already seen.
 - HTTP: every message is one request with the payload as the body and
   `Content-Type: application/json` unless a header overrides it. 2xx is
   delivered; 408, 429, 5xx, timeouts and connection errors are retried with
@@ -102,7 +105,8 @@ Notes:
   advances on `PUBACK`/`PUBCOMP` (QoS 1/2) or when written (QoS 0). On a lost
   connection the daemon reconnects with backoff (1 s to 60 s) and republishes
   unacknowledged messages in order, so duplicates are possible. Payloads above
-  `max_packet_bytes` are rejected and skipped.
+  `max_packet_bytes` are rejected and skipped; keep it below the broker's packet
+  limit, since MQTT 3.1.1 cannot tell an oversized packet from a lost connection.
 - A new channel starts at the current head; disabling a channel keeps its
   cursor; removing it deletes the cursor.
 - All fields apply live except `storage.path` and `log.format`, which are

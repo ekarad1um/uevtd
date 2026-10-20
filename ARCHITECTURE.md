@@ -89,7 +89,8 @@ only place that knows about all of them.
 
 **Transport.** `SOCK_STREAM` Unix domain socket at `inbound.path`, created with
 `inbound.mode` permissions. A stale socket file is removed only after a connect
-attempt is refused, so a second instance fails fast instead of stealing the path.
+attempt is refused, so a second instance fails fast instead of stealing the path;
+anything at the path that is not a socket is an error, never removed.
 
 **Framing.** One message per line, terminated by `\n` (an optional trailing
 `\r` is stripped; empty lines are ignored). Newline framing was chosen because
@@ -172,9 +173,10 @@ a corrupted payload.
    `ts <= S_{i+1}.base_ts` and every record in `S_{i+1}` has `ts >= S_{i+1}.base_ts`.
    A query from time `t` therefore starts at the last segment whose
    `base_ts < t` and never needs to look earlier.
-4. Readers only read below a segment's *committed length*, published by the
-   writer after a batch is fully written. A reader can never observe a partial
-   record, even while the writer is appending.
+4. Readers only read below a segment's *committed length*, which the writer
+   publishes once the data is synced. A reader can never observe a partial
+   record, nor one that a crash could still take back, so a sequence number
+   that was ever delivered or returned by a query is never reused.
 5. A sealed segment's committed length is its file length. The active segment
    is validated on open; a torn tail (crash mid-write) is truncated to the last
    complete, CRC-valid record.
@@ -189,11 +191,13 @@ Inbound connection tasks send `Message { ts, payload }` into a bounded channel
 2. If the active segment has reached `segment_bytes`, seal it and create the
    next one (`first_seq = head + 1`, `base_ts = head_ts`; parent directory
    fsync'd so the file's existence is durable).
-3. Encode the batch into one buffer, `write_all` it, then `fdatasync` according
-   to `sync_interval_ms` (0 = after every batch; otherwise at most once per
-   interval, with a timer so a trailing batch is never left unsynced).
-4. Publish the new head (`watch<u64>`) and the segment's committed length; wake
-   tailing readers.
+3. Encode the batch into one buffer and `write_all` it.
+4. `fdatasync` according to `sync_interval_ms` (0 = after every batch;
+   otherwise at most once per interval, with a timer so a trailing batch is
+   never left unsynced). A successful sync *commits*: it publishes the new head
+   (`watch<u64>`) and the segment's committed length and wakes tailing readers.
+   Until then the batch is invisible, so a positive interval adds up to one
+   interval of forwarding latency in exchange for fewer syncs.
 5. Evict oldest segments while total size exceeds `max_bytes` (never the active one).
 
 During a 1 000 msg/s burst each fsync covers however many messages arrived
@@ -203,12 +207,14 @@ its own fsync, which is the durability one wants for rare events. A dedicated
 thread with synchronous I/O is simpler and faster than `spawn_blocking` per
 batch and keeps file-system latency entirely off the async runtime.
 
-**Write failure.** On an I/O error the batch is dropped and counted, the error
-is logged, and the active file is truncated back to its committed length so a
-partial write can never be followed by valid data. If truncation fails, or an
-fsync fails (the kernel may then have discarded the dirty pages), the segment
-is sealed and the next batch starts a new one, so a possible hole is always at
-the end of a sealed segment and costs at most that segment's unsynced tail.
+**Write failure.** On a write error the batch is dropped and counted, the
+error is logged, and the active file is truncated back to its length before
+the batch so a partial write can never be followed by valid data. If that
+truncation fails, or a sync fails (the kernel may then have discarded the
+dirty pages), everything written since the last successful sync is discarded
+and counted, the file is truncated to its committed length, and the segment is
+sealed so the next batch starts a new one. Nothing visible is ever lost; the
+cost is bounded by one sync interval of unsynced records.
 
 ### 5.5 Eviction and capacity
 
@@ -272,7 +278,8 @@ always when it stops. Writing it at creation is what lets a backlog that
 accumulates before the first successful delivery survive a restart. On restart a channel resumes from its cursor; up to one second of
 already-delivered messages may be delivered again (at-least-once). A cursor
 that points below the eviction horizon jumps forward, and the gap is logged
-and counted as lost.
+and counted as lost. A cursor past the head, which only a hand-repaired log
+can produce, is reset to the head so that new records are not skipped.
 
 ## 6. Outbound
 
@@ -407,8 +414,9 @@ Performed before anything is persisted or applied: socket paths non-empty and
 distinct; `segment_bytes >= 64 KiB`, `max_bytes >= 2 * segment_bytes`; channel
 names `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they become file names); HTTP URL,
 method and header names/values parse; MQTT host and topic non-empty, topic has
-no wildcards, QoS in 0..=2, `inflight >= 1`; log filter parses as a
-`tracing` directive.
+no wildcards, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol field is
+16 bits), `inflight` in 1..=32767 (the packet-id window is twice that);
+`max_connections` in 1..=65536; log filter parses as a `tracing` directive.
 
 ### 7.3 Persistence and live update
 
@@ -486,7 +494,10 @@ adds the last error per component with its timestamp and the
 |-------------------------------------------|---------------------------------------------------------------------------|
 | Crash during a batch write                | Torn tail truncated on next start; those messages are lost (never acked)  |
 | Crash between delivery and cursor save    | Up to ~1 s of messages redelivered                                        |
-| Disk full / write error                   | Batch dropped and counted; file rolled back to committed length           |
+| Disk full / write error                   | Batch dropped and counted; file rolled back to its previous length        |
+| fsync error                               | Unsynced tail discarded and counted; segment sealed; nothing visible lost |
+| Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
+| Log writer thread panics                  | Daemon stops with an error (exit code 1) so the service manager restarts it |
 | Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost; others unaffected     |
 | Target down for longer than retention     | Channel loses the evicted messages, logs the count, continues at the oldest available |
 | Broker drops the session                  | Unacked messages republished (duplicates possible), order preserved       |

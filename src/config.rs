@@ -253,8 +253,8 @@ impl Config {
         ensure((1..=64 << 20).contains(&inbound.max_message_bytes), || {
             "inbound.max_message_bytes must be between 1 and 67108864".into()
         })?;
-        ensure(inbound.max_connections >= 1, || {
-            "inbound.max_connections must be at least 1".into()
+        ensure((1..=65_536).contains(&inbound.max_connections), || {
+            "inbound.max_connections must be between 1 and 65536".into()
         })?;
 
         let storage = &self.storage;
@@ -287,6 +287,7 @@ impl Config {
         for channel in copy.outbound.channels.values_mut() {
             match channel {
                 Channel::Http(c) => {
+                    c.url = redacted_url(&c.url);
                     for (name, value) in c.headers.iter_mut() {
                         let lower = name.to_ascii_lowercase();
                         if ["authorization", "token", "key", "secret", "cookie"]
@@ -341,6 +342,18 @@ impl Config {
     }
 }
 
+/// The URL with any user information replaced, for logging.
+pub fn redacted_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_username("***");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        _ => url.to_string(),
+    }
+}
+
 fn validate_name(name: &str) -> Result<(), Error> {
     let mut chars = name.chars();
     let ok = name.len() <= 64
@@ -387,11 +400,11 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
     ensure(c.qos <= 2, || {
         format!("channel {name}: qos must be 0, 1 or 2")
     })?;
-    ensure(c.keep_alive_s >= 1, || {
-        format!("channel {name}: keep_alive_s must be at least 1")
+    ensure((1..=65_535).contains(&c.keep_alive_s), || {
+        format!("channel {name}: keep_alive_s must be between 1 and 65535")
     })?;
-    ensure(c.inflight >= 1, || {
-        format!("channel {name}: inflight must be at least 1")
+    ensure((1..=32_767).contains(&c.inflight), || {
+        format!("channel {name}: inflight must be between 1 and 32767")
     })?;
     ensure(c.max_packet_bytes >= 1, || {
         format!("channel {name}: max_packet_bytes must be at least 1")
@@ -596,6 +609,30 @@ mod tests {
         let mut config = Config::default();
         config.log.filter = "uevtd=nolevel".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn redaction_hides_secrets() {
+        let mut config = Config::default();
+        config.outbound.channels.insert(
+            "a".into(),
+            Channel::Http(Http {
+                url: "https://user:pw@h/x".into(),
+                headers: BTreeMap::from([
+                    ("Authorization".to_string(), "Bearer t".to_string()),
+                    ("X-Id".to_string(), "1".to_string()),
+                ]),
+                ..Http::default()
+            }),
+        );
+        let redacted = config.redacted();
+        let Channel::Http(c) = &redacted.outbound.channels["a"] else {
+            panic!("http channel");
+        };
+        assert_eq!(c.url, "https://***@h/x");
+        assert_eq!(c.headers["Authorization"], "***");
+        assert_eq!(c.headers["X-Id"], "1");
+        assert_eq!(redacted_url("https://h/x"), "https://h/x");
     }
 
     #[test]

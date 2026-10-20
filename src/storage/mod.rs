@@ -3,8 +3,8 @@
 //!
 //! Concurrency model: one writer (a dedicated thread) mutates files and the
 //! index; readers hold their own file handles and only read below the
-//! committed length published in the index. Eviction removes whole sealed
-//! segments under the index lock.
+//! committed length published in the index, which covers synced data only.
+//! Eviction removes whole sealed segments under the index lock.
 
 mod segment;
 
@@ -162,7 +162,7 @@ impl Storage {
                         index.head_ts = ts;
                     }
                     None => {
-                        index.head_seq = first_seq - 1;
+                        index.head_seq = first_seq.saturating_sub(1);
                         index.head_ts = base_ts;
                     }
                 }
@@ -360,14 +360,21 @@ fn sync_dir(dir: &Path) {
 struct Active {
     first_seq: u64,
     file: File,
+    /// Bytes written, including those not yet synced.
     len: u64,
+    /// Bytes synced and published to readers.
+    committed: u64,
 }
 
-/// The single writer. Owns the active segment file; publishes commits to the
-/// index and the head watch.
+/// The single writer. Owns the active segment file. A batch becomes visible
+/// to readers only once it is synced, so a crash can never take back a record
+/// that a channel delivered or a query returned, nor reuse its sequence number.
 pub struct Writer {
     storage: Arc<Storage>,
     active: Option<Active>,
+    /// Last written sequence number and timestamp; the index holds the committed ones.
+    head_seq: u64,
+    head_ts: i64,
     buf: Vec<u8>,
     unsynced: bool,
     last_sync: Instant,
@@ -378,9 +385,15 @@ pub struct Writer {
 
 impl Writer {
     pub fn new(storage: Arc<Storage>) -> Writer {
+        let (head_seq, head_ts) = {
+            let index = storage.index.lock().unwrap();
+            (index.head_seq, index.head_ts)
+        };
         Writer {
             storage,
             active: None,
+            head_seq,
+            head_ts,
             buf: Vec::with_capacity(MAX_BATCH_BYTES),
             unsynced: false,
             last_sync: Instant::now(),
@@ -397,28 +410,24 @@ impl Writer {
         self.last_sync.elapsed()
     }
 
-    /// Appends a batch as one write. With `sync`, the data is durable before
-    /// it becomes visible to readers; on any failure the file is rolled back
-    /// to its committed length and nothing of the batch is visible.
+    /// Appends a batch as one write. With `sync` it is committed before this
+    /// returns; otherwise it stays invisible until the next [`Writer::sync`].
+    /// On a write failure the file is rolled back and the batch is dropped.
     pub fn append(&mut self, batch: &[Message], sync: bool) -> io::Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
         let segment_bytes = self.storage.segment_bytes.load(Relaxed);
         if self.active.as_ref().is_some_and(|a| a.len >= segment_bytes) {
-            if let Err(e) = self.sync() {
-                warn!(error = %e, "sync before rotation failed; continuing in a new segment");
-            }
+            // A failed sync has already sealed the segment.
+            let _ = self.sync();
             self.active = None;
         }
         if self.active.is_none() {
             self.open_active()?;
         }
 
-        let (mut seq, mut ts) = {
-            let index = self.storage.index.lock().unwrap();
-            (index.head_seq, index.head_ts)
-        };
+        let (mut seq, mut ts) = (self.head_seq, self.head_ts);
         self.buf.clear();
         for message in batch {
             seq += 1;
@@ -431,68 +440,68 @@ impl Writer {
         }
 
         let active = self.active.as_mut().expect("active segment");
-        let written = active.file.write_all(&self.buf).and_then(|_| {
-            self.unsynced = true;
-            if sync {
-                sync_file(&active.file, &mut self.unsynced, &mut self.last_sync)
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(e) = written {
+        if let Err(e) = active.file.write_all(&self.buf) {
             self.storage.metrics.write_errors.fetch_add(1, Relaxed);
             self.rollback();
             return Err(e);
         }
         active.len += self.buf.len() as u64;
+        self.head_seq = seq;
+        self.head_ts = ts;
+        self.unsynced = true;
+        self.storage.metrics.batches.fetch_add(1, Relaxed);
+        if sync { self.sync() } else { Ok(()) }
+    }
 
+    /// Syncs the active file and publishes everything written to it. On
+    /// failure the unsynced tail is discarded, because the kernel may have
+    /// dropped its pages, and the segment is sealed.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if !self.unsynced {
+            return Ok(());
+        }
+        let Some(active) = self.active.as_mut() else {
+            self.unsynced = false;
+            return Ok(());
+        };
+        if let Err(e) = active.file.sync_data() {
+            self.storage.metrics.write_errors.fetch_add(1, Relaxed);
+            error!(error = %e, "sync failed; sealing segment");
+            if let Err(e) = active.file.set_len(active.committed) {
+                error!(error = %e, "could not truncate the unsynced tail");
+            }
+            self.seal();
+            return Err(e);
+        }
+        self.unsynced = false;
+        self.last_sync = Instant::now();
+        let added = active.len - active.committed;
+        if added == 0 {
+            return Ok(());
+        }
+        active.committed = active.len;
         {
             let mut index = self.storage.index.lock().unwrap();
             if let Some(segment) = index.segments.get_mut(&active.first_seq) {
                 segment.len = active.len;
             }
-            index.bytes += self.buf.len() as u64;
-            index.head_seq = seq;
-            index.head_ts = ts;
+            index.bytes += added;
+            let records = self.head_seq - index.head_seq;
+            index.head_seq = self.head_seq;
+            index.head_ts = self.head_ts;
             self.storage.evict(&mut index);
+            self.storage.metrics.records.fetch_add(records, Relaxed);
         }
-        self.storage.head.send_replace(seq);
-        let metrics = &self.storage.metrics;
-        metrics.batches.fetch_add(1, Relaxed);
-        metrics.records.fetch_add(batch.len() as u64, Relaxed);
-        metrics.bytes.fetch_add(self.buf.len() as u64, Relaxed);
-        Ok(())
-    }
-
-    /// Flushes unsynced data. A failure seals the segment because the kernel
-    /// may have discarded the dirty pages.
-    pub fn sync(&mut self) -> io::Result<()> {
-        if !self.unsynced {
-            return Ok(());
-        }
-        let Some(active) = self.active.as_ref() else {
-            self.unsynced = false;
-            return Ok(());
-        };
-        if let Err(e) = sync_file(&active.file, &mut self.unsynced, &mut self.last_sync) {
-            self.storage.metrics.write_errors.fetch_add(1, Relaxed);
-            error!(error = %e, "sync failed; sealing segment");
-            self.active = None;
-            self.unsynced = false;
-            self.force_new = true;
-            return Err(e);
-        }
+        self.storage.metrics.bytes.fetch_add(added, Relaxed);
+        self.storage.head.send_replace(self.head_seq);
         Ok(())
     }
 
     fn open_active(&mut self) -> io::Result<()> {
-        let (head_seq, head_ts, last) = {
+        let last = {
             let index = self.storage.index.lock().unwrap();
-            (
-                index.head_seq,
-                index.head_ts,
-                index.segments.iter().next_back().map(|(k, s)| (*k, s.len)),
-            )
+            debug_assert_eq!(self.head_seq, index.head_seq, "no segment, nothing pending");
+            index.segments.iter().next_back().map(|(k, s)| (*k, s.len))
         };
         if let Some((first_seq, len)) = last {
             if len < self.storage.segment_bytes.load(Relaxed) && !self.force_new {
@@ -506,6 +515,7 @@ impl Writer {
                         first_seq,
                         file,
                         len,
+                        committed: len,
                     });
                     return Ok(());
                 }
@@ -518,25 +528,23 @@ impl Writer {
             }
         }
         self.force_new = false;
-        self.create_segment(head_seq + 1, head_ts)
+        self.create_segment(self.head_seq + 1, self.head_ts)
     }
 
     fn create_segment(&mut self, first_seq: u64, base_ts: i64) -> io::Result<()> {
         let path = self.storage.segment_path(first_seq);
+        // A file that already starts at this sequence number holds no record
+        // (otherwise the head would be past it), so it is replaced.
         {
-            // A segment that already starts at this sequence number holds no
-            // records (otherwise the head would be past it); replace it.
             let mut index = self.storage.index.lock().unwrap();
-            if let Some(stale) = index.segments.get(&first_seq) {
-                let stale_len = stale.len;
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-                index.segments.remove(&first_seq);
-                index.bytes -= stale_len;
+            if let Some(stale) = index.segments.remove(&first_seq) {
+                index.bytes -= stale.len;
             }
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => warn!(segment = first_seq, "replacing an empty segment file"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         let mut file = OpenOptions::new()
             .append(true)
@@ -557,6 +565,7 @@ impl Writer {
             first_seq,
             file,
             len,
+            committed: len,
         });
         self.unsynced = true;
         info!(segment = first_seq, "created segment");
@@ -569,9 +578,26 @@ impl Writer {
         };
         if let Err(e) = active.file.set_len(active.len) {
             error!(error = %e, "rollback failed; sealing segment");
-            self.active = None;
-            self.force_new = true;
+            self.seal();
         }
+    }
+
+    /// Abandons the active segment together with the records written to it
+    /// since the last sync; the next batch starts a new segment.
+    fn seal(&mut self) {
+        let discarded = {
+            let index = self.storage.index.lock().unwrap();
+            let discarded = self.head_seq - index.head_seq;
+            self.head_seq = index.head_seq;
+            self.head_ts = index.head_ts;
+            discarded
+        };
+        if discarded > 0 {
+            error!(records = discarded, "unsynced records discarded");
+        }
+        self.active = None;
+        self.unsynced = false;
+        self.force_new = true;
     }
 
     fn note_clock_step(&mut self, step_us: i64) {
@@ -590,13 +616,6 @@ impl Writer {
     }
 }
 
-fn sync_file(file: &File, unsynced: &mut bool, last_sync: &mut Instant) -> io::Result<()> {
-    file.sync_data()?;
-    *unsynced = false;
-    *last_sync = Instant::now();
-    Ok(())
-}
-
 /// Writer thread body: group commit with the sync policy from the storage limits.
 pub fn run_writer(
     storage: Arc<Storage>,
@@ -609,7 +628,9 @@ pub fn run_writer(
         let interval = storage.sync_interval();
         let first = if writer.unsynced() && !interval.is_zero() {
             let wait = interval.saturating_sub(writer.since_sync());
-            match rt.block_on(tokio::time::timeout(wait, rx.recv())) {
+            // The timer must be created inside the runtime context that
+            // `block_on` enters, not before it.
+            match rt.block_on(async { tokio::time::timeout(wait, rx.recv()).await }) {
                 Ok(Some(m)) => m,
                 Ok(None) => break,
                 Err(_) => {
@@ -750,11 +771,10 @@ impl Reader {
             let (first_seq, segment) = match index.segments.range(..=self.next_seq).next_back() {
                 Some((k, s)) => (*k, s),
                 None => {
-                    let (k, s) = index
-                        .segments
-                        .iter()
-                        .next()
-                        .expect("a non-empty log has a segment");
+                    // Momentarily empty while the writer replaces a segment file.
+                    let Some((k, s)) = index.segments.iter().next() else {
+                        return Ok(None);
+                    };
                     batch.skipped += *k - self.next_seq;
                     self.next_seq = *k;
                     (*k, s)
@@ -880,6 +900,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        writer.sync().unwrap();
         let status = storage.status();
         assert!(
             status.bytes <= l.max_bytes,
@@ -1010,6 +1031,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        writer.sync().unwrap();
         assert!(storage.status().segments > 1);
         let got = storage.query(Some(1200), Some(1250), 0, 100).unwrap();
         assert_eq!(
@@ -1069,6 +1091,7 @@ mod tests {
                     )
                     .unwrap();
             }
+            writer.sync().unwrap();
             storage
                 .index
                 .lock()
@@ -1092,6 +1115,70 @@ mod tests {
         assert_eq!(got.first().map(|r| r.ts), Some(from));
         assert_eq!(got.len() as u64, 33 - second);
         assert!(got.windows(2).all(|w| w[1].seq == w[0].seq + 1));
+    }
+
+    #[test]
+    fn unsynced_batches_become_visible_only_on_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        writer.append(&[msg(1, "a")], false).unwrap();
+        writer.append(&[msg(2, "b")], false).unwrap();
+        assert_eq!(storage.head_seq(), 0);
+        assert!(
+            storage
+                .reader(1)
+                .read(10, 1 << 20)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert_eq!(storage.status().bytes, HEADER_LEN as u64);
+        writer.sync().unwrap();
+        assert_eq!(storage.head_seq(), 2);
+        assert_eq!(
+            storage.reader(1).read(10, 1 << 20).unwrap().records.len(),
+            2
+        );
+
+        // Sequence numbers continue from the written head, not the committed one.
+        writer.append(&[msg(3, "c")], false).unwrap();
+        writer.append(&[msg(4, "d")], true).unwrap();
+        let records = storage.reader(3).read(10, 1 << 20).unwrap().records;
+        assert_eq!(
+            records.iter().map(|r| (r.seq, r.ts)).collect::<Vec<_>>(),
+            vec![(3, 3), (4, 4)]
+        );
+        assert_eq!(storage.metrics().records.load(Relaxed), 4);
+    }
+
+    #[test]
+    fn writer_thread_commits_on_the_timer_and_on_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::from_millis(50),
+        };
+        let storage = Arc::new(Storage::open(dir.path(), l).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let thread = {
+            let (storage, handle) = (storage.clone(), rt.handle().clone());
+            std::thread::spawn(move || run_writer(storage, rx, handle))
+        };
+        for i in 1..=3 {
+            tx.blocking_send(msg(i, "t")).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while storage.head_seq() < 3 {
+            assert!(Instant::now() < deadline, "timer did not commit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tx.blocking_send(msg(4, "u")).unwrap();
+        drop(tx);
+        thread.join().unwrap();
+        assert_eq!(storage.head_seq(), 4);
+        assert_eq!(storage.metrics().records.load(Relaxed), 4);
     }
 
     #[test]
@@ -1123,6 +1210,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        writer.sync().unwrap();
         let before = storage.status();
         assert!(before.segments > 2);
         storage.set_limits(limits(128 << 10, 64 << 10));

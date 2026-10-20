@@ -52,7 +52,7 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
     );
 
     let (tx, rx) = mpsc::channel::<Message>(QUEUE_DEPTH);
-    let writer = {
+    let thread = {
         let storage = storage.clone();
         let rt = tokio::runtime::Handle::current();
         std::thread::Builder::new()
@@ -60,6 +60,15 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
             .spawn(move || storage::run_writer(storage, rx, rt))
             .context("spawning log writer thread")?
     };
+    // The thread ends only once every sender is gone, that is after inbound
+    // stopped; ending earlier is a failure that must stop the daemon.
+    let mut writer = Component::spawn("log writer", async move {
+        match tokio::task::spawn_blocking(move || thread.join()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(anyhow::anyhow!("thread panicked")),
+            Err(e) => Err(anyhow::anyhow!("join failed: {e}")),
+        }
+    });
 
     let inbound_metrics = Arc::new(inbound::Metrics::default());
     let registry = Arc::new(Registry::default());
@@ -110,13 +119,12 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
         r = inbound.wait() => r,
         r = api.wait() => r,
         r = outbound.wait() => r,
+        r = writer.wait() => r,
     };
 
     info!("shutting down");
     inbound.stop(&tokens.inbound).await;
-    if let Err(e) = tokio::task::spawn_blocking(move || writer.join()).await {
-        error!(error = %e, "log writer thread panicked");
-    }
+    writer.join().await;
     outbound.stop(&tokens.outbound).await;
     api.stop(&tokens.api).await;
     tokens.aux.cancel();
@@ -152,7 +160,7 @@ impl Component {
     }
 
     /// Resolves when the component ends by itself; always an error, since a
-    /// component only returns early when it could not start.
+    /// component only ends early when it could not start or lost its thread.
     async fn wait(&mut self) -> anyhow::Result<()> {
         let Some(task) = self.task.as_mut() else {
             return std::future::pending().await;
@@ -168,6 +176,11 @@ impl Component {
 
     async fn stop(&mut self, token: &CancellationToken) {
         token.cancel();
+        self.join().await;
+    }
+
+    /// Waits for a component that was asked to stop and logs how it ended.
+    async fn join(&mut self) {
         if let Some(task) = self.task.take() {
             match task.await {
                 Ok(Ok(())) => {}
@@ -198,7 +211,10 @@ async fn apply_changes(
         }
         let next = cfg.borrow_and_update().clone();
         if next.storage != current.storage {
-            storage.set_limits(limits(&next.storage));
+            let (storage, limits) = (storage.clone(), limits(&next.storage));
+            if let Err(e) = tokio::task::spawn_blocking(move || storage.set_limits(limits)).await {
+                error!(error = %e, "storage limits not applied");
+            }
             if next.storage.path != current.storage.path {
                 warn!(path = %next.storage.path.display(), "storage.path changed; takes effect after restart");
             }

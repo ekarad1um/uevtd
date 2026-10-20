@@ -165,7 +165,7 @@ async fn serve(
                 }
             },
             _ = shutdown.cancelled() => {
-                debug!("closing for shutdown");
+                debug!(pending = framer.pending(), "closing for shutdown");
                 return;
             }
         };

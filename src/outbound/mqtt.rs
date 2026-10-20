@@ -41,6 +41,7 @@ pub async fn run(
     let mut tracker = Tracker::new(cursor.current());
     let mut attempt = 0u32;
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!(host = %cfg.host, port = cfg.port, topic = %cfg.topic, qos = cfg.qos, "forwarding over mqtt");
 
     'session: loop {
@@ -145,7 +146,14 @@ fn connect(cfg: &config::Mqtt, limit: usize) -> Result<(AsyncClient, Events), St
         .set_keep_alive(Duration::from_secs(cfg.keep_alive_s.max(1)))
         .set_clean_session(true)
         .set_inflight((limit * 2 + 1).min(u16::MAX as usize) as u16)
-        .set_max_packet_size(64 * 1024, cfg.max_packet_bytes + 1024);
+        // Our own payload check is the only size limit that may fire: the
+        // library's would end the connection and the record would be
+        // republished forever. A publish packet adds at most 9 bytes to the
+        // topic and payload.
+        .set_max_packet_size(
+            64 * 1024,
+            cfg.max_packet_bytes.saturating_add(cfg.topic.len() + 16),
+        );
     if let Some(user) = &cfg.username {
         options.set_credentials(user.clone(), cfg.password.clone().unwrap_or_default());
     }

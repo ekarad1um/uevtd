@@ -419,6 +419,41 @@ async fn backlog_survives_channel_restart_before_first_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
+    let mut target = target().await;
+    let env = Env::new();
+    let mut config = env.config(&target.url);
+    config.storage.sync_interval_ms = 50;
+    let daemon = env.start(config).await;
+    env.send(&[b"{\"n\":1}\n", b"{\"n\":2}\n", b"{\"n\":3}\n"])
+        .await;
+    for n in 1..=3 {
+        let r = next_request(&mut target).await;
+        assert_eq!(r.body, format!("{{\"n\":{n}}}").as_bytes());
+    }
+
+    // Stop right after sending: the final sync commits what the timer has not.
+    env.send(&[b"{\"n\":4}\n", b"{\"n\":5}\n"]).await;
+    wait_for(Duration::from_secs(5), || async {
+        daemon.get("/v1/status").await.1["inbound"]["messages"] == 5
+    })
+    .await;
+    daemon.stop().await;
+    let daemon = env.start(config::load(&env.config_path).unwrap()).await;
+    assert_eq!(daemon.get("/v1/status").await.1["storage"]["head_seq"], 5);
+    let mut seen = Vec::new();
+    while seen.last() != Some(&5) {
+        let body: Value = serde_json::from_slice(&next_request(&mut target).await.body).unwrap();
+        let n = body["n"].as_u64().unwrap();
+        if seen.last() != Some(&n) {
+            seen.push(n);
+        }
+    }
+    assert_eq!(seen, vec![4, 5]);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn refuses_to_steal_a_live_socket() {
     let target = target().await;
     let env = Env::new();
