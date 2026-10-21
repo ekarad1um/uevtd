@@ -1,9 +1,9 @@
 //! Outbound: a supervisor that keeps one task per enabled channel, each an
 //! independent reader of the log with a durable cursor (ARCHITECTURE.md §6).
 
-pub mod http;
 pub mod mqtt;
 pub mod notice;
+pub mod websocket;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -15,16 +15,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::{Channel, Config};
 use crate::metrics::ErrorSlot;
 use crate::storage::{Batch, Loss, Reader, Record, Storage, Tail};
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
-/// Payload bytes a channel holds for delivery, beyond one record: a batch
-/// being sent, or the messages awaiting acknowledgement.
+/// Payload bytes a channel holds for delivery beyond one record: the
+/// messages awaiting acknowledgement.
 pub const DELIVERY_BYTES: usize = 1 << 20;
+const RECONNECT_BASE: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 pub struct ChannelMetrics {
     pub kind: &'static str,
@@ -151,8 +153,8 @@ async fn reconcile(
         let token = CancellationToken::new();
         let span = tracing::info_span!("channel", name = %name);
         let task = match channel.clone() {
-            Channel::Http(c) => tokio::spawn(
-                http::run(c, feed, cursor, metrics.clone(), token.clone()).instrument(span),
+            Channel::WebSocket(c) => tokio::spawn(
+                websocket::run(c, feed, cursor, metrics.clone(), token.clone()).instrument(span),
             ),
             Channel::Mqtt(c) => tokio::spawn(
                 mqtt::run(c, feed, cursor, metrics.clone(), token.clone()).instrument(span),
@@ -231,6 +233,19 @@ async fn initial_cursor(storage: &Arc<Storage>, name: &str) -> u64 {
 /// Exponential backoff: `base * 2^attempt`, capped.
 pub fn backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
     base.saturating_mul(1u32 << attempt.min(16)).min(max)
+}
+
+/// Waits before a channel reconnects: 1 s after the first failure, doubling
+/// to 60 s. `attempt` counts the failures since the cursor last advanced, so
+/// a target that accepts every connection but takes nothing still backs
+/// off. False if the channel was stopped meanwhile.
+pub async fn pause(attempt: u32, token: &CancellationToken) -> bool {
+    let delay = backoff(attempt, RECONNECT_BASE, RECONNECT_MAX);
+    debug!(delay_s = delay.as_secs(), "reconnecting after backoff");
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = token.cancelled() => false,
+    }
 }
 
 /// What a channel delivers next.
@@ -360,11 +375,14 @@ impl CursorStore {
         self.current
     }
 
-    pub fn advance(&mut self, next_seq: u64) {
-        if next_seq > self.current {
-            self.current = next_seq;
-            self.metrics.cursor.store(next_seq, Relaxed);
+    /// Moves the cursor forward to `next_seq`; true if it moved.
+    pub fn advance(&mut self, next_seq: u64) -> bool {
+        if next_seq <= self.current {
+            return false;
         }
+        self.current = next_seq;
+        self.metrics.cursor.store(next_seq, Relaxed);
+        true
     }
 
     pub fn dirty(&self) -> bool {

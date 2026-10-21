@@ -14,12 +14,15 @@
   "outbound": {
     "channels": {
       "ingest": {
-        "type": "http",
+        "type": "websocket",
         "enabled": true,
-        "url": "https://collector.example/ingest",
-        "method": "POST",
+        "url": "wss://collector.example/ingest",
         "headers": { "Authorization": "Bearer replace-me" },
-        "timeout_ms": 10000
+        "ca_file": null,
+        "timeout_ms": 10000,
+        "keep_alive_s": 30,
+        "inflight": 256,
+        "max_frame_bytes": 1048576
       },
       "broker": {
         "type": "mqtt",
@@ -27,6 +30,7 @@
         "host": "broker.example",
         "port": 8883,
         "tls": true,
+        "ca_file": null,
         "topic": "devices/42/events",
         "client_id": "uevtd-42",
         "username": null,

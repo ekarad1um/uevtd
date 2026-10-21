@@ -2,8 +2,8 @@
 
 `uevtd` is a message forwarding daemon. It accepts newline-delimited messages on a
 Unix domain socket, appends them to a bounded on-disk log, and forwards them to
-configured HTTP and MQTT channels. A second Unix domain socket serves an HTTP API
-for configuration, time-range queries over the log, status and metrics.
+configured WebSocket and MQTT channels. A second Unix domain socket serves an HTTP
+API for configuration, time-range queries over the log, status and metrics.
 
 This document is the design plan for the module: what it does, how it is put
 together, the invariants each part relies on, and the trade-offs that were made.
@@ -17,7 +17,7 @@ Functional scope, from the requirements:
 |---------------|-------------------------------------------------------------------------------------------------|
 | Inbound       | Read messages from a configurable UDS path. Discard and log truncated messages.                 |
 | Storage       | Persist messages under a configurable path and size limit; evict oldest without corruption.     |
-| Outbound      | Forward to HTTP (URL, method, headers, timeout) and MQTT (broker, port, topic, connection).      |
+| Outbound      | Forward to MQTT (broker, port, topic, connection) and to HTTP endpoints, which became a WebSocket channel (URL, headers, timeout; §6.2). |
 | Configuration | HTTP API over UDS to read and update all of the above; apply live; persist to a file.           |
 | Observability | Logs and metrics sufficient for troubleshooting and performance analysis.                       |
 
@@ -43,11 +43,11 @@ defined behaviour.
                                    ┌─────────────────┼─────────────────┐
                                    ▼                 ▼                 ▼
                              ┌──────────┐      ┌──────────┐      ┌──────────┐
-                             │ http ch. │      │ mqtt ch. │      │ api query│
+                             │ ws ch.   │      │ mqtt ch. │      │ api query│
                              │ cursor=n │      │ cursor=m │      │ by time  │
                              └────┬─────┘      └────┬─────┘      └────┬─────┘
                                   ▼                 ▼                 ▲
-                             HTTP endpoint     MQTT broker     HTTP API over UDS
+                           WebSocket receiver  MQTT broker     HTTP API over UDS
                                                                 (config/status/metrics)
 ```
 
@@ -76,10 +76,14 @@ src/
     segment.rs     on-disk encoding: segment header, record frame, CRC, recovery scan
   outbound/
     mod.rs         Supervisor: reconciles configured channels with running tasks;
-                   Feed (cancel-safe batch reader), CursorStore (debounced persistence)
+                   Feed (cancel-safe batch reader), CursorStore (debounced persistence),
+                   reconnect backoff
     notice.rs      drop notices
-    http.rs        HTTP channel task
+    websocket.rs   WebSocket channel task, its frame writer, and the pure `Window`
+                   for acknowledgement bookkeeping
     mqtt.rs        MQTT channel task and the pure `Tracker` for packet-id/ack bookkeeping
+  tls.rs           client TLS for both channels: platform trust store or a CA file
+  view.rs          the JSON shape of a record, shared by queries and WebSocket frames
   api.rs           HTTP API over UDS (axum): config, messages, status, metrics, health
   metrics.rs       Prometheus text rendering helper
 ```
@@ -346,59 +350,99 @@ delivered in that second as lost, if they are evicted before the restart.
 ### 6.1 Delivery model
 
 Each enabled channel is one task that reads the log from its cursor and
-delivers in sequence order, one message at a time for HTTP, pipelined up to
-`inflight` for MQTT. Semantics:
+delivers in sequence order, with up to `inflight` messages awaiting
+acknowledgement. Semantics:
 
 - **At-least-once.** The cursor only advances after the target acknowledged
-  the message (2xx response; `PUBACK`/`PUBCOMP` for QoS 1/2; written to the
-  socket for QoS 0).
+  the message (`{"ack": n}` from a WebSocket receiver; `PUBACK`/`PUBCOMP` for
+  MQTT QoS 1/2; written to the socket for QoS 0). After a lost connection the
+  unacknowledged messages are sent again, in order, so duplicates are possible.
 - **Ordered.** A message is not skipped because a later one succeeded.
-- **Head-of-line blocking is deliberate.** A transient failure blocks the
-  channel with exponential backoff (HTTP: 100 ms to 30 s; MQTT reconnect: 1 s to
-  60 s) until the target recovers. Lag is visible in metrics and bounded by the
-  log's retention, after which the oldest messages are lost, counted and
-  logged as they are evicted (§5.9).
-- **Permanent rejections are skipped.** An HTTP 4xx other than 408/429, or an
-  MQTT payload larger than `max_packet_bytes`, is logged with the sequence
-  number, counted in `rejected`, and the cursor moves on. Retrying forever
-  would stall the channel on one bad message. The record stays in the log and
-  can be queried until it is evicted.
-- **A skipped record leaves a notice.** An MQTT channel publishes a *drop
-  notice* in place of the records it will not deliver, on the channel's own
-  topic, so that the receiver learns of the gap:
+- **Head-of-line blocking is deliberate.** A lost connection blocks the channel
+  until the target is back. It reconnects after 1 s, doubling to 60 s, and the
+  wait shortens again only when an acknowledgement advances the cursor. A
+  target that accepts every connection but takes nothing, such as a broker
+  that disconnects on the first publish or a receiver that closes on each
+  frame, is therefore retried less and less often, not once a second. Lag is
+  visible in metrics and bounded by the log's retention, after which the oldest
+  messages are lost, counted and logged as they are evicted (§5.9).
+- **Permanent rejections are skipped.** A payload too large for the channel
+  (`max_frame_bytes`, `max_packet_bytes`) or a record the WebSocket receiver
+  refuses with a `nack` is logged with the sequence number, counted in
+  `rejected`, and passed. Retrying forever would stall the channel on one bad
+  message. The record stays in the log and can be queried until it is evicted.
+- **A skipped record leaves a notice.** A channel sends a *drop notice* in place
+  of the records it will not deliver, so that the receiver learns of the gap.
+  MQTT publishes it on the channel's own topic:
 
   ```json
   {"notice": {"event": "lost", "from_seq": 1, "to_seq": 3075, "count": 3075}}
   {"notice": {"event": "rejected", "seq": 4242, "ts": 1760928000123456, "reason": "payload too large"}}
   ```
 
-  `lost` covers records that left the log before the channel read them;
-  `rejected` names a record the channel will not deliver, with the time under
-  which `/v1/messages` still returns it. A notice is published like a message,
-  with the channel's QoS, and the cursor passes the records it stands for only
-  once it is acknowledged, so it is delivered at least once and in order. It
-  is never retained, since it would replace the topic's last message for new
-  subscribers. Receivers tell notices apart by the top-level `notice` key,
-  which a producer's own messages should therefore not use. Every notice is
-  at most 256 bytes. The HTTP channel, which is to be replaced, counts and
-  logs the same losses but sends no notice.
+  and WebSocket sends it as a frame with the sequence number to acknowledge,
+  the last one it stands for: `{"seq": 3075, "notice": {...}}`. `lost` covers
+  records that left the log before the channel read them; `rejected` names a
+  record that is too large to send, with the time under which `/v1/messages`
+  still returns it. A refused record gets no notice, since the receiver refused
+  it itself. A notice travels like a message and the cursor passes the records
+  it stands for only once it is acknowledged, so it is delivered at least once
+  and in order. MQTT never retains a notice, since it would replace the topic's
+  last message for new subscribers, and MQTT receivers tell notices apart by
+  the top-level `notice` key, which a producer's own messages should therefore
+  not use. Every notice is at most 256 bytes, as a payload or as a frame.
 - **New channels start at the head.** A channel without a cursor file forwards
   messages received after it was configured; it does not replay the backlog.
   That start position is persisted immediately. Disabling and re-enabling a
   channel keeps its cursor; removing it deletes the cursor.
 
-### 6.2 HTTP channel
+### 6.2 WebSocket channel
 
-One `reqwest` client per channel (connection pooling, rustls, platform trust
-store). Each message is one request: configured method and URL, configured
-headers, body = payload verbatim, `Content-Type: application/json` unless the
-configuration overrides it, `timeout_ms` for the whole request.
+The requirements name an HTTP channel; it became a WebSocket channel, so that
+messages stream over one long-lived connection with explicit acknowledgements
+instead of one request per message, whose throughput is one message per round
+trip and whose status codes cannot tell a refused message from a broken
+endpoint. The receiver must speak the protocol below.
 
-| Outcome                               | Action                                 |
-|---------------------------------------|----------------------------------------|
-| 2xx                                   | delivered; cursor advances             |
-| 408, 429, 5xx, timeout, connect error | retry with backoff (channel blocks)    |
-| other 4xx, 3xx (redirects disabled)   | rejected; logged; cursor advances      |
+**Frames.** One text frame per record, in sequence order, in the shape
+`/v1/messages` returns (`src/view.rs`): `{"seq": n, "ts": us, "data": <payload>}`
+when the payload is valid JSON, embedded verbatim, and
+`{"seq": n, "ts": us, "text": "<payload>"}` otherwise, with invalid UTF-8
+replaced. Notices are frames too (§6.1). Every frame carries a `seq`.
+
+**Answers.** The receiver sends text frames: `{"ack": n}` means every frame up
+to sequence number `n` is processed, so one acknowledgement covers any number
+of frames; `{"nack": n, "reason": "..."}` means frame `n` will never be
+accepted. The cursor is the end of the longest answered prefix. Anything else
+the receiver sends is ignored, a message above 64 KiB ends the session, and a
+close frame or a read error ends it as well. Receivers deduplicate by `seq`.
+
+**Window.** At most `inflight` frames and 1 MiB of payload are unanswered; a
+receiver throttles the stream by answering later, and the backlog waits on
+disk. A record whose frame would exceed `max_frame_bytes` is replaced by a
+notice, so that a receiver's frame limit cannot turn into a reconnect loop.
+
+**Session.** TCP, TLS for `wss://` (§6.5), and the handshake with the
+configured `headers` must complete within `timeout_ms`. The channel pings every
+`keep_alive_s` and ends the session if no pong arrives within `timeout_ms`.
+After a session ends, the unanswered frames are sent again in order in the
+next one. A channel that stops, for a configuration change or at shutdown,
+sends a close frame (1001, going away), waits at most a second for it to be
+written, and persists its cursor.
+
+**Structure.** The socket is split. A writer task owns the sending half and
+drains a queue of frames, so the channel task's `select!` can never abandon a
+frame half-written; a record is encoded only when it is written, and the
+window and the queue share its payload. The channel task selects over the
+receiver's messages, `Feed::next` while the window has room, the ping and
+cursor timers, and cancellation. The queue holds at most two windows: what is
+sent again after a reconnect, and new frames. A receiver can only acknowledge
+frames it has received in some session, so a fuller queue means a broken
+receiver, and the session ends.
+
+`connected` reflects a live session, `delivered` counts acknowledged records,
+`rejected` refused and oversized ones, and `retries` sessions that failed or
+ended, as for MQTT.
 
 ### 6.3 MQTT channel
 
@@ -418,8 +462,10 @@ pure `Tracker` that maps packet ids to sequence numbers:
   `notices`, not in `delivered`.
 
 The daemon manages reconnection itself: on any connection error the client and
-event loop are dropped, every unacknowledged entry is marked unsent, and after a
-backoff a fresh client is created and the entries are republished in order.
+event loop are dropped, every unacknowledged entry is marked unsent, and after
+the backoff of §6.1 a fresh client is created and the entries are republished
+in order. A CONNACK does not shorten the backoff; an acknowledgement that
+advances the cursor does.
 This avoids depending on broker session state (`clean_session` is always true)
 and guarantees ordering across reconnects, at the cost of possible duplicates
 (at-least-once). Outstanding publishes are capped at `inflight`, which is also
@@ -430,16 +476,28 @@ payload plus one message, because the channel and the library each keep a copy
 of a publish until it is acknowledged; an acknowledged payload is released at
 once, even while an earlier publish is still outstanding.
 
-TLS uses rustls with the platform verifier (same trust behaviour as the HTTP
-channel). Username/password, client id, keep-alive, QoS and retain are configurable.
+With `tls` the connection uses the TLS configuration of §6.5. Username and
+password, client id, keep-alive, QoS and retain are configurable.
 
 ### 6.4 Reconciliation
 
 The supervisor diffs the configured channel map against the running tasks on
-every configuration change: removed or changed channels are cancelled (they
-finish the message in flight and persist their cursor), added or changed ones
-are started, unchanged ones are untouched. Channel identity is the map key, and
-the key names the cursor file, so renaming a channel starts it at the head.
+every configuration change: removed or changed channels are cancelled, added or
+changed ones are started, unchanged ones are untouched. A cancelled channel
+abandons what is awaiting acknowledgement and persists its cursor, and a
+WebSocket channel also sends a close frame; the new task sends the
+unacknowledged messages again. Channel identity is the map key, and the key
+names the cursor file, so renaming a channel starts it at the head.
+
+### 6.5 TLS
+
+Both channels use rustls through one configuration (`src/tls.rs`). By default
+it verifies with the platform's trust store; it is built once and shared by
+all channels and reconnects. With `ca_file`, a PEM file of one or more
+certificates, only those certificates are trusted. The file is read again for
+every connection, so a replaced file applies from the next reconnect, and a
+missing or empty one is reported in `last_error` and retried like a
+connection failure. Client certificates are not supported.
 
 ## 7. Configuration
 
@@ -462,12 +520,15 @@ the key names the cursor file, so renaming a channel starts it at the head.
   "outbound": {
     "channels": {
       "primary": {
-        "type": "http",
+        "type": "websocket",
         "enabled": true,
-        "url": "https://example.invalid/ingest",
-        "method": "POST",
+        "url": "wss://example.invalid/ingest",
         "headers": { "Authorization": "Bearer ..." },
-        "timeout_ms": 10000
+        "ca_file": null,
+        "timeout_ms": 10000,
+        "keep_alive_s": 30,
+        "inflight": 256,
+        "max_frame_bytes": 1048576
       },
       "broker": {
         "type": "mqtt",
@@ -475,6 +536,7 @@ the key names the cursor file, so renaming a channel starts it at the head.
         "host": "broker.example.invalid",
         "port": 8883,
         "tls": true,
+        "ca_file": null,
         "topic": "uevtd/events",
         "client_id": "uevtd",
         "username": null,
@@ -504,11 +566,17 @@ with `max_connections × max_message_bytes` at most 16 MiB; `segment_bytes` in
 64 KiB..=256 MiB and at least `max_message_bytes + 48`, `max_bytes >= 2 *
 segment_bytes` and at most 1 TiB, `sync_interval_ms <= 60 000`; at most 8
 channels, named `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they become file names);
-HTTP URL, method and header names/values parse; MQTT host and topic non-empty,
-topic has no wildcards, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol
-field is 16 bits), `inflight` in 1..=1024, `max_packet_bytes` at least 256 so
-that a drop notice fits; log filter parses as a `tracing`
-directive. The bounds on sizes and counts are what bounds memory (section 11.1).
+WebSocket URL parses with scheme `ws` or `wss`, no credentials (they belong in
+`headers`) and no fragment, header names and values parse and leave the
+handshake's own headers alone, `ca_file` only with `wss`, `timeout_ms` at least
+1, `keep_alive_s` in 1..=65535, `inflight` in 1..=1024, `max_frame_bytes` at
+least 256; MQTT host and topic non-empty, topic has no wildcards, `ca_file`
+only with `tls`, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol field
+is 16 bits), `inflight` in 1..=1024, `max_packet_bytes` at least 256; log
+filter parses as a `tracing` directive. The minimum sizes make room for a drop
+notice, and the bounds on sizes and counts are what bounds memory (section
+11.1). A `ca_file` is not read at validation; a missing file shows when the
+channel connects (§6.5).
 
 ### 7.3 Persistence and live update
 
@@ -601,7 +669,10 @@ adds the last error per component with its timestamp and the
 | Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error` |
 | Cursor file unreadable                    | Channel replays from the oldest retained record                            |
 | Target down for longer than retention     | Evicted messages counted as lost and logged as they are evicted; once the target is back, the channel sends a notice in their place and continues at the oldest available |
-| Broker drops the session                  | Unacked messages republished (duplicates possible), order preserved       |
+| Broker or receiver drops the session      | Unacknowledged messages sent again (duplicates possible), order preserved |
+| Target accepts connections but takes nothing | Reconnects back off to once a minute; the cursor stays; `retries` and `last_error` show it |
+| Receiver stops answering pings            | Session ends after `timeout_ms`; reconnect with backoff                   |
+| TLS verification fails, e.g. a wrong clock | Connection fails, reported in `last_error`, retried with backoff          |
 | Another instance already listening        | Startup fails; the socket file is not stolen                              |
 | Config file invalid at startup            | Startup fails with the validation error                                   |
 | Config file missing at startup            | Defaults are used and written to the path                                 |
@@ -612,15 +683,17 @@ adds the last error per component with its timestamp and the
 
 Tokio multi-thread runtime. Tasks: inbound acceptor + one task per connection;
 one supervisor + one task per channel (+ one event-loop task per MQTT
-channel); API server; config applier. One OS thread: the log writer. Blocking
-file reads for channels and queries run on `spawn_blocking`, with the reader
-handed in and out so cancellation never loses it.
+channel, one frame writer per WebSocket session); API server; config applier.
+One OS thread: the log writer. Blocking file reads for channels and queries,
+and reading a CA file, run on `spawn_blocking`, with the reader handed in and
+out so cancellation never loses it.
 
 Shutdown (SIGTERM/SIGINT): stop the inbound acceptor and cancel connection
 tasks; drop the writer's senders so it drains and syncs the queue, then join
-it; cancel channels, which abandon any request still in flight (the cursor has
-not advanced, so it is retried later) and persist their cursors; stop the API.
-A second signal exits immediately without waiting.
+it; cancel channels, which abandon what awaits acknowledgement (the cursor has
+not passed it, so it is sent again later), close their WebSocket sessions and
+persist their cursors; stop the API. A second signal exits immediately without
+waiting.
 
 ### 11.1 Memory
 
@@ -633,30 +706,32 @@ Every buffer that holds messages has a byte bound:
 | Inbound connections | each holds at most one message and an 8 KiB read buffer; a complete message is copied out only once the queue has room for it; `max_connections × max_message_bytes` ≤ 16 MiB | 64 × 72 KiB |
 | Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when producers outrun the disk |
 | Write batch | 1 MiB of encoded records, or one record | 1 MiB |
-| Each channel | 1 MiB of payload being delivered, plus one message; MQTT keeps a second copy inside rumqttc | about 2 MiB |
+| Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc; WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
 | Each log reader | a 64 KiB read buffer, or one record if larger | 64 KiB |
 | A query | one at a time: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
 | An API request | a 256 KiB body | small |
 
-The JSON of a query page can reach six times the page for binary payloads
-(control bytes are escaped as `\u00XX`); valid JSON payloads are embedded as
-they are.
+The JSON of a query page, or of a WebSocket frame, can reach six times the
+payload for binary payloads (control bytes are escaped as `\u00XX`); valid JSON
+payloads are embedded as they are.
 
 On glibc the binary fixes the allocator's mmap threshold at 128 KiB and limits
 it to two arenas (`src/main.rs`). By default glibc raises the threshold after
 every large free and keeps a heap per thread, so the buffers of large messages
-stayed with the process after use: under the heaviest load below the resident
-size reached 122 MiB instead of 54 MiB.
+stayed with the process after use: without the setting, the heaviest load below
+reached more than twice its peak, 122 MiB.
 
 Resident size of the release binary, measured on Linux (glibc, 7 cores) while
 48 connections send messages of the maximum size as fast as they can, 16 more
-hold a partial message each, and queries run in a loop:
+hold a partial message each, and queries run in a loop. The WebSocket
+receivers acknowledge each frame 2 s late, so their channels' windows stay
+full:
 
 | Configuration | Peak |
 |---------------|------|
-| Idle, one MQTT and one HTTP channel | 6 MiB |
-| Defaults (64 KiB messages); one MQTT channel and one HTTP target that answers after 2 s | 31 MiB |
-| Every limit at its maximum (256 KiB messages); four MQTT channels and four slow HTTP targets | 54 MiB |
+| Idle, one MQTT and one WebSocket channel | 6 MiB |
+| Defaults (64 KiB messages); one MQTT channel and one slow WebSocket receiver | 31 MiB |
+| Every limit at its maximum (256 KiB messages); four MQTT channels and four slow WebSocket receivers | 53 MiB |
 
 ## 12. Decisions to confirm
 
@@ -665,13 +740,12 @@ hold a partial message each, and queries run in a loop:
    (kernel-preserved boundaries, 200 KiB-ish practical limit). Newline framing
    matches "typically JSON" producers; switching is a change confined to `Framer`.
 2. **At-least-once with durable cursors** instead of best-effort forwarding.
-   Duplicates are possible after a crash or MQTT reconnect; consumers should be
-   idempotent on message content or an id inside the payload.
-3. **Head-of-line blocking per channel.** Alternative: a per-channel
-   concurrency knob for HTTP (`n` requests in flight, delivery order relaxed).
-   Easy to add later; omitted to keep ordering guarantees simple.
-4. **4xx is a permanent rejection** (skipped). If a target uses 4xx for
-   transient conditions beyond 408/429, this should become configurable.
+   Duplicates are possible after a crash or a reconnect. WebSocket receivers
+   deduplicate by `seq`; MQTT consumers need an id inside the payload.
+3. **Head-of-line blocking per channel.** A message is retried until it is
+   acknowledged, refused or too large; nothing else skips it.
+4. **WebSocket instead of HTTP** (§6.2). Receivers must implement the
+   acknowledgement protocol; plain HTTP endpoints cannot be targeted.
 5. **New channels start at the head.** Alternative: a per-channel
    `start: "oldest" | "head"` field.
 6. **`storage.path` and `log.format` require a restart** (section 7.3).
@@ -690,12 +764,16 @@ hold a partial message each, and queries run in a loop:
 |----------------------------|----------------------------------------------------------|
 | tokio, tokio-util          | runtime, UDS, channels, cancellation                     |
 | axum                       | HTTP API routing/JSON over the UDS listener              |
-| reqwest (rustls)           | HTTP channel client                                      |
+| tokio-tungstenite          | WebSocket client (handshake and framing only)            |
+| futures-util               | splitting a WebSocket into its sending and receiving halves |
+| tokio-rustls               | TLS for WebSocket; the same rustls that rumqttc uses     |
+| url                        | parsing WebSocket URLs                                   |
 | rumqttc (rustls)           | MQTT 3.1.1 client                                        |
-| rustls-platform-verifier   | system trust store for MQTT TLS (reqwest uses it already) |
+| rustls-platform-verifier   | the platform's trust store for both channels             |
 | serde, serde_json          | configuration and API documents                          |
 | tracing, tracing-subscriber| logging with reloadable filter                           |
 | crc32fast                  | record checksums                                         |
 | thiserror, anyhow          | error types / top-level error context                    |
 
-No database, no mmap, no custom allocator, no date-time crate.
+No database, no mmap, no custom allocator, no date-time crate. reqwest is a
+development dependency only, as the API client of the end-to-end tests.

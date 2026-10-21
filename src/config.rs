@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tracing::info;
 
 use crate::outbound::notice::MAX_NOTICE_BYTES;
@@ -76,21 +77,21 @@ pub struct Outbound {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Channel {
-    Http(Http),
+    WebSocket(WebSocket),
     Mqtt(Mqtt),
 }
 
 impl Channel {
     pub fn enabled(&self) -> bool {
         match self {
-            Channel::Http(c) => c.enabled,
+            Channel::WebSocket(c) => c.enabled,
             Channel::Mqtt(c) => c.enabled,
         }
     }
 
     pub fn kind(&self) -> &'static str {
         match self {
-            Channel::Http(_) => "http",
+            Channel::WebSocket(_) => "websocket",
             Channel::Mqtt(_) => "mqtt",
         }
     }
@@ -98,22 +99,35 @@ impl Channel {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Http {
+pub struct WebSocket {
     pub enabled: bool,
+    /// `ws://` or `wss://`.
     pub url: String,
-    pub method: String,
+    /// Sent with the handshake.
     pub headers: BTreeMap<String, String>,
+    /// PEM certificates trusted instead of the platform's store.
+    pub ca_file: Option<PathBuf>,
+    /// For the handshake, and for a pong after each ping.
     pub timeout_ms: u64,
+    /// Ping interval.
+    pub keep_alive_s: u64,
+    /// Maximum unacknowledged frames.
+    pub inflight: u16,
+    /// Records whose frame would be larger are replaced by a drop notice.
+    pub max_frame_bytes: usize,
 }
 
-impl Default for Http {
+impl Default for WebSocket {
     fn default() -> Self {
         Self {
             enabled: true,
             url: String::new(),
-            method: "POST".into(),
             headers: BTreeMap::new(),
+            ca_file: None,
             timeout_ms: 10_000,
+            keep_alive_s: 30,
+            inflight: 256,
+            max_frame_bytes: 1 << 20,
         }
     }
 }
@@ -125,6 +139,8 @@ pub struct Mqtt {
     pub host: String,
     pub port: u16,
     pub tls: bool,
+    /// PEM certificates trusted instead of the platform's store.
+    pub ca_file: Option<PathBuf>,
     pub topic: String,
     pub client_id: String,
     pub username: Option<String>,
@@ -145,6 +161,7 @@ impl Default for Mqtt {
             host: String::new(),
             port: 1883,
             tls: false,
+            ca_file: None,
             topic: String::new(),
             client_id: "uevtd".into(),
             username: None,
@@ -307,7 +324,7 @@ impl Config {
         for (name, channel) in &self.outbound.channels {
             validate_name(name)?;
             match channel {
-                Channel::Http(c) => validate_http(name, c)?,
+                Channel::WebSocket(c) => validate_websocket(name, c)?,
                 Channel::Mqtt(c) => validate_mqtt(name, c)?,
             }
         }
@@ -322,7 +339,7 @@ impl Config {
         let mut copy = self.clone();
         for channel in copy.outbound.channels.values_mut() {
             match channel {
-                Channel::Http(c) => {
+                Channel::WebSocket(c) => {
                     c.url = redacted_url(&c.url);
                     for (name, value) in c.headers.iter_mut() {
                         if secret_name(name) {
@@ -392,7 +409,7 @@ fn secret_name(name: &str) -> bool {
 /// The URL with user information and secret-looking query values replaced,
 /// for logging.
 pub fn redacted_url(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+    let Ok(mut parsed) = url::Url::parse(url) else {
         return url.to_string();
     };
     let mut changed = false;
@@ -431,22 +448,54 @@ fn validate_name(name: &str) -> Result<(), Error> {
     })
 }
 
-fn validate_http(name: &str, c: &Http) -> Result<(), Error> {
-    let url = reqwest::Url::parse(&c.url)
-        .map_err(|e| Error::Invalid(format!("channel {name}: url: {e}")))?;
-    ensure(matches!(url.scheme(), "http" | "https"), || {
-        format!("channel {name}: url must use http or https")
+/// Request headers that the WebSocket handshake sets itself.
+const HANDSHAKE_HEADERS: [&str; 5] = [
+    "host",
+    "connection",
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+];
+
+fn validate_websocket(name: &str, c: &WebSocket) -> Result<(), Error> {
+    let url =
+        url::Url::parse(&c.url).map_err(|e| Error::Invalid(format!("channel {name}: url: {e}")))?;
+    ensure(matches!(url.scheme(), "ws" | "wss"), || {
+        format!("channel {name}: url must use ws or wss")
     })?;
-    reqwest::Method::from_bytes(c.method.to_ascii_uppercase().as_bytes())
-        .map_err(|e| Error::Invalid(format!("channel {name}: method: {e}")))?;
+    ensure(
+        url.username().is_empty() && url.password().is_none(),
+        || format!("channel {name}: url must not hold credentials; send them in headers"),
+    )?;
+    ensure(url.fragment().is_none(), || {
+        format!("channel {name}: url must not have a fragment")
+    })?;
     for (k, v) in &c.headers {
-        reqwest::header::HeaderName::from_bytes(k.as_bytes())
+        let header = HeaderName::from_bytes(k.as_bytes())
             .map_err(|e| Error::Invalid(format!("channel {name}: header {k:?}: {e}")))?;
-        reqwest::header::HeaderValue::from_str(v)
+        HeaderValue::from_str(v)
             .map_err(|e| Error::Invalid(format!("channel {name}: header {k:?}: {e}")))?;
+        ensure(!HANDSHAKE_HEADERS.contains(&header.as_str()), || {
+            format!("channel {name}: header {k:?} is set by the handshake")
+        })?;
     }
+    ensure(c.ca_file.is_none() || url.scheme() == "wss", || {
+        format!("channel {name}: ca_file needs a wss url")
+    })?;
     ensure(c.timeout_ms >= 1, || {
         format!("channel {name}: timeout_ms must be at least 1")
+    })?;
+    ensure((1..=65_535).contains(&c.keep_alive_s), || {
+        format!("channel {name}: keep_alive_s must be between 1 and 65535")
+    })?;
+    ensure((1..=1024).contains(&c.inflight), || {
+        format!("channel {name}: inflight must be between 1 and 1024")
+    })?;
+    ensure(c.max_frame_bytes >= MAX_NOTICE_BYTES, || {
+        format!(
+            "channel {name}: max_frame_bytes must be at least {MAX_NOTICE_BYTES}, \
+             so that a drop notice fits"
+        )
     })
 }
 
@@ -456,6 +505,9 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
     })?;
     ensure(c.port != 0, || {
         format!("channel {name}: port must not be 0")
+    })?;
+    ensure(c.ca_file.is_none() || c.tls, || {
+        format!("channel {name}: ca_file needs tls")
     })?;
     ensure(
         !c.topic.is_empty() && rumqttc::valid_topic(&c.topic),
@@ -636,10 +688,10 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn http(url: &str) -> Channel {
-        Channel::Http(Http {
+    fn websocket(url: &str) -> Channel {
+        Channel::WebSocket(WebSocket {
             url: url.into(),
-            ..Http::default()
+            ..WebSocket::default()
         })
     }
 
@@ -696,7 +748,7 @@ mod tests {
                 for i in 0..n {
                     c.outbound
                         .channels
-                        .insert(format!("c{i}"), http("http://h/x"));
+                        .insert(format!("c{i}"), websocket("ws://h/x"));
                 }
             })
         };
@@ -739,14 +791,14 @@ mod tests {
 
     #[test]
     fn channels_are_tagged_and_strict() {
-        let text = r#"{"outbound":{"channels":{"a":{"type":"http","url":"http://h/x"},
+        let text = r#"{"outbound":{"channels":{"a":{"type":"websocket","url":"ws://h/x"},
             "b":{"type":"mqtt","host":"h","topic":"t"}}}}"#;
         let config: Config = serde_json::from_str(text).unwrap();
         config.validate().unwrap();
         assert_eq!(config.outbound.channels.len(), 2);
         assert!(
             serde_json::from_str::<Config>(
-                r#"{"outbound":{"channels":{"a":{"type":"http","url":"http://h","bogus":1}}}}"#
+                r#"{"outbound":{"channels":{"a":{"type":"websocket","url":"ws://h","bogus":1}}}}"#
             )
             .is_err()
         );
@@ -773,14 +825,14 @@ mod tests {
         config
             .outbound
             .channels
-            .insert("bad name".into(), http("http://h/"));
+            .insert("bad name".into(), websocket("ws://h/"));
         assert!(config.validate().is_err());
 
         let mut config = Config::default();
         config
             .outbound
             .channels
-            .insert("a".into(), http("ftp://h/"));
+            .insert("a".into(), websocket("ftp://h/"));
         assert!(config.validate().is_err());
 
         let mut config = Config::default();
@@ -800,28 +852,90 @@ mod tests {
     }
 
     #[test]
+    fn websocket_channels_are_validated() {
+        let check = |c: WebSocket| {
+            let mut config = Config::default();
+            config
+                .outbound
+                .channels
+                .insert("w".into(), Channel::WebSocket(c));
+            config.validate()
+        };
+        let base = |url: &str| WebSocket {
+            url: url.into(),
+            ..WebSocket::default()
+        };
+        assert!(check(base("ws://h:8080/x?device=1")).is_ok());
+        assert!(check(base("wss://[::1]/x")).is_ok());
+        assert!(check(base("https://h/x")).is_err());
+        assert!(check(base("ws://user:pw@h/x")).is_err());
+        assert!(check(base("ws://h/x#part")).is_err());
+        let headers = |name: &str| WebSocket {
+            headers: BTreeMap::from([(name.to_string(), "v".to_string())]),
+            ..base("ws://h/x")
+        };
+        assert!(check(headers("Authorization")).is_ok());
+        assert!(check(headers("Sec-WebSocket-Key")).is_err());
+        assert!(check(headers("bad header")).is_err());
+        let ca_file = |url: &str| WebSocket {
+            ca_file: Some("/etc/ca.pem".into()),
+            ..base(url)
+        };
+        assert!(check(ca_file("wss://h/x")).is_ok());
+        assert!(check(ca_file("ws://h/x")).is_err());
+        let sized = |inflight, max_frame_bytes| WebSocket {
+            inflight,
+            max_frame_bytes,
+            ..base("ws://h/x")
+        };
+        assert!(check(sized(1024, MAX_NOTICE_BYTES)).is_ok());
+        assert!(check(sized(1025, 1 << 20)).is_err());
+        assert!(check(sized(0, 1 << 20)).is_err());
+        assert!(check(sized(1, MAX_NOTICE_BYTES - 1)).is_err());
+
+        let mut config = Config::default();
+        config.outbound.channels.insert(
+            "m".into(),
+            Channel::Mqtt(Mqtt {
+                host: "h".into(),
+                topic: "t".into(),
+                ca_file: Some("/etc/ca.pem".into()),
+                ..Mqtt::default()
+            }),
+        );
+        assert!(config.validate().is_err(), "ca_file without tls");
+
+        // The HTTP channel is gone; a file that still has one says so.
+        let err = serde_json::from_str::<Config>(
+            r#"{"outbound":{"channels":{"a":{"type":"http","url":"http://h/x"}}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant `http`"), "{err}");
+    }
+
+    #[test]
     fn redaction_hides_secrets() {
         let mut config = Config::default();
         config.outbound.channels.insert(
             "a".into(),
-            Channel::Http(Http {
-                url: "https://user:pw@h/x".into(),
+            Channel::WebSocket(WebSocket {
+                url: "wss://h/x?token=abc".into(),
                 headers: BTreeMap::from([
                     ("Authorization".to_string(), "Bearer t".to_string()),
                     ("X-Id".to_string(), "1".to_string()),
                 ]),
-                ..Http::default()
+                ..WebSocket::default()
             }),
         );
         let redacted = config.redacted();
-        let Channel::Http(c) = &redacted.outbound.channels["a"] else {
-            panic!("http channel");
+        let Channel::WebSocket(c) = &redacted.outbound.channels["a"] else {
+            panic!("websocket channel");
         };
-        assert_eq!(c.url, "https://***@h/x");
+        assert_eq!(c.url, "wss://h/x?token=***");
         assert_eq!(c.headers["Authorization"], "***");
         assert_eq!(c.headers["X-Id"], "1");
-        assert_eq!(redacted_url("https://h/x"), "https://h/x");
-        assert_eq!(redacted_url("https://h/x?a=1&b=2"), "https://h/x?a=1&b=2");
+        assert_eq!(redacted_url("wss://h/x"), "wss://h/x");
+        assert_eq!(redacted_url("ws://h/x?a=1&b=2"), "ws://h/x?a=1&b=2");
         assert_eq!(
             redacted_url("wss://u:p@h/x?device=42&token=abc"),
             "wss://***@h/x?device=42&token=***"
@@ -899,7 +1013,7 @@ mod tests {
         let mut next = Config::default();
         next.outbound
             .channels
-            .insert("a".into(), http("http://h/x"));
+            .insert("a".into(), websocket("ws://h/x"));
         store.update(next.clone()).unwrap();
         assert!(rx.has_changed().unwrap());
         assert_eq!(**rx.borrow_and_update(), next);

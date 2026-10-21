@@ -3,8 +3,8 @@
 
 use serde::Serialize;
 
-/// Every notice encodes to at most this many bytes, so a channel whose size
-/// limit admits this much can send every notice.
+/// Every notice encodes to at most this many bytes, as a payload or as a
+/// frame, so a channel whose size limit admits this much can send every one.
 pub const MAX_NOTICE_BYTES: usize = 256;
 
 /// The reason given for a record above the channel's size limit.
@@ -33,13 +33,25 @@ impl Notice<'_> {
         }
     }
 
-    /// `{"notice": {"event": ..., ...}}`
+    /// `{"notice": {"event": ..., ...}}`, the payload of an MQTT publish.
     pub fn encode(&self) -> Vec<u8> {
         #[derive(Serialize)]
         struct Envelope<'a, 'b> {
             notice: &'a Notice<'b>,
         }
         serde_json::to_vec(&Envelope { notice: self }).expect("a notice serializes")
+    }
+
+    /// `{"seq": n, "notice": {...}}`, a WebSocket frame. Like a record's
+    /// frame it carries the sequence number to acknowledge: the last one it
+    /// stands for.
+    pub fn frame(&self, seq: u64) -> String {
+        #[derive(Serialize)]
+        struct Frame<'a, 'b> {
+            seq: u64,
+            notice: &'a Notice<'b>,
+        }
+        serde_json::to_string(&Frame { seq, notice: self }).expect("a notice serializes")
     }
 }
 
@@ -76,6 +88,14 @@ mod tests {
         ];
         for notice in largest {
             assert!(notice.encode().len() <= MAX_NOTICE_BYTES, "{notice:?}");
+            assert!(
+                notice.frame(u64::MAX).len() <= MAX_NOTICE_BYTES,
+                "{notice:?}"
+            );
         }
+        assert_eq!(
+            Notice::lost(3, 5).frame(5),
+            r#"{"seq":5,"notice":{"event":"lost","from_seq":3,"to_seq":5,"count":3}}"#
+        );
     }
 }

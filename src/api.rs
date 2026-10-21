@@ -1,7 +1,6 @@
 //! HTTP API over a Unix domain socket: configuration, time-range queries,
 //! status, metrics and health (ARCHITECTURE.md §8).
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -15,7 +14,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
-use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, watch};
@@ -26,7 +24,8 @@ use tracing::{error, info, warn};
 use crate::config::{self, Config};
 use crate::metrics::{ErrorSlot, Exposition};
 use crate::outbound::Registry;
-use crate::storage::{self, Record, Storage};
+use crate::storage::{self, Storage};
+use crate::view::{self, RecordView};
 use crate::{inbound, uds};
 
 const DEFAULT_LIMIT: usize = 100;
@@ -248,7 +247,7 @@ async fn get_messages(
         .then(|| page.records.last().map(|r| r.seq))
         .flatten();
     let body = MessagesBody {
-        messages: page.records.iter().map(message_view).collect(),
+        messages: page.records.iter().map(view::record).collect(),
         next,
     };
     let json = serde_json::to_vec(&body).map_err(ApiError::internal)?;
@@ -257,36 +256,8 @@ async fn get_messages(
 
 #[derive(Serialize)]
 struct MessagesBody<'a> {
-    messages: Vec<MessageView<'a>>,
+    messages: Vec<RecordView<'a>>,
     next: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct MessageView<'a> {
-    seq: u64,
-    ts: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<&'a RawValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<Cow<'a, str>>,
-}
-
-/// A payload that is valid JSON is embedded verbatim as `data`; any other
-/// payload is a string in `text`, with invalid UTF-8 replaced.
-fn message_view(record: &Record) -> MessageView<'_> {
-    let (data, text) = match std::str::from_utf8(&record.payload) {
-        Ok(s) => match serde_json::from_str::<&RawValue>(s) {
-            Ok(raw) => (Some(raw), None),
-            Err(_) => (None, Some(Cow::Borrowed(s))),
-        },
-        Err(_) => (None, Some(String::from_utf8_lossy(&record.payload))),
-    };
-    MessageView {
-        seq: record.seq,
-        ts: record.ts,
-        data,
-        text,
-    }
 }
 
 async fn get_status(State(state): State<Shared>) -> Json<Value> {
@@ -475,7 +446,7 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
         (
             "uevtd_channel_connected",
             "gauge",
-            "Last delivery or connection succeeded",
+            "A session with the target is up",
             &|m| m.connected.load(Relaxed) as u64,
         ),
         (
@@ -493,13 +464,13 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
         (
             "uevtd_channel_rejected_total",
             "counter",
-            "Messages skipped as permanently rejected",
+            "Messages the channel or its target refused",
             &|m| m.rejected.load(Relaxed),
         ),
         (
             "uevtd_channel_retries_total",
             "counter",
-            "Delivery attempts that failed",
+            "Reconnections after a failed connection or a lost session",
             &|m| m.retries.load(Relaxed),
         ),
         (

@@ -600,8 +600,9 @@ Protocol:
 **Revised order.** (1) Local fixes: M1, M3, M9, L1, L2, L4, L11, L12. (2) Memory budget per Q4 (M4) and
 the new defaults. (3) Eviction-time accounting (M8) and the drop-notice mechanism (Q2), shared by both
 channels. (4) The WebSocket channel replacing HTTP (D12), together with the backoff rule (M5),
-`ca_file` (Q6) and the shared TLS builder. (5) MQTT: `client_id` default (L10), `max_packet_bytes`
-notice. (6) Supervision (M6), recovery and read-error hardening (M7). (7) Observability (L8, D6) and
+`ca_file` (Q6) and the shared TLS builder. (5) MQTT: `client_id` default (L10); the
+`max_packet_bytes` notice came with step 3. (6) Supervision (M6), recovery and read-error hardening
+(M7). (7) Observability (L8, D6) and
 docs (§5, H1, D3, D9, the changelog note on `type: "http"`). The drop ledger (Q2) is last and still to
 be confirmed.
 
@@ -773,6 +774,79 @@ used a 256 KiB log, filled with 2 001 messages while the broker was down:
 
 macOS and Linux: 64 unit and 7 end-to-end tests pass; on Linux 30 of 30 repeated end-to-end runs
 and 15 of 15 unit runs pass.
+
+**Step 4, WebSocket replaces HTTP (2026-10-21).** Implemented D12, M5 and Q6. H2, D1, D4, L6, L7 and
+the HTTP item of L8 are superseded, and probes p08, p09 and p11 are history.
+
+- The HTTP channel is gone, and a configuration with `type: "http"` no longer parses. `reqwest`
+  remains as a test-only dependency, the API client of the end-to-end tests. The runtime
+  dependency tree went from 168 to 170 crates.
+- The WebSocket channel keeps one long-lived connection:
+  - Records go out as text frames in the `/v1/messages` shape; `src/view.rs` now serves both.
+  - The receiver answers `{"ack": n}` (cumulative) or `{"nack": n, "reason": "..."}` (one frame).
+  - At most `inflight` frames and 1 MiB of payload are unanswered.
+  - A ping goes out every `keep_alive_s`; no pong within `timeout_ms` ends the session.
+  - Unanswered frames are sent again in order after a reconnect, and a stopping channel sends a
+    close frame (1001).
+- Inside the channel:
+  - A writer task owns the sending half of the socket.
+  - Records are shared by `Arc` and encoded only when written.
+  - Incoming messages are limited to 64 KiB.
+  - The frame queue holds at most two windows. A fuller one means the receiver acknowledged
+    frames it was never sent, which ends the session.
+- Two deviations from the D12 sketch, both for consistency with step 3:
+  - A notice is a frame with a top-level `seq`, the last sequence number it stands for. It is
+    acknowledged like a record, so it is delivered at least once and in order, not untracked.
+  - A refused record gets no notice, since the receiver refused it itself.
+
+  `max_frame_bytes` is checked against the encoded frame, not the payload.
+- M5, for both channels: the reconnect backoff (1 s doubling to 60 s, now shared as
+  `outbound::pause`) resets only when an acknowledgement advances the cursor; a CONNACK or a
+  handshake no longer does. `retries` counts reconnects on both channels; MQTT counted none
+  before.
+- Q6: `ca_file` for both channels. `src/tls.rs` builds one rustls configuration for MQTT and
+  WebSocket. It uses either the platform verifier, built once per process and shared, or only
+  the certificates of the CA file, read on every connection so that a replaced file applies at
+  the next reconnect. The WebSocket TLS handshake goes through tokio-rustls directly, so
+  tokio-tungstenite needs only its `handshake` feature and none of its private TLS features. MQTT
+  over TLS had no test before; it has one now.
+
+Found while implementing and testing, all fixed:
+
+- My first `submit` ended the session as soon as a frame could not be queued, for example when the
+  writer had stopped. The rest of that batch then never reached the window, but the feed had
+  already moved past it, so those records would never have been delivered. Every record now enters
+  the window first, and a unit test fails without the fix.
+- Two races in my test receiver, not in the daemon:
+  - It read its scripted mode after reporting a frame, so the test could change the answer to
+    that very frame. This failed 2 of 30 Linux runs.
+  - A test deduplicated frames across sessions with a check that only drops consecutive repeats.
+    This failed 1 of 40.
+
+Verified with unit tests and end-to-end tests.
+
+- Unit tests (73) cover the window's acknowledgements and refusals, reply parsing, the frame
+  length, that only progress ends the backoff, a frame that cannot be queued, the WebSocket
+  validation, notice frames, and a CA file.
+- End-to-end tests (13) run against a scripted WebSocket receiver (acknowledge, refuse, stay
+  silent, drop once or always, stop reading) and the MQTT broker, both also over TLS with test
+  certificates in `tests/data`. They cover:
+  - forwarding with handshake headers, reconfiguration and restart;
+  - resending after a lost session, refusals, and the backlog across restarts;
+  - the sync timer and notices over WebSocket;
+  - the backoff gaps of both channels (about 1 s, then at least 1.9 s);
+  - a receiver that stops reading losing its session after a ping;
+  - `wss` and MQTT over TLS trusting only the CA file, while the platform store refuses the test
+    CA.
+
+macOS and Linux: 73 unit and 13 end-to-end tests pass. On Linux, 40 of 40 repeated end-to-end runs
+and 15 of 15 unit runs pass.
+
+Memory was measured as in step 2, with slow WebSocket receivers in place of the slow HTTP targets.
+The receiver is written with the Python standard library, so it is also an independent
+implementation of the protocol, and it acknowledges each frame 2 s late, which keeps every
+window full. Peaks were 5.5 MiB idle, 31.3 MiB with the defaults and 53.3 MiB with every limit
+at its maximum, against 6.0, 30.5 and 53.8 MiB with HTTP channels.
 
 ## Appendix: probes
 

@@ -12,7 +12,9 @@ pub mod logging;
 pub mod metrics;
 pub mod outbound;
 pub mod storage;
+pub mod tls;
 pub mod uds;
+pub mod view;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -3,8 +3,8 @@
 A message forwarding daemon. Producers write newline-delimited messages
 (typically JSON) to a Unix domain socket; `uevtd` appends them to a bounded,
 crash-safe log on disk and forwards them, in order and at least once, to the
-configured HTTP endpoints and MQTT topics. A second Unix socket serves an HTTP
-API for configuration, time-range queries over the log, status and metrics.
+configured WebSocket receivers and MQTT topics. A second Unix socket serves an
+HTTP API for configuration, time-range queries over the log, status and metrics.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and its trade-offs.
 
@@ -58,12 +58,15 @@ delivery cursor, so renaming a channel starts it afresh at the current head.
   "outbound": {
     "channels": {
       "ingest": {
-        "type": "http",
+        "type": "websocket",
         "enabled": true,
-        "url": "https://collector.example/ingest",
-        "method": "POST",
+        "url": "wss://collector.example/ingest",
         "headers": { "Authorization": "Bearer ..." },
-        "timeout_ms": 10000
+        "ca_file": null,
+        "timeout_ms": 10000,
+        "keep_alive_s": 30,
+        "inflight": 256,
+        "max_frame_bytes": 1048576
       },
       "broker": {
         "type": "mqtt",
@@ -71,6 +74,7 @@ delivery cursor, so renaming a channel starts it afresh at the current head.
         "host": "broker.example",
         "port": 8883,
         "tls": true,
+        "ca_file": "/etc/uevtd/broker-ca.pem",
         "topic": "devices/42/events",
         "client_id": "uevtd-42",
         "username": "device",
@@ -91,7 +95,7 @@ Notes:
 - Memory is bounded by sizes and counts, not by traffic: a backlog waits on disk.
   `inbound.max_message_bytes` is at most 262144 and `max_connections` at most
   256, and their product at most 16 MiB, because each connection may hold one
-  message. There are at most 8 channels, and MQTT `inflight` is at most 1024.
+  message. There are at most 8 channels, and a channel's `inflight` is at most 1024.
   Within these limits the daemon stays below about 60 MiB resident; see
   ARCHITECTURE.md §11.1 for the budget and measurements.
 - `storage.max_bytes` bounds the log; the oldest whole segment is evicted when
@@ -104,33 +108,48 @@ Notes:
   forwarded and queryable only once synced, so a positive interval adds up to
   that much latency and a crash can lose at most the unsynced tail, never a
   record that was already seen.
-- HTTP: every message is one request with the payload as the body and
-  `Content-Type: application/json` unless a header overrides it. 2xx is
-  delivered; 408, 429, 5xx, timeouts and connection errors are retried with
-  backoff (100 ms to 30 s) while the channel waits; any other status is logged,
-  counted as rejected and skipped.
+- WebSocket: one long-lived connection (`ws://` or `wss://`); `headers` go with
+  the handshake. Every message is a text frame in the shape `/v1/messages`
+  returns, `{"seq": 7, "ts": 1760928000123456, "data": {...}}`, or `"text"`
+  instead of `"data"` for a payload that is not JSON. The receiver answers
+  `{"ack": n}` once it has processed every frame up to `seq` `n`, or
+  `{"nack": n, "reason": "..."}` for a frame it will never accept, which is
+  counted as rejected and skipped. At most `inflight` frames and 1 MiB of payload
+  wait for an answer, so a receiver slows the stream by answering later. The
+  daemon pings every `keep_alive_s` and gives up on a session without a pong
+  within `timeout_ms`, the same limit as for connecting. Unanswered frames are
+  sent again after a reconnect, so receivers deduplicate by `seq`. A message
+  whose frame would exceed `max_frame_bytes` (at least 256) is replaced by a
+  notice.
 - MQTT: MQTT 3.1.1, `clean_session`, `inflight` publishes pipelined; the cursor
   advances on `PUBACK`/`PUBCOMP` (QoS 1/2) or when written (QoS 0). On a lost
-  connection the daemon reconnects with backoff (1 s to 60 s) and republishes
-  unacknowledged messages in order, so duplicates are possible. Payloads above
-  `max_packet_bytes` (at least 256) are rejected: a notice is published in their
-  place. Keep it below the broker's packet limit, since MQTT 3.1.1 cannot tell an
-  oversized packet from a lost connection.
-- Drop notices: an MQTT channel publishes a notice on its topic in place of the
-  messages it will not deliver, so the receiver learns of the gap:
+  connection the daemon reconnects and republishes unacknowledged messages in
+  order, so duplicates are possible. Payloads above `max_packet_bytes` (at least
+  256) are rejected: a notice is published in their place. Keep it below the
+  broker's packet limit, since MQTT 3.1.1 cannot tell an oversized packet from a
+  lost connection.
+- Reconnects of both channels back off from 1 s to 60 s, and the wait shortens
+  again only once the target acknowledges something: a target that accepts
+  connections but takes nothing is retried less and less often. `retries`
+  counts the reconnects.
+- TLS (`wss://`, or MQTT `tls`) trusts the platform's certificate store, or with
+  `ca_file` only the certificates in that PEM file. The file is read for every
+  connection; a missing file shows in `last_error`.
+- Drop notices: a channel sends a notice in place of the messages it will not
+  deliver, so the receiver learns of the gap. MQTT publishes it on the topic:
 
   ```json
   {"notice": {"event": "lost", "from_seq": 1, "to_seq": 3075, "count": 3075}}
   {"notice": {"event": "rejected", "seq": 4242, "ts": 1760928000123456, "reason": "payload too large"}}
   ```
 
-  `lost` stands for messages evicted from the log before the channel delivered
-  them. `rejected` names one the channel will not deliver; it stays in the log,
-  and `/v1/messages` returns it by `seq` or `ts`. Notices use the channel's QoS,
-  are never retained, and are delivered at least once and in order: the cursor
-  passes the messages a notice stands for once it is acknowledged. Producers
-  should not send messages with a top-level `notice` key. The HTTP channel
-  sends no notices.
+  WebSocket sends it as a frame with the `seq` to acknowledge, the last one it
+  stands for: `{"seq": 3075, "notice": {...}}`. `lost` stands for messages
+  evicted from the log before the channel delivered them. `rejected` names one
+  too large to send; it stays in the log, and `/v1/messages` returns it by `seq`
+  or `ts`. Notices are delivered at least once and in order: the cursor passes
+  the messages a notice stands for once it is acknowledged. MQTT never retains
+  them, and producers should not send messages with a top-level `notice` key.
 - Messages evicted before a channel delivered them are counted in its `lost`
   and logged when they are evicted, also while the target is down. `lag`
   counts only messages still in the log.
@@ -214,6 +233,7 @@ cargo test            # unit tests and end-to-end tests (no external services)
 cargo clippy --all-targets
 ```
 
-The end-to-end tests start the daemon in-process with temporary sockets and a
-local HTTP target. MQTT delivery can be exercised against any broker, e.g.
-`mosquitto`, by configuring a channel and watching `/v1/status`.
+The end-to-end tests start the daemon in-process with temporary sockets, a
+scripted WebSocket receiver and a minimal MQTT broker, both also over TLS with
+the test certificates in `tests/data`. A real broker such as `mosquitto` works
+too: configure a channel and watch `/v1/status`.

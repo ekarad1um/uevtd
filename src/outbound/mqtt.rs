@@ -8,24 +8,20 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use rumqttc::tokio_rustls::rustls::ClientConfig;
 use rumqttc::{
     AsyncClient, ConnectionError, Event, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration,
     Transport,
 };
-use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::notice::{self, Notice};
-use super::{ChannelMetrics, CursorStore, DELIVERY_BYTES, Delivery, Feed, backoff};
-use crate::config;
+use super::{ChannelMetrics, CursorStore, DELIVERY_BYTES, Delivery, Feed, pause};
 use crate::storage::Record;
+use crate::{config, tls};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 pub async fn run(
     cfg: config::Mqtt,
@@ -41,100 +37,77 @@ pub async fn run(
     };
     let limit = cfg.inflight.max(1) as usize;
     let mut tracker = Tracker::new(cursor.current());
+    // Sessions that ended since the cursor last advanced.
     let mut attempt = 0u32;
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!(host = %cfg.host, port = cfg.port, topic = %cfg.topic, qos = cfg.qos, "forwarding over mqtt");
 
-    'session: loop {
-        let (client, mut events) = match connect(&cfg, limit) {
-            Ok(session) => session,
-            Err(e) => {
-                warn!(error = %e, "cannot create mqtt client");
-                metrics.last_error.set(&e);
-                if !pause(attempt, &token).await {
-                    break;
+    'run: loop {
+        let failure = 'session: {
+            let (client, mut events) = match connect(&cfg, limit).await {
+                Ok(session) => session,
+                Err(e) => break 'session e,
+            };
+            for entry in tracker.reset() {
+                publish(&client, &cfg, qos, entry);
+            }
+            let mut connected = false;
+            loop {
+                tokio::select! {
+                    event = events.recv() => {
+                        // Progress, not a CONNACK, ends the backoff: a broker
+                        // that accepts the connection and then drops it on the
+                        // first publish still waits longer each time.
+                        let completed = match event {
+                            Some(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
+                                connected = true;
+                                metrics.connected.store(true, Relaxed);
+                                metrics.last_error.clear();
+                                info!(outstanding = tracker.outstanding(), "connected");
+                                None
+                            }
+                            Some(Ok(Event::Outgoing(Outgoing::Publish(pkid)))) => tracker.sent(pkid),
+                            Some(Ok(Event::Incoming(Packet::PubAck(ack)))) => tracker.acked(ack.pkid),
+                            Some(Ok(Event::Incoming(Packet::PubComp(comp)))) => tracker.acked(comp.pkid),
+                            Some(Ok(_)) => None,
+                            Some(Err(e)) => break 'session e.to_string(),
+                            None => break 'session "event loop ended".to_string(),
+                        };
+                        tally(&metrics, completed);
+                        if cursor.advance(tracker.cursor()) {
+                            attempt = 0;
+                        }
+                    }
+                    // Bounded by count and by payload bytes; the library holds a
+                    // copy of every unacknowledged publish as well.
+                    delivery = feed.next(limit - tracker.outstanding(), DELIVERY_BYTES.saturating_sub(tracker.bytes())),
+                        if connected && tracker.outstanding() < limit && tracker.bytes() < DELIVERY_BYTES => {
+                        submit(delivery, &client, &cfg, qos, &mut tracker, &metrics);
+                    }
+                    _ = flush.tick() => cursor.flush(false).await,
+                    _ = token.cancelled() => break 'run,
                 }
-                attempt += 1;
-                continue;
             }
         };
-        for entry in tracker.reset() {
-            publish(&client, &cfg, qos, entry);
+        metrics.connected.store(false, Relaxed);
+        warn!(error = %failure, outstanding = tracker.outstanding(), "no session");
+        metrics.last_error.set(&failure);
+        metrics.retries.fetch_add(1, Relaxed);
+        if !pause(attempt, &token).await {
+            break;
         }
-        let mut connected = false;
-        loop {
-            tokio::select! {
-                event = events.recv() => match event {
-                    Some(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
-                        connected = true;
-                        attempt = 0;
-                        metrics.connected.store(true, Relaxed);
-                        metrics.last_error.clear();
-                        info!(outstanding = tracker.outstanding(), "connected");
-                    }
-                    Some(Ok(Event::Outgoing(Outgoing::Publish(pkid)))) => {
-                        tally(&metrics, tracker.sent(pkid));
-                        cursor.advance(tracker.cursor());
-                    }
-                    Some(Ok(Event::Incoming(Packet::PubAck(ack)))) => {
-                        tally(&metrics, tracker.acked(ack.pkid));
-                        cursor.advance(tracker.cursor());
-                    }
-                    Some(Ok(Event::Incoming(Packet::PubComp(comp)))) => {
-                        tally(&metrics, tracker.acked(comp.pkid));
-                        cursor.advance(tracker.cursor());
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => {
-                        metrics.connected.store(false, Relaxed);
-                        metrics.last_error.set(&e);
-                        warn!(error = %e, outstanding = tracker.outstanding(), "connection lost");
-                        if !pause(attempt, &token).await {
-                            break 'session;
-                        }
-                        attempt += 1;
-                        continue 'session;
-                    }
-                    None => {
-                        metrics.connected.store(false, Relaxed);
-                        warn!("event loop ended");
-                        if !pause(attempt, &token).await {
-                            break 'session;
-                        }
-                        attempt += 1;
-                        continue 'session;
-                    }
-                },
-                // Bounded by count and by payload bytes; the library holds a
-                // copy of every unacknowledged publish as well.
-                delivery = feed.next(limit - tracker.outstanding(), DELIVERY_BYTES.saturating_sub(tracker.bytes())),
-                    if connected && tracker.outstanding() < limit && tracker.bytes() < DELIVERY_BYTES => {
-                    submit(delivery, &client, &cfg, qos, &mut tracker, &metrics);
-                }
-                _ = flush.tick() => cursor.flush(false).await,
-                _ = token.cancelled() => break 'session,
-            }
-        }
+        attempt += 1;
     }
+    metrics.connected.store(false, Relaxed);
     cursor.flush(true).await;
-}
-
-/// Sleeps for the reconnect backoff; false if cancelled meanwhile.
-async fn pause(attempt: u32, token: &CancellationToken) -> bool {
-    let delay = backoff(attempt, BACKOFF_BASE, BACKOFF_MAX);
-    debug!(delay_s = delay.as_secs(), "reconnecting after backoff");
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => true,
-        _ = token.cancelled() => false,
-    }
 }
 
 type Events = mpsc::Receiver<Result<Event, ConnectionError>>;
 
 /// Builds a client and drives its event loop on a task that forwards events;
 /// the task ends on the first connection error or when the receiver is dropped.
-fn connect(cfg: &config::Mqtt, limit: usize) -> Result<(AsyncClient, Events), String> {
+async fn connect(cfg: &config::Mqtt, limit: usize) -> Result<(AsyncClient, Events), String> {
     let mut options = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
     options
         .set_keep_alive(Duration::from_secs(cfg.keep_alive_s.max(1)))
@@ -152,10 +125,11 @@ fn connect(cfg: &config::Mqtt, limit: usize) -> Result<(AsyncClient, Events), St
         options.set_credentials(user.clone(), cfg.password.clone().unwrap_or_default());
     }
     if cfg.tls {
-        let tls = ClientConfig::with_platform_verifier().map_err(|e| format!("tls: {e}"))?;
-        options.set_transport(Transport::tls_with_config(TlsConfiguration::Rustls(
-            Arc::new(tls),
-        )));
+        let ca_file = cfg.ca_file.clone();
+        let tls = tokio::task::spawn_blocking(move || tls::client_config(ca_file.as_deref()))
+            .await
+            .map_err(|e| format!("tls: {e}"))??;
+        options.set_transport(Transport::tls_with_config(TlsConfiguration::Rustls(tls)));
     }
     let (client, mut eventloop) = AsyncClient::new(options, limit);
     let (tx, rx) = mpsc::channel(limit.max(16));

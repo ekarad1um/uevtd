@@ -1,70 +1,32 @@
-//! End-to-end: a daemon with channels pointed at a local HTTP server and a
-//! minimal MQTT broker, driven through its inbound socket and HTTP API.
+//! End-to-end: a daemon with channels pointed at a scripted WebSocket
+//! receiver and a minimal MQTT broker, driven through its inbound socket and
+//! HTTP API.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode};
-use axum::routing::post;
+use futures_util::{SinkExt, StreamExt};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_util::sync::CancellationToken;
 
-use uevtd::config::{self, Channel, Config, Http, Mqtt};
+use uevtd::config::{self, Channel, Config, Mqtt, WebSocket};
 use uevtd::daemon::{self, Options};
-
-struct Received {
-    method: Method,
-    headers: HeaderMap,
-    body: Vec<u8>,
-}
-
-struct Target {
-    url: String,
-    requests: mpsc::UnboundedReceiver<Received>,
-    status: Arc<AtomicU16>,
-}
-
-async fn target() -> Target {
-    let (tx, requests) = mpsc::unbounded_channel();
-    let status = Arc::new(AtomicU16::new(200));
-    let state = (tx, status.clone());
-    let app = Router::new()
-        .route("/ingest", post(ingest))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(axum::serve(listener, app).into_future());
-    Target {
-        url: format!("http://{addr}/ingest"),
-        requests,
-        status,
-    }
-}
-
-async fn ingest(
-    State((tx, status)): State<(mpsc::UnboundedSender<Received>, Arc<AtomicU16>)>,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
-) -> StatusCode {
-    let _ = tx.send(Received {
-        method,
-        headers,
-        body: body.to_vec(),
-    });
-    StatusCode::from_u16(status.load(Relaxed)).unwrap()
-}
 
 struct Env {
     _dir: tempfile::TempDir,
@@ -97,9 +59,10 @@ impl Env {
         c
     }
 
+    /// With one WebSocket channel `t` that sends the header `X-Test: 1`.
     fn config(&self, url: &str) -> Config {
         let mut c = self.base();
-        c.outbound.channels.insert("t".into(), http(url, "1"));
+        c.outbound.channels.insert("t".into(), websocket(url, "1"));
         c
     }
 
@@ -148,12 +111,13 @@ impl Env {
     }
 }
 
-fn http(url: &str, test_header: &str) -> Channel {
-    Channel::Http(Http {
+/// Pings every second, so that every test also exercises them.
+fn websocket(url: &str, test_header: &str) -> Channel {
+    Channel::WebSocket(WebSocket {
         url: url.into(),
         headers: BTreeMap::from([("X-Test".to_string(), test_header.to_string())]),
-        timeout_ms: 2000,
-        ..Http::default()
+        keep_alive_s: 1,
+        ..WebSocket::default()
     })
 }
 
@@ -174,6 +138,10 @@ impl Daemon {
         let status = response.status();
         let body = response.bytes().await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    async fn channel(&self, name: &str) -> Value {
+        self.get("/v1/status").await.1["channels"][name].take()
     }
 
     async fn patch(&self, body: Value) -> (StatusCode, Value) {
@@ -211,18 +179,167 @@ where
     }
 }
 
-async fn next_request(target: &mut Target) -> Received {
-    tokio::time::timeout(Duration::from_secs(10), target.requests.recv())
-        .await
-        .expect("request arrives")
+async fn listen() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0").await.unwrap()
+}
+
+/// An address that nothing listens on yet.
+async fn unused_address() -> SocketAddr {
+    listen().await.local_addr().unwrap()
+}
+
+fn data(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
+}
+
+/// TLS with the test certificate for `localhost` and `127.0.0.1`, signed by
+/// the test CA in `tests/data/ca.pem`.
+fn tls_acceptor() -> TlsAcceptor {
+    let certs = CertificateDer::pem_file_iter(data("server.pem"))
         .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_file(data("server.key")).unwrap();
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    TlsAcceptor::from(Arc::new(config))
+}
+
+// How the receiver answers each frame.
+/// Acknowledges it.
+const ACK: u8 = 0;
+/// Refuses every record and acknowledges notices.
+const NACK: u8 = 1;
+/// Answers nothing.
+const SILENT: u8 = 2;
+/// Drops the connection on the next frame without answering, then acknowledges.
+const DROP_ONCE: u8 = 3;
+/// Drops the connection on every frame.
+const DROP: u8 = 4;
+/// Stops reading after the next frame, without closing; pings go unanswered.
+const STALL: u8 = 5;
+
+enum Event {
+    /// A handshake, with its request headers.
+    Connected(HeaderMap, Instant),
+    Frame(Value),
+}
+
+/// A WebSocket receiver that reports every connection and frame, in order,
+/// and answers frames as `mode` says.
+struct Receiver {
+    url: String,
+    events: mpsc::UnboundedReceiver<Event>,
+    mode: Arc<AtomicU8>,
+}
+
+impl Receiver {
+    fn start(listener: TcpListener, tls: Option<TlsAcceptor>) -> Receiver {
+        let scheme = if tls.is_some() { "wss" } else { "ws" };
+        let url = format!("{scheme}://{}/ingest", listener.local_addr().unwrap());
+        let (tx, events) = mpsc::unbounded_channel();
+        let mode = Arc::new(AtomicU8::new(ACK));
+        let shared = mode.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (tx, mode, tls) = (tx.clone(), shared.clone(), tls.clone());
+                tokio::spawn(async move {
+                    match tls {
+                        Some(tls) => {
+                            if let Ok(stream) = tls.accept(stream).await {
+                                receive(stream, tx, mode).await;
+                            }
+                        }
+                        None => receive(stream, tx, mode).await,
+                    }
+                });
+            }
+        });
+        Receiver { url, events, mode }
+    }
+
+    fn set(&self, mode: u8) {
+        self.mode.store(mode, Relaxed);
+    }
+
+    async fn event(&mut self) -> Event {
+        tokio::time::timeout(Duration::from_secs(30), self.events.recv())
+            .await
+            .expect("the receiver sees something")
+            .unwrap()
+    }
+
+    async fn connected(&mut self) -> HeaderMap {
+        match self.event().await {
+            Event::Connected(headers, _) => headers,
+            Event::Frame(frame) => panic!("a frame where a connection was expected: {frame}"),
+        }
+    }
+
+    async fn frame(&mut self) -> Value {
+        match self.event().await {
+            Event::Frame(frame) => frame,
+            Event::Connected(..) => panic!("a connection where a frame was expected"),
+        }
+    }
+}
+
+async fn receive<S>(stream: S, events: mpsc::UnboundedSender<Event>, mode: Arc<AtomicU8>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut headers = HeaderMap::new();
+    // The signature, and its large error, are tungstenite's.
+    #[allow(clippy::result_large_err)]
+    let callback = |request: &Request, response: Response| {
+        headers = request.headers().clone();
+        Ok(response)
+    };
+    let Ok(mut socket) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
+        return;
+    };
+    let _ = events.send(Event::Connected(headers, Instant::now()));
+    while let Some(Ok(message)) = socket.next().await {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let frame: Value = serde_json::from_str(&text).unwrap();
+        let seq = frame["seq"].as_u64().unwrap();
+        let notice = frame.get("notice").is_some();
+        // Taken before the frame is reported, so that a test reacting to the
+        // frame decides the next one, never this one.
+        let now = mode
+            .compare_exchange(DROP_ONCE, ACK, Relaxed, Relaxed)
+            .unwrap_or_else(|current| current);
+        let _ = events.send(Event::Frame(frame));
+        let answer = match now {
+            ACK => json!({"ack": seq}),
+            NACK if notice => json!({"ack": seq}),
+            NACK => json!({"nack": seq, "reason": "refused by test"}),
+            SILENT => continue,
+            STALL => return std::future::pending().await,
+            _ => return,
+        };
+        if socket
+            .send(Message::text(answer.to_string()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn forwards_queries_reconfigures_and_resumes() {
-    let mut target = target().await;
+    let mut receiver = Receiver::start(listen().await, None);
     let env = Env::new();
-    let daemon = env.start(env.config(&target.url)).await;
+    let daemon = env.start(env.config(&receiver.url)).await;
+    assert_eq!(receiver.connected().await["x-test"], "1");
 
     // Three messages, one oversized line, one truncated tail.
     let big = format!("{{\"big\":\"{}\"}}\n", "x".repeat(2000));
@@ -234,14 +351,19 @@ async fn forwards_queries_reconfigures_and_resumes() {
         b"{\"n\":3",
     ])
     .await;
-
-    for expected in ["{\"n\":1}", "{\"n\":2}", "not json"] {
-        let r = next_request(&mut target).await;
-        assert_eq!(r.method, Method::POST);
-        assert_eq!(r.headers.get("content-type").unwrap(), "application/json");
-        assert_eq!(r.headers.get("x-test").unwrap(), "1");
-        assert_eq!(r.body, expected.as_bytes());
-    }
+    let frames = vec![
+        receiver.frame().await,
+        receiver.frame().await,
+        receiver.frame().await,
+    ];
+    assert_eq!(frames[0]["seq"], 1);
+    assert_eq!(frames[0]["data"], json!({"n": 1}));
+    assert_eq!(frames[1]["data"], json!({"n": 2}));
+    assert_eq!(frames[2]["seq"], 3);
+    assert_eq!(frames[2]["text"], "not json");
+    // A frame and a query return the same record the same way.
+    let (_, all) = daemon.get("/v1/messages").await;
+    assert_eq!(all["messages"], Value::Array(frames));
 
     let (status, messages) = daemon.get("/v1/messages?limit=2").await;
     assert_eq!(status, StatusCode::OK);
@@ -264,7 +386,7 @@ async fn forwards_queries_reconfigures_and_resumes() {
     assert!(err["error"].is_string());
 
     wait_for(Duration::from_secs(5), || async {
-        daemon.get("/v1/status").await.1["channels"]["t"]["lag"] == 0
+        daemon.channel("t").await["lag"] == 0
     })
     .await;
     let (_, status) = daemon.get("/v1/status").await;
@@ -272,13 +394,19 @@ async fn forwards_queries_reconfigures_and_resumes() {
     assert_eq!(status["inbound"]["oversized"], 1);
     assert_eq!(status["inbound"]["truncated"], 1);
     assert_eq!(status["storage"]["head_seq"], 3);
-    assert_eq!(status["channels"]["t"]["delivered"], 3);
-    assert_eq!(status["channels"]["t"]["cursor"], 4);
-    assert_eq!(status["restart_required"], serde_json::json!([]));
+    let channel = &status["channels"]["t"];
+    assert_eq!(channel["kind"], "websocket");
+    assert_eq!(channel["connected"], true);
+    assert_eq!(channel["delivered"], 3);
+    assert_eq!(channel["cursor"], 4);
+    // Pinged every second all along, and answered.
+    assert_eq!(channel["retries"], 0);
+    assert_eq!(status["restart_required"], json!([]));
 
-    // Reconfigure the channel: it restarts and keeps its position.
+    // Reconfigure the channel: it reconnects with the new header and keeps
+    // its position.
     let (status, applied) = daemon
-        .patch(serde_json::json!({
+        .patch(json!({
             "outbound": {"channels": {"t": {"headers": {"X-Test": "2"}}}},
             "storage": {"path": "/elsewhere"},
         }))
@@ -294,21 +422,22 @@ async fn forwards_queries_reconfigures_and_resumes() {
     );
     assert_eq!(
         daemon.get("/v1/status").await.1["restart_required"],
-        serde_json::json!(["storage.path"])
+        json!(["storage.path"])
     );
-    let (status, err) = daemon
-        .patch(serde_json::json!({"storage": {"max_bytes": 1}}))
-        .await;
+    let (status, err) = daemon.patch(json!({"storage": {"max_bytes": 1}})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(err["error"].as_str().unwrap().contains("max_bytes"));
+    assert_eq!(receiver.connected().await["x-test"], "2");
 
     env.send(&[b"{\"n\":4}\n"]).await;
-    let r = next_request(&mut target).await;
-    assert_eq!(r.headers.get("x-test").unwrap(), "2");
-    assert_eq!(r.body, b"{\"n\":4}");
-    // The target sees the request before the daemon sees the response.
+    let frame = receiver.frame().await;
+    assert_eq!(
+        (&frame["seq"], &frame["data"]),
+        (&json!(4), &json!({"n": 4}))
+    );
+    // The receiver sees the frame before the daemon sees its acknowledgement.
     wait_for(Duration::from_secs(5), || async {
-        daemon.get("/v1/status").await.1["channels"]["t"]["delivered"] == 4
+        daemon.channel("t").await["delivered"] == 4
     })
     .await;
 
@@ -322,127 +451,143 @@ async fn forwards_queries_reconfigures_and_resumes() {
         .await
         .unwrap();
     assert!(
-        metrics.contains("uevtd_channel_delivered_total{channel=\"t\",kind=\"http\"} 4"),
+        metrics.contains("uevtd_channel_delivered_total{channel=\"t\",kind=\"websocket\"} 4"),
         "{metrics}"
     );
     assert!(metrics.contains("uevtd_inbound_truncated_total 1"));
 
     // Restore the storage path before restarting on the same directory.
     let (status, _) = daemon
-        .patch(serde_json::json!({"storage": {"path": env.config(&target.url).storage.path}}))
+        .patch(json!({"storage": {"path": env.base().storage.path}}))
         .await;
     assert_eq!(status, StatusCode::OK);
     daemon.stop().await;
     assert!(!env.api.exists());
     assert!(!env.inbound.exists());
 
-    // Restart: sequence numbers continue and nothing is redelivered.
+    // Restart: sequence numbers continue and nothing is sent again.
     let daemon = env.start(config::load(&env.config_path).unwrap()).await;
+    assert_eq!(receiver.connected().await["x-test"], "2");
     env.send(&[b"{\"n\":5}\n"]).await;
-    let r = next_request(&mut target).await;
-    assert_eq!(r.body, b"{\"n\":5}");
+    let frame = receiver.frame().await;
+    assert_eq!((&frame["seq"], &frame["data"]["n"]), (&json!(5), &json!(5)));
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), target.requests.recv())
+        tokio::time::timeout(Duration::from_millis(300), receiver.events.recv())
             .await
             .is_err()
     );
-    let (_, status) = daemon.get("/v1/status").await;
-    assert_eq!(status["storage"]["head_seq"], 5);
-    assert_eq!(status["channels"]["t"]["cursor"], 6);
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("t").await["cursor"] == 6
+    })
+    .await;
+    assert_eq!(daemon.get("/v1/status").await.1["storage"]["head_seq"], 5);
     daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn retries_transient_failures_and_skips_rejections() {
-    let mut target = target().await;
+async fn resends_after_a_lost_session_and_counts_refusals() {
+    let mut receiver = Receiver::start(listen().await, None);
     let env = Env::new();
-    let daemon = env.start(env.config(&target.url)).await;
+    let daemon = env.start(env.config(&receiver.url)).await;
+    receiver.connected().await;
 
-    target.status.store(503, Relaxed);
+    // The receiver drops the connection without answering: the frame is
+    // sent again in the next session.
+    receiver.set(DROP_ONCE);
     env.send(&[b"{\"n\":1}\n"]).await;
-    let first = next_request(&mut target).await;
-    assert_eq!(first.body, b"{\"n\":1}");
-    let retry = next_request(&mut target).await;
-    assert_eq!(retry.body, b"{\"n\":1}");
-    target.status.store(200, Relaxed);
-    wait_for(Duration::from_secs(10), || async {
-        daemon.get("/v1/status").await.1["channels"]["t"]["delivered"] == 1
-    })
-    .await;
-    while target.requests.try_recv().is_ok() {}
-
-    target.status.store(400, Relaxed);
-    env.send(&[b"{\"n\":2}\n", b"{\"n\":3}\n"]).await;
-    let _ = next_request(&mut target).await;
-    let _ = next_request(&mut target).await;
+    assert_eq!(receiver.frame().await["seq"], 1);
+    receiver.connected().await;
+    assert_eq!(receiver.frame().await["seq"], 1);
     wait_for(Duration::from_secs(5), || async {
-        daemon.get("/v1/status").await.1["channels"]["t"]["cursor"] == 4
+        daemon.channel("t").await["delivered"] == 1
     })
     .await;
-    let (_, status) = daemon.get("/v1/status").await;
-    assert_eq!(status["channels"]["t"]["rejected"], 2);
-    assert!(status["channels"]["t"]["retries"].as_u64().unwrap() >= 1);
+    let channel = daemon.channel("t").await;
+    assert_eq!(channel["cursor"], 2);
+    assert_eq!(channel["retries"], 1);
+
+    // Refused records are counted and passed, and stay in the log.
+    receiver.set(NACK);
+    env.send(&[b"{\"n\":2}\n", b"{\"n\":3}\n"]).await;
+    assert_eq!(receiver.frame().await["seq"], 2);
+    assert_eq!(receiver.frame().await["seq"], 3);
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("t").await["cursor"] == 4
+    })
+    .await;
+    let channel = daemon.channel("t").await;
+    assert_eq!(channel["rejected"], 2);
+    assert_eq!(channel["delivered"], 1);
+    let error = channel["last_error"]["message"].as_str().unwrap();
     assert!(
-        status["channels"]["t"]["last_error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("400")
+        error.contains("seq 3") && error.contains("refused by test"),
+        "{error}"
     );
+    let (_, page) = daemon.get("/v1/messages?after=1").await;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 2);
     daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn backlog_survives_channel_restart_before_first_delivery() {
-    let mut target = target().await;
+    let mut receiver = Receiver::start(listen().await, None);
+    receiver.set(SILENT);
     let env = Env::new();
-    target.status.store(503, Relaxed);
-    let daemon = env.start(env.config(&target.url)).await;
+    let daemon = env.start(env.config(&receiver.url)).await;
+    receiver.connected().await;
     env.send(&[b"{\"n\":1}\n", b"{\"n\":2}\n", b"{\"n\":3}\n"])
         .await;
-    let first = next_request(&mut target).await;
-    assert_eq!(first.body, b"{\"n\":1}");
+    for seq in 1..=3 {
+        assert_eq!(receiver.frame().await["seq"], seq);
+    }
 
-    // Reconfigure the channel and restart the daemon while nothing has been delivered.
+    // Reconfigure the channel and restart the daemon while nothing has been
+    // acknowledged.
     let (status, _) = daemon
-        .patch(serde_json::json!({"outbound": {"channels": {"t": {"headers": {"X-Test": "2"}}}}}))
+        .patch(json!({"outbound": {"channels": {"t": {"headers": {"X-Test": "2"}}}}}))
         .await;
     assert_eq!(status, StatusCode::OK);
     daemon.stop().await;
-    let daemon = env.start(config::load(&env.config_path).unwrap()).await;
-    target.status.store(200, Relaxed);
+    receiver.set(ACK);
+    let mut config = config::load(&env.config_path).unwrap();
+    let Some(Channel::WebSocket(c)) = config.outbound.channels.get_mut("t") else {
+        panic!("websocket channel");
+    };
+    c.headers.insert("X-Test".into(), "3".into());
+    let daemon = env.start(config).await;
 
-    let mut seen = Vec::new();
-    while seen.last() != Some(&3) {
-        let body: Value = serde_json::from_slice(&next_request(&mut target).await.body).unwrap();
-        let n = body["n"].as_u64().unwrap();
-        if seen.last() != Some(&n) {
-            seen.push(n);
-        }
+    // The session after the reconfiguration may have sent some frames again;
+    // the session after the restart starts over at the first.
+    while !matches!(receiver.event().await, Event::Connected(h, _) if h["x-test"] == "3") {}
+    for n in 1..=3 {
+        assert_eq!(receiver.frame().await["data"]["n"], n);
     }
-    assert_eq!(seen, vec![1, 2, 3]);
     wait_for(Duration::from_secs(5), || async {
-        daemon.get("/v1/status").await.1["channels"]["t"]["cursor"] == 4
+        daemon.channel("t").await["cursor"] == 4
     })
     .await;
-    let (_, status) = daemon.get("/v1/status").await;
-    assert_eq!(status["channels"]["t"]["delivered"], 3);
-    assert_eq!(status["channels"]["t"]["lost"], 0);
+    let channel = daemon.channel("t").await;
+    assert_eq!(channel["delivered"], 3);
+    assert_eq!(channel["lost"], 0);
     daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
-    let mut target = target().await;
+    let mut receiver = Receiver::start(listen().await, None);
     let env = Env::new();
-    let mut config = env.config(&target.url);
+    let mut config = env.config(&receiver.url);
     config.storage.sync_interval_ms = 50;
     let daemon = env.start(config).await;
     env.send(&[b"{\"n\":1}\n", b"{\"n\":2}\n", b"{\"n\":3}\n"])
         .await;
-    for n in 1..=3 {
-        let r = next_request(&mut target).await;
-        assert_eq!(r.body, format!("{{\"n\":{n}}}").as_bytes());
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        if let Event::Frame(frame) = receiver.event().await {
+            seen.push(frame["data"]["n"].as_u64().unwrap());
+        }
     }
+    assert_eq!(seen, vec![1, 2, 3]);
 
     // Stop right after sending: the final sync commits what the timer has not.
     env.send(&[b"{\"n\":4}\n", b"{\"n\":5}\n"]).await;
@@ -455,10 +600,11 @@ async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
     assert_eq!(daemon.get("/v1/status").await.1["storage"]["head_seq"], 5);
     let mut seen = Vec::new();
     while seen.last() != Some(&5) {
-        let body: Value = serde_json::from_slice(&next_request(&mut target).await.body).unwrap();
-        let n = body["n"].as_u64().unwrap();
-        if seen.last() != Some(&n) {
-            seen.push(n);
+        if let Event::Frame(frame) = receiver.event().await {
+            let n = frame["data"]["n"].as_u64().unwrap();
+            if seen.last() != Some(&n) {
+                seen.push(n);
+            }
         }
     }
     assert_eq!(seen, vec![4, 5]);
@@ -467,12 +613,12 @@ async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_patches_compose() {
-    let target = target().await;
+    let receiver = Receiver::start(listen().await, None);
     let env = Env::new();
-    let daemon = env.start(env.config(&target.url)).await;
+    let daemon = env.start(env.config(&receiver.url)).await;
     for i in 1..=10u64 {
-        let a = daemon.patch(serde_json::json!({"storage": {"sync_interval_ms": i}}));
-        let b = daemon.patch(serde_json::json!({"inbound": {"max_connections": 100 + i}}));
+        let a = daemon.patch(json!({"storage": {"sync_interval_ms": i}}));
+        let b = daemon.patch(json!({"inbound": {"max_connections": 100 + i}}));
         let ((status_a, _), (status_b, _)) = tokio::join!(a, b);
         assert_eq!((status_a, status_b), (StatusCode::OK, StatusCode::OK));
     }
@@ -491,11 +637,11 @@ async fn concurrent_patches_compose() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn refuses_to_steal_a_live_socket() {
-    let target = target().await;
+    let receiver = Receiver::start(listen().await, None);
     let env = Env::new();
-    let daemon = env.start(env.config(&target.url)).await;
+    let daemon = env.start(env.config(&receiver.url)).await;
     let other = Env::new();
-    let mut config = other.config(&target.url);
+    let mut config = other.config(&receiver.url);
     config.inbound.path = env.inbound.clone();
     config::save(&other.config_path, &config).unwrap();
     let result = daemon::run(
@@ -516,6 +662,182 @@ async fn refuses_to_steal_a_live_socket() {
     daemon.stop().await;
 }
 
+/// 2 000 messages of about 420 bytes overflow a 256 KiB log; then one more
+/// of about 610 bytes.
+async fn overflow_then_one_large(env: &Env, daemon: &Daemon) {
+    let pad = "p".repeat(400);
+    let lines: Vec<String> = (1..=2000)
+        .map(|n| format!("{{\"n\":{n},\"pad\":\"{pad}\"}}\n"))
+        .collect();
+    env.send(&lines.iter().map(|l| l.as_bytes()).collect::<Vec<_>>())
+        .await;
+    wait_for(Duration::from_secs(10), || async {
+        daemon.get("/v1/status").await.1["storage"]["head_seq"] == 2000
+    })
+    .await;
+    let large = format!("{{\"large\":\"{}\"}}\n", "l".repeat(600));
+    env.send(&[large.as_bytes()]).await;
+    wait_for(Duration::from_secs(10), || async {
+        daemon.get("/v1/status").await.1["storage"]["head_seq"] == 2001
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_sends_notices_in_place_of_lost_and_oversized_records() {
+    let addr = unused_address().await;
+    let env = Env::new();
+    let mut config = env.base();
+    config.storage.max_bytes = 256 << 10;
+    config.outbound.channels.insert(
+        "w".into(),
+        Channel::WebSocket(WebSocket {
+            url: format!("ws://{addr}/ingest"),
+            max_frame_bytes: 512,
+            ..WebSocket::default()
+        }),
+    );
+    let daemon = env.start(config).await;
+
+    // The log overflows while the receiver is down. The records evicted are
+    // counted as lost when they are evicted.
+    overflow_then_one_large(&env, &daemon).await;
+    let (_, status) = daemon.get("/v1/status").await;
+    let first = status["storage"]["first_seq"].as_u64().unwrap();
+    assert!(first > 1);
+    let channel = &status["channels"]["w"];
+    assert_eq!(channel["connected"], false);
+    assert_eq!(channel["cursor"], 1);
+    assert_eq!(channel["lost"], first - 1);
+
+    // Once the receiver is up: a notice in place of the evicted records, the
+    // records still in the log, then a notice in place of the large one. A
+    // notice carries the sequence number to acknowledge, as a record does.
+    let mut receiver = Receiver::start(TcpListener::bind(addr).await.unwrap(), None);
+    receiver.connected().await;
+    assert_eq!(
+        receiver.frame().await,
+        json!({"seq": first - 1, "notice": {"event": "lost", "from_seq": 1, "to_seq": first - 1, "count": first - 1}})
+    );
+    for n in first..=2000 {
+        let frame = receiver.frame().await;
+        assert_eq!((&frame["seq"], &frame["data"]["n"]), (&json!(n), &json!(n)));
+    }
+    let rejected = receiver.frame().await;
+    assert_eq!(rejected["seq"], 2001);
+    assert_eq!(rejected["notice"]["event"], "rejected");
+    assert_eq!(rejected["notice"]["seq"], 2001);
+    assert_eq!(rejected["notice"]["reason"], "payload too large");
+
+    wait_for(Duration::from_secs(10), || async {
+        daemon.channel("w").await["cursor"] == 2002
+    })
+    .await;
+    let channel = daemon.channel("w").await;
+    assert_eq!(channel["delivered"], 2001 - first);
+    assert_eq!(channel["notices"], 2);
+    assert_eq!(channel["rejected"], 1);
+    assert_eq!(channel["lost"], first - 1);
+    assert_eq!(channel["lag"], 0);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_reconnects_back_off_while_the_receiver_takes_nothing() {
+    let mut receiver = Receiver::start(listen().await, None);
+    receiver.set(DROP);
+    let env = Env::new();
+    let daemon = env.start(env.config(&receiver.url)).await;
+    let Event::Connected(_, mut last) = receiver.event().await else {
+        panic!("a connection first");
+    };
+    env.send(&[b"{\"n\":1}\n"]).await;
+    // Every session ends at the first frame, so the cursor never advances and
+    // each reconnect waits twice as long as the one before: 1 s, then 2 s.
+    let mut gaps = Vec::new();
+    while gaps.len() < 2 {
+        if let Event::Connected(_, at) = receiver.event().await {
+            gaps.push(at - last);
+            last = at;
+        }
+    }
+    assert!(gaps[0] >= Duration::from_millis(900), "{gaps:?}");
+    assert!(gaps[1] >= Duration::from_millis(1900), "{gaps:?}");
+    let channel = daemon.channel("t").await;
+    assert_eq!(channel["delivered"], 0);
+    assert!(channel["retries"].as_u64().unwrap() >= 2);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receiver_that_stops_answering_pings_loses_its_session() {
+    let mut receiver = Receiver::start(listen().await, None);
+    receiver.set(STALL);
+    let env = Env::new();
+    let mut config = env.config(&receiver.url);
+    let Some(Channel::WebSocket(c)) = config.outbound.channels.get_mut("t") else {
+        panic!("websocket channel");
+    };
+    c.timeout_ms = 500;
+    let daemon = env.start(config).await;
+    receiver.connected().await;
+    env.send(&[b"{\"n\":1}\n"]).await;
+    assert_eq!(receiver.frame().await["seq"], 1);
+    // The stalled receiver answers neither the frame nor the next ping; the
+    // channel gives up on the session and sends the frame again in a new one.
+    receiver.set(ACK);
+    receiver.connected().await;
+    assert_eq!(receiver.frame().await["seq"], 1);
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("t").await["delivered"] == 1
+    })
+    .await;
+    assert!(daemon.channel("t").await["retries"].as_u64().unwrap() >= 1);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wss_trusts_the_ca_file_instead_of_the_platform_store() {
+    let mut receiver = Receiver::start(listen().await, Some(tls_acceptor()));
+    let env = Env::new();
+    let mut config = env.base();
+    let channel = |ca_file: Option<PathBuf>| {
+        Channel::WebSocket(WebSocket {
+            url: receiver.url.clone(),
+            ca_file,
+            ..WebSocket::default()
+        })
+    };
+    config
+        .outbound
+        .channels
+        .insert("trusted".into(), channel(Some(data("ca.pem"))));
+    config
+        .outbound
+        .channels
+        .insert("platform".into(), channel(None));
+    let daemon = env.start(config).await;
+
+    // Only the channel that trusts the test CA gets through.
+    receiver.connected().await;
+    env.send(&[b"{\"n\":1}\n"]).await;
+    assert_eq!(receiver.frame().await["data"]["n"], 1);
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("trusted").await["delivered"] == 1
+    })
+    .await;
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("platform").await["last_error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("tls"))
+    })
+    .await;
+    let platform = daemon.channel("platform").await;
+    assert_eq!(platform["connected"], false);
+    assert_eq!(platform["delivered"], 0);
+    daemon.stop().await;
+}
+
 /// A PUBLISH as the broker received it.
 struct Publish {
     topic: String,
@@ -523,19 +845,48 @@ struct Publish {
     payload: Vec<u8>,
 }
 
+enum BrokerEvent {
+    Connected(Instant),
+    Published(Publish),
+}
+
 /// A minimal MQTT 3.1.1 broker: accepts every client, acknowledges QoS 1
-/// publishes, and reports publishes in the order they arrive.
-fn broker(listener: TcpListener) -> mpsc::UnboundedReceiver<Publish> {
+/// publishes or drops the connection on each, and reports connections and
+/// publishes in the order they arrive.
+fn broker(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    drop_publishes: bool,
+) -> mpsc::UnboundedReceiver<BrokerEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(session(stream, tx.clone()));
+            let (tx, tls) = (tx.clone(), tls.clone());
+            tokio::spawn(async move {
+                match tls {
+                    Some(tls) => {
+                        if let Ok(stream) = tls.accept(stream).await {
+                            let _ = session(stream, tx, drop_publishes).await;
+                        }
+                    }
+                    None => {
+                        let _ = session(stream, tx, drop_publishes).await;
+                    }
+                }
+            });
         }
     });
     rx
 }
 
-async fn session(mut stream: TcpStream, tx: mpsc::UnboundedSender<Publish>) -> std::io::Result<()> {
+async fn session<S>(
+    mut stream: S,
+    tx: mpsc::UnboundedSender<BrokerEvent>,
+    drop_publishes: bool,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let header = stream.read_u8().await?;
         let mut len = 0;
@@ -550,8 +901,12 @@ async fn session(mut stream: TcpStream, tx: mpsc::UnboundedSender<Publish>) -> s
         stream.read_exact(&mut body).await?;
         match header >> 4 {
             // CONNECT: accepted.
-            1 => stream.write_all(&[0x20, 2, 0, 0]).await?,
+            1 => {
+                stream.write_all(&[0x20, 2, 0, 0]).await?;
+                let _ = tx.send(BrokerEvent::Connected(Instant::now()));
+            }
             // PUBLISH: topic, a packet id for QoS 1, then the payload.
+            3 if drop_publishes => return Ok(()),
             3 => {
                 let topic_end = 2 + usize::from(u16::from_be_bytes([body[0], body[1]]));
                 let topic = String::from_utf8(body[2..topic_end].to_vec()).unwrap();
@@ -561,11 +916,11 @@ async fn session(mut stream: TcpStream, tx: mpsc::UnboundedSender<Publish>) -> s
                     stream.write_all(&[0x40, 2, pkid[0], pkid[1]]).await?;
                     payload_start += 2;
                 }
-                let _ = tx.send(Publish {
+                let _ = tx.send(BrokerEvent::Published(Publish {
                     topic,
                     retain: header & 1 == 1,
                     payload: body[payload_start..].to_vec(),
-                });
+                }));
             }
             // PINGREQ
             12 => stream.write_all(&[0xd0, 0]).await?,
@@ -576,56 +931,57 @@ async fn session(mut stream: TcpStream, tx: mpsc::UnboundedSender<Publish>) -> s
     }
 }
 
-async fn next_publish(publishes: &mut mpsc::UnboundedReceiver<Publish>) -> Publish {
-    tokio::time::timeout(Duration::from_secs(30), publishes.recv())
+async fn broker_event(events: &mut mpsc::UnboundedReceiver<BrokerEvent>) -> BrokerEvent {
+    tokio::time::timeout(Duration::from_secs(30), events.recv())
         .await
-        .expect("a publish arrives")
+        .expect("the broker sees something")
         .unwrap()
+}
+
+async fn next_publish(events: &mut mpsc::UnboundedReceiver<BrokerEvent>) -> Publish {
+    loop {
+        if let BrokerEvent::Published(publish) = broker_event(events).await {
+            return publish;
+        }
+    }
+}
+
+async fn next_connection(events: &mut mpsc::UnboundedReceiver<BrokerEvent>) -> Instant {
+    loop {
+        if let BrokerEvent::Connected(at) = broker_event(events).await {
+            return at;
+        }
+    }
+}
+
+fn mqtt(addr: SocketAddr, topic: &str) -> Mqtt {
+    Mqtt {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        topic: topic.into(),
+        ..Mqtt::default()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mqtt_publishes_notices_in_place_of_lost_and_rejected_records() {
-    // Nothing listens on the broker's port yet, so the channel cannot connect.
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let addr = unused_address().await;
     let env = Env::new();
     let mut config = env.base();
     config.storage.max_bytes = 256 << 10;
     config.outbound.channels.insert(
         "m".into(),
         Channel::Mqtt(Mqtt {
-            host: addr.ip().to_string(),
-            port: addr.port(),
-            topic: "dev/events".into(),
             retain: true,
             max_packet_bytes: 512,
-            ..Mqtt::default()
+            ..mqtt(addr, "dev/events")
         }),
     );
     let daemon = env.start(config).await;
 
     // The log overflows while the broker is down. The records evicted are
     // counted as lost when they are evicted, not when the channel reads.
-    let pad = "p".repeat(400);
-    let lines: Vec<String> = (1..=2000)
-        .map(|n| format!("{{\"n\":{n},\"pad\":\"{pad}\"}}\n"))
-        .collect();
-    env.send(&lines.iter().map(|l| l.as_bytes()).collect::<Vec<_>>())
-        .await;
-    wait_for(Duration::from_secs(10), || async {
-        daemon.get("/v1/status").await.1["storage"]["head_seq"] == 2000
-    })
-    .await;
-    // Larger than max_packet_bytes.
-    let large = format!("{{\"large\":\"{}\"}}\n", "l".repeat(600));
-    env.send(&[large.as_bytes()]).await;
-    wait_for(Duration::from_secs(10), || async {
-        daemon.get("/v1/status").await.1["storage"]["head_seq"] == 2001
-    })
-    .await;
+    overflow_then_one_large(&env, &daemon).await;
     let (_, status) = daemon.get("/v1/status").await;
     let first = status["storage"]["first_seq"].as_u64().unwrap();
     assert!(first > 1);
@@ -638,22 +994,22 @@ async fn mqtt_publishes_notices_in_place_of_lost_and_rejected_records() {
     // Once the broker is up: a notice in place of the evicted records, the
     // records still in the log, then a notice in place of the large one.
     // Notices are never retained.
-    let mut publishes = broker(TcpListener::bind(addr).await.unwrap());
-    let lost = next_publish(&mut publishes).await;
+    let mut events = broker(TcpListener::bind(addr).await.unwrap(), None, false);
+    let lost = next_publish(&mut events).await;
     assert_eq!((lost.topic.as_str(), lost.retain), ("dev/events", false));
     assert_eq!(
         serde_json::from_slice::<Value>(&lost.payload).unwrap(),
         json!({"notice": {"event": "lost", "from_seq": 1, "to_seq": first - 1, "count": first - 1}})
     );
     for n in first..=2000 {
-        let record = next_publish(&mut publishes).await;
+        let record = next_publish(&mut events).await;
         assert!(record.retain);
         assert_eq!(
             serde_json::from_slice::<Value>(&record.payload).unwrap()["n"],
             n
         );
     }
-    let rejected = next_publish(&mut publishes).await;
+    let rejected = next_publish(&mut events).await;
     assert!(!rejected.retain);
     let notice = serde_json::from_slice::<Value>(&rejected.payload).unwrap()["notice"].take();
     assert_eq!(notice["event"], "rejected");
@@ -661,11 +1017,10 @@ async fn mqtt_publishes_notices_in_place_of_lost_and_rejected_records() {
     assert_eq!(notice["reason"], "payload too large");
 
     wait_for(Duration::from_secs(10), || async {
-        daemon.get("/v1/status").await.1["channels"]["m"]["cursor"] == 2002
+        daemon.channel("m").await["cursor"] == 2002
     })
     .await;
-    let (_, status) = daemon.get("/v1/status").await;
-    let channel = &status["channels"]["m"];
+    let channel = daemon.channel("m").await;
     assert_eq!(channel["delivered"], 2001 - first);
     assert_eq!(channel["notices"], 2);
     assert_eq!(channel["rejected"], 1);
@@ -677,5 +1032,64 @@ async fn mqtt_publishes_notices_in_place_of_lost_and_rejected_records() {
     assert_eq!(page["messages"][0]["seq"], 2001);
     assert_eq!(page["messages"][0]["ts"], notice["ts"]);
     assert!(page["messages"][0]["data"]["large"].is_string());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_reconnects_back_off_while_the_broker_takes_nothing() {
+    let listener = listen().await;
+    let addr = listener.local_addr().unwrap();
+    let mut events = broker(listener, None, true);
+    let env = Env::new();
+    let mut config = env.base();
+    config
+        .outbound
+        .channels
+        .insert("m".into(), Channel::Mqtt(mqtt(addr, "dev/events")));
+    let daemon = env.start(config).await;
+    let mut last = next_connection(&mut events).await;
+    env.send(&[b"{\"n\":1}\n"]).await;
+    // The broker accepts each connection and drops it at the first publish:
+    // a CONNACK is no progress, so the waits grow, 1 s, then 2 s.
+    let mut gaps = Vec::new();
+    while gaps.len() < 2 {
+        let at = next_connection(&mut events).await;
+        gaps.push(at - last);
+        last = at;
+    }
+    assert!(gaps[0] >= Duration::from_millis(900), "{gaps:?}");
+    assert!(gaps[1] >= Duration::from_millis(1900), "{gaps:?}");
+    let channel = daemon.channel("m").await;
+    assert_eq!(channel["delivered"], 0);
+    assert!(channel["retries"].as_u64().unwrap() >= 2);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_over_tls_trusts_the_ca_file() {
+    let listener = listen().await;
+    let addr = listener.local_addr().unwrap();
+    let mut events = broker(listener, Some(tls_acceptor()), false);
+    let env = Env::new();
+    let mut config = env.base();
+    config.outbound.channels.insert(
+        "m".into(),
+        Channel::Mqtt(Mqtt {
+            tls: true,
+            ca_file: Some(data("ca.pem")),
+            ..mqtt(addr, "dev/tls")
+        }),
+    );
+    let daemon = env.start(config).await;
+    env.send(&[b"{\"n\":1}\n"]).await;
+    let publish = next_publish(&mut events).await;
+    assert_eq!(
+        (publish.topic.as_str(), &publish.payload[..]),
+        ("dev/tls", &b"{\"n\":1}"[..])
+    );
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("m").await["delivered"] == 1
+    })
+    .await;
     daemon.stop().await;
 }
