@@ -4,8 +4,10 @@
 //! Concurrency model: one writer (a dedicated thread) mutates files and the
 //! index; readers hold their own file handles and only read below the
 //! committed length published in the index, which covers synced data only.
-//! Eviction removes whole sealed segments under the index lock.
+//! Eviction removes whole sealed segments under the index lock, and counts
+//! what channels lose by it under the same lock.
 
+mod queue;
 mod segment;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,18 +20,31 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
+pub use queue::{QueueReceiver, QueueSender, queue};
 pub use segment::{Corrupt, Record};
-use segment::{HEADER_LEN, Header, Next, Peek, SegmentCursor};
+use segment::{FRAME_HEADER_LEN, HEADER_LEN, Header, Next, Peek, SegmentCursor};
+
+/// Bytes a segment needs besides the payload of its first record: the
+/// segment header and one frame header.
+pub const SEGMENT_OVERHEAD: u64 = (HEADER_LEN + FRAME_HEADER_LEN) as u64;
 
 const CURSOR_DIR: &str = "cursors";
 const MAX_BATCH: usize = 1024;
+/// Encoded bytes per write batch, frame headers included; a single larger
+/// message is written alone.
 const MAX_BATCH_BYTES: usize = 1 << 20;
+/// Read size for queries, which filter what they read.
+const QUERY_READ_RECORDS: usize = 256;
+const QUERY_READ_BYTES: usize = 256 << 10;
 /// Stored messages are readable by the owner and the group only.
 const FILE_MODE: u32 = 0o640;
 const DIR_MODE: u32 = 0o750;
+/// A channel that stays behind loses records with every eviction; its
+/// warning repeats at most this often, with the running total.
+const LOSS_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A message as handed to the writer: receipt time and verbatim payload.
 #[derive(Clone, Debug)]
@@ -79,6 +94,21 @@ struct Index {
     head_seq: u64,
     head_ts: i64,
     bytes: u64,
+    /// Channel positions kept for loss accounting, by [`Tail`] id.
+    tails: BTreeMap<u64, TailState>,
+    next_tail: u64,
+}
+
+impl Index {
+    /// The oldest retained sequence number; the head's successor when no
+    /// record is retained.
+    fn first_seq(&self) -> u64 {
+        self.segments
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(self.head_seq + 1)
+    }
 }
 
 pub struct Storage {
@@ -110,6 +140,8 @@ impl Storage {
             head_seq: 0,
             head_ts: 0,
             bytes: 0,
+            tails: BTreeMap::new(),
+            next_tail: 0,
         };
         // Trailing files that hold no record are removed, so the previous
         // segment becomes the active one again.
@@ -226,12 +258,7 @@ impl Storage {
         Status {
             segments: index.segments.len(),
             bytes: index.bytes,
-            first_seq: index
-                .segments
-                .keys()
-                .next()
-                .copied()
-                .unwrap_or(index.head_seq + 1),
+            first_seq: index.first_seq(),
             head_seq: index.head_seq,
             head_ts: index.head_ts,
         }
@@ -241,15 +268,39 @@ impl Storage {
         Reader::new(Arc::clone(self), next_seq)
     }
 
-    /// Records with `from <= ts < to` and `seq > after`, in sequence order,
-    /// at most `limit` of them.
+    /// Keeps a channel's position at `next_seq` for loss accounting, with
+    /// losses counted in `loss` and logged under `label`; see [`Tail`].
+    /// Records already gone below the position are counted at once.
+    pub fn tail(self: &Arc<Self>, label: &str, next_seq: u64, loss: Arc<Loss>) -> Tail {
+        let mut index = self.index.lock().unwrap();
+        let mut state = TailState {
+            next: next_seq.max(1),
+            reading: false,
+            label: label.to_string(),
+            loss,
+            warned: None,
+        };
+        state.claim(index.first_seq());
+        let id = index.next_tail;
+        index.next_tail += 1;
+        index.tails.insert(id, state);
+        Tail {
+            storage: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// Records with `from <= ts < to` and `seq > after`, in sequence order:
+    /// at most `limit` of them, and at most `max_bytes` of payload unless the
+    /// first record alone is larger.
     pub fn query(
         self: &Arc<Self>,
         from: Option<i64>,
         to: Option<i64>,
         after: u64,
         limit: usize,
-    ) -> io::Result<Vec<Record>> {
+        max_bytes: usize,
+    ) -> io::Result<Page> {
         let start = {
             let index = self.index.lock().unwrap();
             let by_time = from.and_then(|from| {
@@ -263,10 +314,11 @@ impl Storage {
             after.saturating_add(1).max(by_time.unwrap_or(1))
         };
         let mut reader = self.reader(start);
-        let mut out = Vec::new();
-        'read: while out.len() < limit {
-            let batch = reader.read(256, 1 << 20)?;
-            if batch.records.is_empty() {
+        let mut page = Page::default();
+        let mut bytes = 0usize;
+        'read: loop {
+            let batch = reader.read(QUERY_READ_RECORDS, QUERY_READ_BYTES)?;
+            if batch.records.is_empty() && batch.skipped == 0 {
                 break;
             }
             for record in batch.records {
@@ -276,13 +328,20 @@ impl Storage {
                 if from.is_some_and(|from| record.ts < from) {
                     continue;
                 }
-                out.push(record);
-                if out.len() >= limit {
+                // Timestamps never decrease, so the first record left out
+                // tells whether the page is the last one.
+                let len = record.payload.len();
+                if page.records.len() >= limit
+                    || (!page.records.is_empty() && bytes.saturating_add(len) > max_bytes)
+                {
+                    page.more = true;
                     break 'read;
                 }
+                bytes += len;
+                page.records.push(record);
             }
         }
-        Ok(out)
+        Ok(page)
     }
 
     pub fn load_cursor(&self, name: &str) -> io::Result<Option<u64>> {
@@ -347,8 +406,11 @@ impl Storage {
         self.dir.join(segment::file_name(first_seq))
     }
 
+    /// Removes the oldest segments while the log is over its size limit, and
+    /// counts the records that channels had not read as lost.
     fn evict(&self, index: &mut Index) {
         let max = self.max_bytes.load(Relaxed);
+        let mut evicted = false;
         while index.bytes > max && index.segments.len() > 1 {
             let (&first_seq, segment) = index.segments.iter().next().expect("non-empty");
             let len = segment.len;
@@ -362,6 +424,7 @@ impl Storage {
             }
             index.segments.remove(&first_seq);
             index.bytes -= len;
+            evicted = true;
             self.metrics.evictions.fetch_add(1, Relaxed);
             debug!(
                 segment = first_seq,
@@ -369,6 +432,109 @@ impl Storage {
                 remaining = index.bytes,
                 "evicted segment"
             );
+        }
+        if evicted {
+            let first = index.first_seq();
+            for tail in index.tails.values_mut().filter(|t| !t.reading) {
+                tail.claim(first);
+            }
+        }
+    }
+}
+
+/// What a channel lost before delivery: the records that left the log
+/// before the channel read them.
+#[derive(Default)]
+pub struct Loss {
+    records: AtomicU64,
+    /// Records below this have been counted. A channel is restarted on every
+    /// change to its configuration, and the new tail starts at the cursor,
+    /// behind what the one before it counted.
+    until: AtomicU64,
+}
+
+impl Loss {
+    pub fn records(&self) -> u64 {
+        self.records.load(Relaxed)
+    }
+}
+
+/// A channel's position in the log, kept for loss accounting: records that
+/// leave the log before the channel has read them are counted in its
+/// [`Loss`] and logged as soon as that happens, whether or not the channel is
+/// reading, and only once (ARCHITECTURE.md §5.9). Readers made from it move
+/// the position as they read; dropping it ends the accounting.
+pub struct Tail {
+    storage: Arc<Storage>,
+    id: u64,
+}
+
+impl Tail {
+    /// A reader at `next_seq` that moves this tail. A tail has one reader at
+    /// a time; a new one replaces a reader that was lost.
+    pub fn reader(&self, next_seq: u64) -> Reader {
+        let mut index = self.storage.index.lock().unwrap();
+        let first = index.first_seq();
+        if let Some(tail) = index.tails.get_mut(&self.id) {
+            // A reader lost in the middle of a read never ended it.
+            tail.reading = false;
+            tail.next = tail.next.max(next_seq);
+            tail.claim(first);
+        }
+        drop(index);
+        Reader {
+            tail: Some(self.id),
+            ..Reader::new(Arc::clone(&self.storage), next_seq)
+        }
+    }
+}
+
+impl Drop for Tail {
+    fn drop(&mut self) {
+        self.storage.index.lock().unwrap().tails.remove(&self.id);
+    }
+}
+
+/// The accounting state of a [`Tail`], kept in the index.
+struct TailState {
+    /// Every record below this is in the channel's hands or counted as lost.
+    next: u64,
+    /// A read is running and counts what it skips when it ends; eviction
+    /// leaves the tail alone until then.
+    reading: bool,
+    label: String,
+    loss: Arc<Loss>,
+    warned: Option<Instant>,
+}
+
+impl TailState {
+    /// Counts the records below `first` that the channel has not read.
+    fn claim(&mut self, first: u64) {
+        if self.next < first {
+            self.lose(self.next, first);
+            self.next = first;
+        }
+    }
+
+    /// Counts records `from..to` as lost, apart from those counted before.
+    /// Every count happens under the index lock.
+    fn lose(&mut self, from: u64, to: u64) {
+        let from = from.max(self.loss.until.load(Relaxed));
+        if from >= to {
+            return;
+        }
+        self.loss.until.store(to, Relaxed);
+        let records = to - from;
+        let total = self.loss.records.fetch_add(records, Relaxed) + records;
+        let (from_seq, to_seq) = (from, to - 1);
+        if self
+            .warned
+            .is_none_or(|t| t.elapsed() >= LOSS_WARN_INTERVAL)
+        {
+            warn!(channel = %self.label, from_seq, to_seq, records, total, "records lost before delivery");
+            self.warned = Some(Instant::now());
+        } else {
+            debug!(channel = %self.label, from_seq, to_seq, records, total, "records lost before delivery");
         }
     }
 }
@@ -449,18 +615,27 @@ impl Writer {
     /// Appends a batch as one write. With `sync` it is committed before this
     /// returns; otherwise it stays invisible until the next [`Writer::sync`].
     /// On a write failure the file is rolled back and the batch is dropped.
+    ///
+    /// A batch that would carry the active segment past `segment_bytes`
+    /// starts a new segment, so a segment exceeds that size only when it
+    /// holds a single batch that is larger on its own.
     pub fn append(&mut self, batch: &[Message], sync: bool) -> io::Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
+        let need: u64 = batch.iter().map(|m| frame_len(m) as u64).sum();
         let segment_bytes = self.storage.segment_bytes.load(Relaxed);
-        if self.active.as_ref().is_some_and(|a| a.len >= segment_bytes) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| !fits(a.len, need, segment_bytes))
+        {
             // A failed sync has already sealed the segment.
             let _ = self.sync();
             self.active = None;
         }
         if self.active.is_none() {
-            self.open_active()?;
+            self.open_active(need)?;
         }
 
         let (mut seq, mut ts) = (self.head_seq, self.head_ts);
@@ -533,14 +708,16 @@ impl Writer {
         Ok(())
     }
 
-    fn open_active(&mut self) -> io::Result<()> {
+    /// Reopens the last segment if `need` more bytes fit into it, or creates
+    /// the next one.
+    fn open_active(&mut self, need: u64) -> io::Result<()> {
         let last = {
             let index = self.storage.index.lock().unwrap();
             debug_assert_eq!(self.head_seq, index.head_seq, "no segment, nothing pending");
             index.segments.iter().next_back().map(|(k, s)| (*k, s.len))
         };
         if let Some((first_seq, len)) = last {
-            if len < self.storage.segment_bytes.load(Relaxed) && !self.force_new {
+            if fits(len, need, self.storage.segment_bytes.load(Relaxed)) && !self.force_new {
                 let file = OpenOptions::new()
                     .append(true)
                     .open(self.storage.segment_path(first_seq))?;
@@ -653,16 +830,27 @@ impl Writer {
     }
 }
 
+/// Whether `need` more bytes fit into a segment that is `len` bytes long. A
+/// segment without records takes any batch, so that a record larger than
+/// `segment_bytes` still has a place.
+fn fits(len: u64, need: u64, segment_bytes: u64) -> bool {
+    len <= HEADER_LEN as u64 || len.saturating_add(need) <= segment_bytes
+}
+
+fn frame_len(message: &Message) -> usize {
+    FRAME_HEADER_LEN + message.payload.len()
+}
+
 /// Writer thread body: group commit with the sync policy from the storage limits.
-pub fn run_writer(
-    storage: Arc<Storage>,
-    mut rx: mpsc::Receiver<Message>,
-    rt: tokio::runtime::Handle,
-) {
+pub fn run_writer(storage: Arc<Storage>, mut rx: QueueReceiver, rt: tokio::runtime::Handle) {
     let mut writer = Writer::new(storage.clone());
     let mut batch: Vec<Message> = Vec::with_capacity(MAX_BATCH);
+    // A message that did not fit into the previous batch starts the next one.
+    let mut carry: Option<Message> = None;
     loop {
-        let first = if writer.unsynced() {
+        let first = if let Some(message) = carry.take() {
+            message
+        } else if writer.unsynced() {
             // The interval is re-read at least once a second while data is
             // pending, so a change made meanwhile (to zero in particular)
             // takes effect without waiting for the next message.
@@ -688,22 +876,32 @@ pub fn run_writer(
                 None => break,
             }
         };
-        let mut bytes = first.payload.len();
+        // A batch is one write into one segment, so it never holds more than
+        // an empty segment does.
+        let segment_room = usize::try_from(storage.segment_bytes.load(Relaxed))
+            .unwrap_or(usize::MAX)
+            .saturating_sub(HEADER_LEN);
+        let cap = MAX_BATCH_BYTES.min(segment_room);
+        let mut bytes = frame_len(&first);
         batch.push(first);
-        while batch.len() < MAX_BATCH && bytes < MAX_BATCH_BYTES {
-            match rx.try_recv() {
-                Ok(m) => {
-                    bytes += m.payload.len();
-                    batch.push(m);
-                }
-                Err(_) => break,
+        while batch.len() < MAX_BATCH {
+            let Some(message) = rx.try_recv() else {
+                break;
+            };
+            let len = frame_len(&message);
+            if bytes + len > cap {
+                carry = Some(message);
+                break;
             }
+            bytes += len;
+            batch.push(message);
         }
         let interval = storage.sync_interval();
         let sync = interval.is_zero() || writer.since_sync() >= interval;
         if let Err(e) = writer.append(&batch, sync) {
             error!(error = %e, records = batch.len(), "write failed; batch dropped");
         }
+        rx.release(&batch);
         batch.clear();
     }
     if let Err(e) = writer.sync() {
@@ -712,12 +910,37 @@ pub fn run_writer(
     info!("log writer stopped");
 }
 
+/// One page of a time-range query.
+#[derive(Default, Debug)]
+pub struct Page {
+    pub records: Vec<Record>,
+    /// More matching records follow; the page ended at its record or byte limit.
+    pub more: bool,
+}
+
+/// What a read returns: consecutive records, or a gap. A batch never holds
+/// both, so a gap always ends at the reader's position.
 #[derive(Default, Debug)]
 pub struct Batch {
     pub records: Vec<Record>,
-    /// Records that no longer exist (evicted or corrupt) between the previous
-    /// position and the first record returned.
+    /// With no records: how many records before the reader's position no
+    /// longer exist (evicted or unreadable). Zero as well means caught up.
     pub skipped: u64,
+}
+
+enum Step {
+    Record(Record),
+    /// Moved past this many missing records.
+    Skipped(u64),
+    /// Caught up, or missing records follow that this read may not skip.
+    Stop,
+}
+
+enum Located {
+    At(View),
+    CaughtUp,
+    /// The position was evicted; the oldest segment starts here.
+    Evicted(u64),
 }
 
 struct View {
@@ -738,6 +961,8 @@ pub struct Reader {
     storage: Arc<Storage>,
     next_seq: u64,
     current: Option<Open>,
+    /// The [`Tail`] this reader moves, if it reads for a channel.
+    tail: Option<u64>,
 }
 
 impl Reader {
@@ -746,6 +971,7 @@ impl Reader {
             storage,
             next_seq: next_seq.max(1),
             current: None,
+            tail: None,
         }
     }
 
@@ -753,88 +979,160 @@ impl Reader {
         self.next_seq
     }
 
-    /// Reads up to `max_records` / `max_bytes` of records in sequence order;
-    /// an empty batch means the reader has caught up with the head. An I/O
-    /// error is returned only if nothing was read or skipped before it;
-    /// otherwise that progress is returned and the error surfaces on the next
+    /// Reads up to `max_records` / `max_bytes` of consecutive records. Where
+    /// records are missing (evicted or unreadable), the batch holds no
+    /// records and says how many were passed over: a gap always comes alone.
+    /// An empty batch with nothing skipped means the reader has caught up.
+    /// An I/O error is returned only if nothing was read before it;
+    /// otherwise the records are returned and the error surfaces on the next
     /// call, which starts at the failing position with nothing to lose.
     pub fn read(&mut self, max_records: usize, max_bytes: usize) -> io::Result<Batch> {
+        let start = self.next_seq;
+        if self.begin() {
+            return Ok(Batch {
+                records: Vec::new(),
+                skipped: self.next_seq - start,
+            });
+        }
+        let batch = self.fill(max_records, max_bytes);
+        self.end(batch.as_ref().map_or(0, |b| b.skipped));
+        batch
+    }
+
+    fn fill(&mut self, max_records: usize, max_bytes: usize) -> io::Result<Batch> {
         let mut batch = Batch::default();
         let mut bytes = 0usize;
         let mut reopen_attempts = 0;
         while batch.records.len() < max_records && bytes < max_bytes {
-            match self.next(&mut batch) {
-                Ok(Some(record)) => {
+            match self.next(batch.records.is_empty()) {
+                Ok(Step::Record(record)) => {
                     bytes += record.payload.len();
                     batch.records.push(record);
                 }
-                Ok(None) => break,
+                Ok(Step::Skipped(missing)) => {
+                    batch.skipped = missing;
+                    break;
+                }
+                Ok(Step::Stop) => break,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && reopen_attempts < 3 => {
                     reopen_attempts += 1;
                     self.current = None;
                 }
-                Err(_) if !batch.records.is_empty() || batch.skipped > 0 => break,
+                Err(_) if !batch.records.is_empty() => break,
                 Err(e) => return Err(e),
             }
         }
         Ok(batch)
     }
 
-    /// The record at `next_seq`, or `None` once caught up; records that no
-    /// longer exist on the way are counted in `batch.skipped`.
-    fn next(&mut self, batch: &mut Batch) -> io::Result<Option<Record>> {
+    /// The record at `next_seq`. Where records are missing, moves past them
+    /// if `may_skip`, and stops in front of them otherwise.
+    fn next(&mut self, may_skip: bool) -> io::Result<Step> {
         loop {
-            let Some(view) = self.locate(batch)? else {
-                return Ok(None);
+            let view = match self.locate()? {
+                Located::At(view) => view,
+                Located::CaughtUp => return Ok(Step::Stop),
+                Located::Evicted(first) => return Ok(self.skip_to(first, may_skip)),
             };
             let open = self.current.as_mut().expect("positioned");
             match open.cursor.next(view.bound)? {
                 Next::Record(record) if record.seq == self.next_seq => {
                     self.next_seq += 1;
-                    return Ok(Some(record));
+                    return Ok(Step::Record(record));
                 }
-                Next::Record(_) => self.skip_segment(&view, batch, Corrupt("sequence mismatch")),
+                Next::Record(_) => {
+                    return Ok(self.skip_segment(&view, Corrupt("sequence mismatch"), may_skip));
+                }
                 Next::End => match view.next_first_seq {
-                    Some(next) => {
-                        batch.skipped += next.saturating_sub(self.next_seq);
-                        self.next_seq = self.next_seq.max(next);
-                        self.current = None;
-                    }
-                    None => return Ok(None),
+                    Some(next) if next > self.next_seq => return Ok(self.skip_to(next, may_skip)),
+                    Some(_) => self.current = None,
+                    None => return Ok(Step::Stop),
                 },
-                Next::Corrupt(c) => self.skip_segment(&view, batch, c),
+                Next::Corrupt(c) => return Ok(self.skip_segment(&view, c, may_skip)),
             }
         }
     }
 
-    fn skip_segment(&mut self, view: &View, batch: &mut Batch, cause: Corrupt) {
+    /// Moves past the missing records below `seq`, if this read may.
+    fn skip_to(&mut self, seq: u64, may_skip: bool) -> Step {
+        if !may_skip {
+            return Step::Stop;
+        }
+        debug_assert!(seq > self.next_seq, "a gap ends past the reader");
+        let missing = seq.saturating_sub(self.next_seq);
+        self.next_seq = self.next_seq.max(seq);
+        self.current = None;
+        Step::Skipped(missing)
+    }
+
+    fn skip_segment(&mut self, view: &View, cause: Corrupt, may_skip: bool) -> Step {
+        if !may_skip {
+            // The next read reopens the segment and finds the record again.
+            self.current = None;
+            return Step::Stop;
+        }
         let offset = self.current.as_ref().map(|o| o.cursor.pos()).unwrap_or(0);
         error!(segment = view.first_seq, offset, error = %cause, "corrupt record; skipping the rest of the segment");
         self.storage.metrics.corrupt_segments.fetch_add(1, Relaxed);
-        let resume = view.next_first_seq.unwrap_or(view.head_seq + 1);
-        batch.skipped += resume.saturating_sub(self.next_seq);
-        self.next_seq = self.next_seq.max(resume);
-        self.current = None;
+        self.skip_to(view.next_first_seq.unwrap_or(view.head_seq + 1), true)
     }
 
-    /// Positions the cursor at `next_seq`; `None` when caught up.
-    fn locate(&mut self, batch: &mut Batch) -> io::Result<Option<View>> {
+    /// Starts a read for a tail. Returns true, with no read to follow, if the
+    /// tail is ahead of the reader, past records already counted as lost
+    /// while the reader was idle: the reader catches up to it. Otherwise the
+    /// read counts what it skips, in [`Reader::end`].
+    fn begin(&mut self) -> bool {
+        let Some(id) = self.tail else {
+            return false;
+        };
+        let mut index = self.storage.index.lock().unwrap();
+        let Some(tail) = index.tails.get_mut(&id) else {
+            return false;
+        };
+        if tail.next > self.next_seq {
+            self.next_seq = tail.next;
+            self.current = None;
+            return true;
+        }
+        tail.reading = true;
+        false
+    }
+
+    /// Ends a read for a tail: counts the `skipped` records it passed over,
+    /// moves the tail to the reader, and counts what an eviction removed
+    /// beyond it meanwhile.
+    fn end(&mut self, skipped: u64) {
+        let Some(id) = self.tail else {
+            return;
+        };
+        let mut index = self.storage.index.lock().unwrap();
+        let first = index.first_seq();
+        let Some(tail) = index.tails.get_mut(&id) else {
+            return;
+        };
+        if skipped > 0 {
+            tail.lose(self.next_seq - skipped, self.next_seq);
+        }
+        tail.next = self.next_seq;
+        tail.reading = false;
+        tail.claim(first);
+    }
+
+    /// Positions the cursor at `next_seq`.
+    fn locate(&mut self) -> io::Result<Located> {
         let view = {
             let index = self.storage.index.lock().unwrap();
             if self.next_seq > index.head_seq {
-                return Ok(None);
+                return Ok(Located::CaughtUp);
             }
-            let (first_seq, segment) = match index.segments.range(..=self.next_seq).next_back() {
-                Some((k, s)) => (*k, s),
-                None => {
-                    // Momentarily empty while the writer replaces a segment file.
-                    let Some((k, s)) = index.segments.iter().next() else {
-                        return Ok(None);
-                    };
-                    batch.skipped += *k - self.next_seq;
-                    self.next_seq = *k;
-                    (*k, s)
-                }
+            let Some((&first_seq, segment)) = index.segments.range(..=self.next_seq).next_back()
+            else {
+                // Evicted; or the index is momentarily empty while the
+                // writer replaces a segment file.
+                return Ok(match index.segments.keys().next() {
+                    Some(&first) => Located::Evicted(first),
+                    None => Located::CaughtUp,
+                });
             };
             View {
                 first_seq,
@@ -861,7 +1159,7 @@ impl Reader {
                 cursor,
             });
         }
-        Ok(Some(view))
+        Ok(Located::At(view))
     }
 }
 
@@ -968,10 +1266,13 @@ mod tests {
         assert!(storage.metrics().evictions.load(Relaxed) > 0);
         assert_eq!(status.head_seq, 400);
 
-        // A reader positioned before the eviction horizon jumps forward and reports the gap.
+        // A reader positioned before the eviction horizon reports the gap
+        // on its own, then continues at the oldest record.
         let mut reader = storage.reader(1);
+        let gap = reader.read(5, 1 << 20).unwrap();
+        assert_eq!((gap.records.len(), gap.skipped), (0, status.first_seq - 1));
         let batch = reader.read(5, 1 << 20).unwrap();
-        assert_eq!(batch.skipped, status.first_seq - 1);
+        assert_eq!(batch.skipped, 0);
         assert_eq!(batch.records[0].seq, status.first_seq);
 
         // Segment files on disk match the index.
@@ -1059,15 +1360,140 @@ mod tests {
         let mut skipped = 0;
         loop {
             let batch = reader.read(100, 1 << 30).unwrap();
-            skipped += batch.skipped;
-            if batch.records.is_empty() {
+            if batch.records.is_empty() && batch.skipped == 0 {
                 break;
             }
+            skipped += batch.skipped;
             seqs.extend(batch.records.iter().map(|r| r.seq));
         }
         assert!(skipped > 0);
+        assert_eq!(seqs.len() as u64 + skipped, 20);
         assert_eq!(*seqs.last().unwrap(), 20);
         assert!(seqs.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
+    }
+
+    fn write_records(writer: &mut Writer, records: usize) {
+        for _ in 0..records {
+            let message = Message {
+                ts: 0,
+                payload: vec![b'f'; 1000],
+            };
+            writer.append(&[message], true).unwrap();
+        }
+    }
+
+    #[test]
+    fn loss_is_counted_once_and_when_it_happens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(128 << 10, 64 << 10));
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+
+        // Nothing was read, so the eviction counts at once.
+        write_records(&mut writer, 200);
+        let first = storage.status().first_seq;
+        assert!(first > 1);
+        assert_eq!(lost.records(), first - 1);
+        // The read reports the gap alone without counting it again, then
+        // continues at the oldest record.
+        let gap = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!((gap.records.len(), gap.skipped), (0, first - 1));
+        let batch = reader.read(10, 1 << 30).unwrap();
+        assert_eq!((batch.records[0].seq, batch.skipped), (first, 0));
+        assert_eq!(lost.records(), first - 1);
+
+        // Records the reader holds are not lost when evicted; the ones it
+        // has not reached are.
+        write_records(&mut writer, 200);
+        let second = storage.status().first_seq;
+        assert_eq!(lost.records(), second - 1 - 10);
+
+        // A tail kept from the start of a lagging position counts at once.
+        let late = Arc::new(Loss::default());
+        let _late = storage.tail("late", 1, late.clone());
+        assert_eq!(late.records(), second - 1);
+
+        // A dropped tail no longer counts, and its reader still reads.
+        drop(tail);
+        write_records(&mut writer, 200);
+        assert_eq!(lost.records(), second - 1 - 10);
+        assert!(reader.read(10, 1 << 30).unwrap().skipped > 0);
+
+        // A channel restarted at a cursor that still waits for its notice
+        // does not count the same records again, only those evicted while
+        // it had no tail.
+        let third = storage.status().first_seq;
+        let again = storage.tail("c", 1, lost.clone());
+        assert_eq!(lost.records(), third - 1 - 10);
+        let gap = again.reader(1).read(1000, 1 << 30).unwrap();
+        assert_eq!(gap.skipped, third - 1);
+    }
+
+    #[test]
+    fn an_eviction_during_a_read_is_counted_when_the_read_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(128 << 10, 64 << 10));
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+        write_records(&mut writer, 10);
+        assert_eq!(reader.read(10, 1 << 30).unwrap().records.len(), 10);
+
+        // Records the read may already be returning are not counted under it.
+        assert!(!reader.begin());
+        write_records(&mut writer, 200);
+        assert_eq!(lost.records(), 0);
+        reader.end(0);
+        let first = storage.status().first_seq;
+        assert_eq!(lost.records(), first - 11);
+        let gap = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!((gap.records.len(), gap.skipped), (0, first - 11));
+        assert_eq!(lost.records(), first - 11);
+    }
+
+    #[test]
+    fn a_gap_found_by_a_read_is_counted_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        for i in 0..20 {
+            let message = Message {
+                ts: i,
+                payload: vec![b'g'; 10_000],
+            };
+            writer.append(&[message], true).unwrap();
+        }
+        let second = *storage
+            .index
+            .lock()
+            .unwrap()
+            .segments
+            .keys()
+            .nth(1)
+            .unwrap();
+        let path = storage.segment_path(1);
+        let mut bytes = fs::read(&path).unwrap();
+        let at = HEADER_LEN + 2 * (FRAME_HEADER_LEN + 10_000) + FRAME_HEADER_LEN;
+        bytes[at] ^= 0x55;
+        fs::write(&path, &bytes).unwrap();
+
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+        // Records before the damage, then the gap alone, then the rest.
+        let before = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!(
+            before.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(lost.records(), 0);
+        let gap = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!((gap.records.len(), gap.skipped), (0, second - 3));
+        assert_eq!(lost.records(), second - 3);
+        let after = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!(after.records[0].seq, second);
+        assert_eq!(lost.records(), second - 3);
         assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
     }
 
@@ -1089,19 +1515,183 @@ mod tests {
         }
         writer.sync().unwrap();
         assert!(storage.status().segments > 1);
-        let got = storage.query(Some(1200), Some(1250), 0, 100).unwrap();
+        let all = usize::MAX;
+        let got = storage.query(Some(1200), Some(1250), 0, 100, all).unwrap();
         assert_eq!(
-            got.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            got.records.iter().map(|r| r.ts).collect::<Vec<_>>(),
             vec![1200, 1210, 1220, 1230, 1240]
         );
-        let page = storage.query(Some(1200), None, got[1].seq, 2).unwrap();
+        assert!(!got.more);
+        let page = storage
+            .query(Some(1200), None, got.records[1].seq, 2, all)
+            .unwrap();
         assert_eq!(
-            page.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            page.records.iter().map(|r| r.ts).collect::<Vec<_>>(),
             vec![1220, 1230]
         );
-        assert!(storage.query(Some(5000), None, 0, 10).unwrap().is_empty());
-        assert_eq!(storage.query(None, Some(1010), 0, 10).unwrap().len(), 1);
-        assert_eq!(storage.query(None, None, 98, 10).unwrap().len(), 2);
+        assert!(page.more);
+        assert!(
+            storage
+                .query(Some(5000), None, 0, 10, all)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        let first = storage.query(None, Some(1010), 0, 10, all).unwrap();
+        assert_eq!((first.records.len(), first.more), (1, false));
+        let last = storage.query(None, None, 98, 2, all).unwrap();
+        assert_eq!((last.records.len(), last.more), (2, false));
+    }
+
+    #[test]
+    fn query_pages_are_cut_by_payload_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        for i in 1..=10 {
+            writer
+                .append(
+                    &[Message {
+                        ts: i,
+                        payload: vec![b'p'; 1000],
+                    }],
+                    true,
+                )
+                .unwrap();
+        }
+        let page = storage.query(None, None, 0, 100, 3500).unwrap();
+        assert_eq!(page.records.len(), 3);
+        assert!(page.more);
+        let next = storage
+            .query(None, None, page.records[2].seq, 100, 3500)
+            .unwrap();
+        assert_eq!(next.records[0].seq, 4);
+        // The first record is returned even when it alone exceeds the budget.
+        let one = storage.query(None, None, 0, 100, 10).unwrap();
+        assert_eq!((one.records.len(), one.more), (1, true));
+        let rest = storage.query(None, None, 7, 100, 1 << 20).unwrap();
+        assert_eq!((rest.records.len(), rest.more), (3, false));
+    }
+
+    #[test]
+    fn segments_never_grow_past_segment_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment_bytes = 64 << 10;
+        let (storage, mut writer) = open(dir.path(), limits(64 << 20, segment_bytes));
+        let mut ts = 0;
+        let mut written = 0u64;
+        for records in [1usize, 3, 7, 20, 2, 50, 1, 11] {
+            for size in [100usize, 1000, 5000, 30_000] {
+                let batch: Vec<Message> = (0..records)
+                    .map(|_| {
+                        ts += 1;
+                        Message {
+                            ts,
+                            payload: vec![b'x'; size],
+                        }
+                    })
+                    .collect();
+                // The writer thread never forms a batch larger than an empty segment.
+                let need: usize = batch.iter().map(frame_len).sum();
+                if need > segment_bytes as usize - HEADER_LEN {
+                    ts -= records as i64;
+                    continue;
+                }
+                writer.append(&batch, records % 2 == 0).unwrap();
+                written += records as u64;
+            }
+        }
+        writer.sync().unwrap();
+        assert_eq!(storage.head_seq(), written);
+        assert!(storage.status().segments >= 5);
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "seg") {
+                let len = fs::metadata(&path).unwrap().len();
+                assert!(len <= segment_bytes, "{} is {len} bytes", path.display());
+            }
+        }
+        let mut reader = storage.reader(1);
+        let mut next = 1;
+        loop {
+            let batch = reader.read(1000, 1 << 30).unwrap();
+            assert_eq!(batch.skipped, 0);
+            if batch.records.is_empty() {
+                break;
+            }
+            for r in batch.records {
+                assert_eq!(r.seq, next);
+                next += 1;
+            }
+        }
+        assert_eq!(next, written + 1);
+    }
+
+    #[test]
+    fn a_record_larger_than_a_segment_is_written_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment_bytes = 64 << 10;
+        let (storage, mut writer) = open(dir.path(), limits(64 << 20, segment_bytes));
+        writer.append(&[msg(1, "a")], true).unwrap();
+        writer
+            .append(
+                &[Message {
+                    ts: 2,
+                    payload: vec![b'b'; 100 << 10],
+                }],
+                true,
+            )
+            .unwrap();
+        writer.append(&[msg(3, "c")], true).unwrap();
+        let firsts: Vec<u64> = storage
+            .index
+            .lock()
+            .unwrap()
+            .segments
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(firsts, vec![1, 2, 3]);
+        let records = storage.reader(1).read(10, 1 << 30).unwrap().records;
+        assert_eq!(
+            records.iter().map(|r| r.payload.len()).collect::<Vec<_>>(),
+            vec![1, 100 << 10, 1]
+        );
+    }
+
+    #[test]
+    fn writer_thread_batches_fit_in_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment_bytes = 64 << 10;
+        let storage = Arc::new(Storage::open(dir.path(), limits(64 << 20, segment_bytes)).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = queue(4096, 8 << 20);
+        // Queue everything first, so the writer forms the largest batches it can.
+        for i in 1..=500 {
+            rt.block_on(tx.send(Message {
+                ts: i,
+                payload: vec![b'w'; 1000],
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let handle = rt.handle().clone();
+        let thread = {
+            let storage = storage.clone();
+            std::thread::spawn(move || run_writer(storage, rx, handle))
+        };
+        thread.join().unwrap();
+        assert_eq!(storage.head_seq(), 500);
+        assert!(storage.metrics().batches.load(Relaxed) < 50);
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "seg") {
+                let len = fs::metadata(&path).unwrap().len();
+                assert!(len <= segment_bytes, "{} is {len} bytes", path.display());
+            }
+        }
+        let page = storage.query(None, None, 0, 1000, usize::MAX).unwrap();
+        assert_eq!(page.records.len(), 500);
+        assert!(page.records.windows(2).all(|w| w[1].seq == w[0].seq + 1));
     }
 
     #[test]
@@ -1167,7 +1757,10 @@ mod tests {
         let (storage, _) = open(dir.path(), l);
         // Sequence k has timestamp 1000 + (k - 1) * 10; start two records before the damaged segment.
         let from = 1000 + (second as i64 - 3) * 10;
-        let got = storage.query(Some(from), None, 0, 1000).unwrap();
+        let got = storage
+            .query(Some(from), None, 0, 1000, usize::MAX)
+            .unwrap()
+            .records;
         assert_eq!(got.first().map(|r| r.ts), Some(from));
         assert_eq!(got.len() as u64, 33 - second);
         assert!(got.windows(2).all(|w| w[1].seq == w[0].seq + 1));
@@ -1217,20 +1810,20 @@ mod tests {
         };
         let storage = Arc::new(Storage::open(dir.path(), l).unwrap());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = queue(16, 1 << 20);
         let thread = {
             let (storage, handle) = (storage.clone(), rt.handle().clone());
             std::thread::spawn(move || run_writer(storage, rx, handle))
         };
         for i in 1..=3 {
-            tx.blocking_send(msg(i, "t")).unwrap();
+            rt.block_on(tx.send(msg(i, "t"))).unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         while storage.head_seq() < 3 {
             assert!(Instant::now() < deadline, "timer did not commit");
             std::thread::sleep(Duration::from_millis(5));
         }
-        tx.blocking_send(msg(4, "u")).unwrap();
+        rt.block_on(tx.send(msg(4, "u"))).unwrap();
         drop(tx);
         thread.join().unwrap();
         assert_eq!(storage.head_seq(), 4);
@@ -1260,13 +1853,13 @@ mod tests {
         };
         let storage = Arc::new(Storage::open(dir.path(), l).unwrap());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = queue(16, 1 << 20);
         let thread = {
             let (storage, handle) = (storage.clone(), rt.handle().clone());
             std::thread::spawn(move || run_writer(storage, rx, handle))
         };
         // Written but not synced: the interval has not elapsed since the writer started.
-        tx.blocking_send(msg(1, "a")).unwrap();
+        rt.block_on(tx.send(msg(1, "a"))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while storage.metrics().batches.load(Relaxed) < 1 {
             assert!(Instant::now() < deadline, "batch not written");

@@ -13,6 +13,9 @@ use serde_json::{Map, Value};
 use tokio::sync::watch;
 use tracing::info;
 
+use crate::outbound::notice::MAX_NOTICE_BYTES;
+use crate::storage::SEGMENT_OVERHEAD;
+
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -37,7 +40,7 @@ impl Default for Inbound {
         Self {
             path: "/run/uevtd/in.sock".into(),
             mode: Mode(0o660),
-            max_message_bytes: 1 << 20,
+            max_message_bytes: 64 << 10,
             max_connections: 64,
         }
     }
@@ -131,7 +134,7 @@ pub struct Mqtt {
     pub keep_alive_s: u64,
     /// Maximum unacknowledged publishes in flight.
     pub inflight: u16,
-    /// Payloads larger than this are rejected instead of published.
+    /// Payloads larger than this are replaced by a drop notice.
     pub max_packet_bytes: usize,
 }
 
@@ -250,12 +253,22 @@ impl Config {
         ensure(inbound.path != self.api.path, || {
             "inbound.path and api.path must differ".into()
         })?;
-        ensure((1..=64 << 20).contains(&inbound.max_message_bytes), || {
-            "inbound.max_message_bytes must be between 1 and 67108864".into()
+        // Every buffer that holds messages is sized from these two, so their
+        // bounds are what keeps memory bounded (ARCHITECTURE.md §11.1).
+        ensure((1..=256 << 10).contains(&inbound.max_message_bytes), || {
+            "inbound.max_message_bytes must be between 1 and 262144".into()
         })?;
-        ensure((1..=65_536).contains(&inbound.max_connections), || {
-            "inbound.max_connections must be between 1 and 65536".into()
+        ensure((1..=256).contains(&inbound.max_connections), || {
+            "inbound.max_connections must be between 1 and 256".into()
         })?;
+        ensure(
+            inbound.max_connections * inbound.max_message_bytes <= 16 << 20,
+            || {
+                "inbound.max_connections times inbound.max_message_bytes must be at most 16777216, \
+                 since each connection may hold one partial message"
+                    .into()
+            },
+        )?;
 
         let storage = &self.storage;
         ensure(!storage.path.as_os_str().is_empty(), || {
@@ -278,7 +291,19 @@ impl Config {
         ensure(storage.sync_interval_ms <= 60_000, || {
             "storage.sync_interval_ms must be at most 60000".into()
         })?;
+        ensure(
+            storage.segment_bytes >= inbound.max_message_bytes as u64 + SEGMENT_OVERHEAD,
+            || {
+                format!(
+                    "storage.segment_bytes must be at least inbound.max_message_bytes + \
+                     {SEGMENT_OVERHEAD}, so that every message fits in a segment"
+                )
+            },
+        )?;
 
+        ensure(self.outbound.channels.len() <= 8, || {
+            "outbound.channels must not hold more than 8 channels".into()
+        })?;
         for (name, channel) in &self.outbound.channels {
             validate_name(name)?;
             match channel {
@@ -445,11 +470,14 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
     ensure((1..=65_535).contains(&c.keep_alive_s), || {
         format!("channel {name}: keep_alive_s must be between 1 and 65535")
     })?;
-    ensure((1..=32_767).contains(&c.inflight), || {
-        format!("channel {name}: inflight must be between 1 and 32767")
+    ensure((1..=1024).contains(&c.inflight), || {
+        format!("channel {name}: inflight must be between 1 and 1024")
     })?;
-    ensure(c.max_packet_bytes >= 1, || {
-        format!("channel {name}: max_packet_bytes must be at least 1")
+    ensure(c.max_packet_bytes >= MAX_NOTICE_BYTES, || {
+        format!(
+            "channel {name}: max_packet_bytes must be at least {MAX_NOTICE_BYTES}, \
+             so that a drop notice fits"
+        )
     })
 }
 
@@ -622,6 +650,91 @@ mod tests {
         let text = serde_json::to_string_pretty(&config).unwrap();
         assert!(text.contains("\"mode\": \"0660\""));
         assert_eq!(serde_json::from_str::<Config>(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn example_configuration_is_valid() {
+        let config: Config =
+            serde_json::from_str(include_str!("../contrib/config.example.json")).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn memory_bounds_are_validated() {
+        let check = |f: &dyn Fn(&mut Config)| {
+            let mut config = Config::default();
+            f(&mut config);
+            config.validate()
+        };
+        assert!(check(&|c| c.inbound.max_message_bytes = 256 << 10).is_ok());
+        assert!(check(&|c| c.inbound.max_message_bytes = (256 << 10) + 1).is_err());
+        assert!(check(&|c| c.inbound.max_connections = 256).is_ok());
+        assert!(check(&|c| c.inbound.max_connections = 257).is_err());
+        // Each limit alone is fine; together they exceed the 16 MiB for partial messages.
+        assert!(
+            check(&|c| {
+                c.inbound.max_connections = 65;
+                c.inbound.max_message_bytes = 256 << 10;
+            })
+            .is_err()
+        );
+        // The configuration files written by earlier versions held 64 connections of 1 MiB.
+        assert!(check(&|c| c.inbound.max_message_bytes = 1 << 20).is_err());
+
+        // A message must fit into a segment together with the headers.
+        let fits = |segment_bytes: u64, max_message_bytes: usize| {
+            check(&|c| {
+                c.storage.segment_bytes = segment_bytes;
+                c.inbound.max_message_bytes = max_message_bytes;
+            })
+        };
+        assert!(fits(64 << 10, (64 << 10) - 48).is_ok());
+        assert!(fits(64 << 10, (64 << 10) - 47).is_err());
+
+        let channels = |n: usize| {
+            check(&|c| {
+                for i in 0..n {
+                    c.outbound
+                        .channels
+                        .insert(format!("c{i}"), http("http://h/x"));
+                }
+            })
+        };
+        assert!(channels(8).is_ok());
+        assert!(channels(9).is_err());
+
+        let inflight = |n: u16| {
+            check(&|c| {
+                c.outbound.channels.insert(
+                    "m".into(),
+                    Channel::Mqtt(Mqtt {
+                        host: "h".into(),
+                        topic: "t".into(),
+                        inflight: n,
+                        ..Mqtt::default()
+                    }),
+                );
+            })
+        };
+        assert!(inflight(1024).is_ok());
+        assert!(inflight(1025).is_err());
+
+        // A channel's size limit must admit its drop notices.
+        let packet = |max_packet_bytes: usize| {
+            check(&|c| {
+                c.outbound.channels.insert(
+                    "m".into(),
+                    Channel::Mqtt(Mqtt {
+                        host: "h".into(),
+                        topic: "t".into(),
+                        max_packet_bytes,
+                        ..Mqtt::default()
+                    }),
+                );
+            })
+        };
+        assert!(packet(256).is_ok());
+        assert!(packet(255).is_err());
     }
 
     #[test]

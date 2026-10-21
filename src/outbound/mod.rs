@@ -3,6 +3,7 @@
 
 pub mod http;
 pub mod mqtt;
+pub mod notice;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -18,10 +19,12 @@ use tracing::{Instrument, error, info, warn};
 
 use crate::config::{Channel, Config};
 use crate::metrics::ErrorSlot;
-use crate::storage::{Batch, Reader, Record, Storage};
+use crate::storage::{Batch, Loss, Reader, Record, Storage, Tail};
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_BATCH_BYTES: usize = 4 << 20;
+/// Payload bytes a channel holds for delivery, beyond one record: a batch
+/// being sent, or the messages awaiting acknowledgement.
+pub const DELIVERY_BYTES: usize = 1 << 20;
 
 pub struct ChannelMetrics {
     pub kind: &'static str,
@@ -33,7 +36,11 @@ pub struct ChannelMetrics {
     pub delivered: AtomicU64,
     pub rejected: AtomicU64,
     pub retries: AtomicU64,
-    pub lost: AtomicU64,
+    /// Records that left the log before the channel read them, counted by
+    /// the log when that happens.
+    pub lost: Arc<Loss>,
+    /// Drop notices the target acknowledged.
+    pub notices: AtomicU64,
     pub last_error: ErrorSlot,
 }
 
@@ -48,7 +55,8 @@ impl ChannelMetrics {
             delivered: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             retries: AtomicU64::new(0),
-            lost: AtomicU64::new(0),
+            lost: Arc::default(),
+            notices: AtomicU64::new(0),
             last_error: ErrorSlot::default(),
         }
     }
@@ -138,7 +146,7 @@ async fn reconcile(
             continue;
         }
         let start = initial_cursor(storage, name).await;
-        let feed = Feed::new(storage.clone(), start, metrics.clone());
+        let feed = Feed::new(storage, name, start, metrics.clone());
         let cursor = CursorStore::new(storage.clone(), name.clone(), start, metrics.clone());
         let token = CancellationToken::new();
         let span = tracing::info_span!("channel", name = %name);
@@ -225,11 +233,22 @@ pub fn backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
     base.saturating_mul(1u32 << attempt.min(16)).min(max)
 }
 
-/// Cancel-safe batch reader for a channel. Blocking reads run on the
-/// blocking pool with the reader handed in and out, so dropping a pending
-/// `next` never loses it.
+/// What a channel delivers next.
+#[derive(Debug)]
+pub enum Delivery {
+    /// Consecutive records in sequence order.
+    Records(Vec<Record>),
+    /// Records `from..=to` left the log before the channel read them; they
+    /// are counted in `lost` already. A channel that can sends a notice in
+    /// their place.
+    Lost { from: u64, to: u64 },
+}
+
+/// Cancel-safe reader of the log for a channel, which keeps the channel's
+/// position for loss accounting. Blocking reads run on the blocking pool with
+/// the reader handed in and out, so dropping a pending `next` never loses it.
 pub struct Feed {
-    storage: Arc<Storage>,
+    tail: Tail,
     head: watch::Receiver<u64>,
     reader: Option<Reader>,
     next_seq: u64,
@@ -240,13 +259,12 @@ pub struct Feed {
 }
 
 impl Feed {
-    fn new(storage: Arc<Storage>, start: u64, metrics: Arc<ChannelMetrics>) -> Self {
-        let head = storage.subscribe();
-        let reader = storage.reader(start);
+    fn new(storage: &Arc<Storage>, name: &str, start: u64, metrics: Arc<ChannelMetrics>) -> Self {
+        let tail = storage.tail(name, start, metrics.lost.clone());
         Feed {
-            storage,
-            head,
-            reader: Some(reader),
+            reader: Some(tail.reader(start)),
+            tail,
+            head: storage.subscribe(),
             next_seq: start,
             pending: None,
             metrics,
@@ -254,8 +272,10 @@ impl Feed {
         }
     }
 
-    /// Next non-empty batch of records in sequence order, at most `max`.
-    pub async fn next(&mut self, max: usize) -> Vec<Record> {
+    /// The next delivery: consecutive records, at most `max_records` and at
+    /// most `max_bytes` of payload plus one record; or a range of records
+    /// that left the log before the channel read them.
+    pub async fn next(&mut self, max_records: usize, max_bytes: usize) -> Delivery {
         loop {
             if let Some(task) = self.pending.as_mut() {
                 let outcome = task.await;
@@ -272,15 +292,14 @@ impl Feed {
                                         .last_error
                                         .clear_if(|m| m.starts_with("log read: "));
                                 }
-                                if batch.skipped > 0 {
-                                    self.metrics.lost.fetch_add(batch.skipped, Relaxed);
-                                    warn!(
-                                        skipped = batch.skipped,
-                                        "records were evicted before delivery"
-                                    );
-                                }
                                 if !batch.records.is_empty() {
-                                    return batch.records;
+                                    return Delivery::Records(batch.records);
+                                }
+                                if batch.skipped > 0 {
+                                    return Delivery::Lost {
+                                        from: self.next_seq - batch.skipped,
+                                        to: self.next_seq - 1,
+                                    };
                                 }
                             }
                             Err(e) => {
@@ -293,7 +312,7 @@ impl Feed {
                     }
                     Err(e) => {
                         error!(error = %e, "log reader task failed; reopening");
-                        self.reader = Some(self.storage.reader(self.next_seq));
+                        self.reader = Some(self.tail.reader(self.next_seq));
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -305,9 +324,9 @@ impl Feed {
                 .reader
                 .take()
                 .expect("reader is present when no read is pending");
-            let max = max.max(1);
+            let (max_records, max_bytes) = (max_records.max(1), max_bytes.max(1));
             self.pending = Some(tokio::task::spawn_blocking(move || {
-                let result = reader.read(max, MAX_BATCH_BYTES);
+                let result = reader.read(max_records, max_bytes);
                 (reader, result)
             }));
         }
@@ -417,6 +436,58 @@ mod tests {
         std::fs::write(dir.path().join("cursors").join("bad"), b"garbage\n").unwrap();
         assert_eq!(initial_cursor(&storage, "bad").await, 1);
         assert_eq!(storage.load_cursor("bad").unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn feed_delivers_a_loss_in_place_of_the_records_it_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_bytes: 128 << 10,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
+        let metrics = Arc::new(ChannelMetrics::new("mqtt"));
+        let mut feed = Feed::new(&storage, "c", 1, metrics.clone());
+        let mut writer = crate::storage::Writer::new(storage.clone());
+        let mut write = |records: i64| {
+            for ts in 0..records {
+                let message = crate::storage::Message {
+                    ts,
+                    payload: vec![b'f'; 1000],
+                };
+                writer.append(&[message], true).unwrap();
+            }
+        };
+        write(300);
+        let first = storage.status().first_seq;
+        assert!(first > 1);
+        // Counted when evicted, before the channel reads.
+        assert_eq!(metrics.lost.records(), first - 1);
+        let Delivery::Lost { from, to } = feed.next(10, 1 << 20).await else {
+            panic!("the loss comes first");
+        };
+        assert_eq!((from, to), (1, first - 1));
+        let Delivery::Records(records) = feed.next(10, 1 << 20).await else {
+            panic!("then the records after it");
+        };
+        assert_eq!(records[0].seq, first);
+        assert_eq!(metrics.lost.records(), first - 1);
+
+        // Restarted before its notice was acknowledged, the channel resumes
+        // at the same cursor: the notice is due again, the count is not.
+        drop(feed);
+        let mut feed = Feed::new(&storage, "c", 1, metrics.clone());
+        assert_eq!(metrics.lost.records(), first - 1);
+        let Delivery::Lost { from, to } = feed.next(10, 1 << 20).await else {
+            panic!("the loss again");
+        };
+        assert_eq!((from, to), (1, first - 1));
+
+        // A stopped channel's position is not accounted any more.
+        drop(feed);
+        write(300);
+        assert_eq!(metrics.lost.records(), first - 1);
     }
 
     #[test]

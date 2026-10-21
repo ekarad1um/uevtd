@@ -20,6 +20,7 @@ usage: uevtd [--config PATH]
   -h, --help          print this help";
 
 fn main() -> ExitCode {
+    tune_allocator();
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -96,6 +97,24 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// glibc keeps memory that large buffers free: it raises its mmap threshold
+/// after every large free and gives each thread its own heap, so a burst of
+/// large messages would leave the process far above what it uses. A fixed
+/// threshold hands large buffers back to the system when they are freed, and
+/// two arenas bound the rest (ARCHITECTURE.md §11.1).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_allocator() {
+    // SAFETY: mallopt only changes allocator parameters, and no other thread
+    // exists yet.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 << 10);
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_allocator() {}
 
 fn usage_error(message: &str) -> ExitCode {
     eprintln!("uevtd: {message}\n{USAGE}");

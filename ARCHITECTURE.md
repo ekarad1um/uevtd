@@ -70,11 +70,14 @@ src/
   inbound.rs       UDS listener, connection tasks, line framing (sans-IO `Framer`)
   storage/
     mod.rs         Storage: segment index, Writer (group commit, rotation, eviction),
-                   Reader (tailing cursor), time-range query, cursor files
+                   Reader (tailing cursor), Tail (loss accounting), time-range query,
+                   cursor files
+    queue.rs       bounded queue to the writer, by message count and payload bytes
     segment.rs     on-disk encoding: segment header, record frame, CRC, recovery scan
   outbound/
     mod.rs         Supervisor: reconciles configured channels with running tasks;
                    Feed (cancel-safe batch reader), CursorStore (debounced persistence)
+    notice.rs      drop notices
     http.rs        HTTP channel task
     mqtt.rs        MQTT channel task and the pure `Tracker` for packet-id/ack bookkeeping
   api.rs           HTTP API over UDS (axum): config, messages, status, metrics, health
@@ -106,7 +109,7 @@ Edge cases, all handled by the sans-IO `Framer` so they are unit-testable:
 | Peer closes with an unterminated final line | Line discarded, `warn` with byte count, `inbound_truncated_total`+1 |
 | Line longer than `max_message_bytes`        | Bytes discarded up to the next `\n`, `warn`, `inbound_oversized_total`+1 |
 | More than `max_connections` clients         | Extra connection closed immediately, `warn`, counter                 |
-| Writer queue full                           | Connection task awaits (socket flow control); nothing is dropped     |
+| Writer queue full (8 192 messages or 8 MiB) | Connection task awaits (socket flow control); nothing is dropped     |
 | Daemon shutdown                             | Accept stops; connection tasks stop reading; buffered complete lines already handed to the writer are kept |
 
 **Timestamps.** Every message receives a timestamp at receipt (microseconds
@@ -187,14 +190,17 @@ a corrupted payload.
 
 ### 5.4 Write path
 
-Inbound connection tasks send `Message { ts, payload }` into a bounded channel
-(8 192 entries). A dedicated writer **thread** drains it with group commit:
+Inbound connection tasks send `Message { ts, payload }` into a bounded queue
+of at most 8 192 messages and 8 MiB of payload, whichever comes first; a
+message counts against the bytes until it has been written. A dedicated writer
+**thread** drains it with group commit:
 
 1. Block for the first message, then take whatever else is already queued, up to
-   1 024 messages or 1 MiB.
-2. If the active segment has reached `segment_bytes`, seal it and create the
-   next one (`first_seq = head + 1`, `base_ts = head_ts`; parent directory
-   fsync'd so the file's existence is durable).
+   1 024 messages or 1 MiB of encoded records, and never more than an empty
+   segment holds; a message that does not fit starts the next batch.
+2. If the batch would carry the active segment past `segment_bytes`, seal it
+   and create the next one (`first_seq = head + 1`, `base_ts = head_ts`; parent
+   directory fsync'd so the file's existence is durable).
 3. Encode the batch into one buffer and `write_all` it.
 4. `fdatasync` according to `sync_interval_ms` (0 = after every batch;
    otherwise at most once per interval, with a timer so a trailing batch is
@@ -225,11 +231,16 @@ cost is bounded by one sync interval of unsynced records.
 
 Eviction granularity is one segment, so retained bytes stay within
 `[max_bytes - segment_bytes, max_bytes]`. Validation requires
-`max_bytes >= 2 * segment_bytes`. With the defaults (256 MiB / 8 MiB) and
-0.5 KiB messages the log holds roughly 500 000 messages; at 1 msg/s that is six
-days, and a 1 000 msg/s burst can run for eight minutes before evicting the
-oldest segment. An oversized single message is still written (a segment may
-exceed `segment_bytes` by one batch).
+`max_bytes >= 2 * segment_bytes` and `segment_bytes >= max_message_bytes + 48`
+(the segment header and one frame header), so every message fits into a
+segment. Since a batch that would cross `segment_bytes` starts a new segment, a
+segment exceeds that size only when a single record is larger, which can happen
+only to a message accepted just before the limits were lowered. With the
+defaults (256 MiB / 8 MiB) and 0.5 KiB messages the log holds roughly 500 000
+messages; at 1 msg/s that is six days, and a 1 000 msg/s burst fills an empty
+log in about eight minutes. Once the log is full, every new segment evicts the
+oldest one, whether or not every channel has delivered it; what a channel
+loses that way is counted and logged at once (§5.9).
 
 Lowering `max_bytes` at runtime evicts immediately; changing `segment_bytes`
 applies to the next rotation.
@@ -262,8 +273,11 @@ position inside the segment that contains it. Reads use `pread` of 64 KiB
 chunks bounded by the committed length and decode as many complete records as
 fit the requested batch. Creating a reader at an arbitrary sequence costs one
 scan from the start of that segment; subsequent reads are O(bytes returned).
-When a reader's segment has been evicted it jumps to the oldest remaining one
-and reports how many records it skipped. An I/O error is reported only once the
+Where records are missing, because they were evicted or the rest of a
+segment is corrupt, a read returns the gap on its own, as the number of
+records it passed over, and never together with records. The records of a
+batch are therefore consecutive, and a channel knows exactly which records it
+will not deliver. An I/O error is reported only once the
 records read before it have been returned, so a failing segment never costs
 the records in front of it; a channel then retries the failing position every
 second and shows the error in `last_error`.
@@ -274,8 +288,11 @@ which is free of lost wake-ups and cancel-safe.
 **Time-range query** (`GET /v1/messages`): locate the start segment from
 `base_ts` (invariant 3), create a reader there (or at `after + 1` if later),
 scan forward, keep records with `from <= ts < to`, stop at the first `ts >= to`
-or at `limit`. Results are in sequence order; the caller paginates with
-`after=<last seq>`.
+or when the page holds `limit` records or 1 MiB of payload (a larger first
+record is still returned). Results are in sequence order. Because timestamps
+never decrease, the first record left out tells whether the page is the last:
+`next` is the page's last sequence number when more records follow and `null`
+otherwise, and the caller paginates with `after=<next>`.
 
 ### 5.8 Cursors
 
@@ -293,6 +310,37 @@ the position is unknown, and at-least-once means replaying rather than
 skipping. Cursor files of channels that are no longer configured are removed at
 startup, as they are when a channel is removed at runtime.
 
+### 5.9 Loss accounting
+
+Every running channel keeps its position in the log as a *tail*: every record
+below it is in the channel's hands (delivered, or held until acknowledged) or
+counted as lost. Eviction, under the index lock, compares the new oldest
+sequence number with each tail. The records a channel had not read are added
+to its `lost` counter at that moment and logged with their range, whether the
+channel is connected or not. While a channel's read is running, eviction
+leaves its tail alone. The read counts the gaps it passes over itself, such as
+a corrupt segment or a segment evicted under it, and when it ends it counts
+whatever was evicted beyond its position meanwhile. A channel that starts with
+a cursor below the oldest record counts the difference when it starts. Each
+record is therefore counted as soon as its loss is known, and the reader then
+reports the gap so that the channel can send a notice in its place (§6.1).
+
+A record is counted once. A channel is restarted on every change to its
+configuration, and its new tail starts at the cursor, which stays below a
+gap until the gap's notice is acknowledged. The `lost` counter therefore
+remembers how far it has counted, and a later tail counts only what lies
+beyond; its reader still reports the whole gap, so the notice is sent again.
+One case is left uncounted: records a channel held for an acknowledgement
+when it was restarted, if they were evicted while it held them. They are at
+most what a channel holds for delivery (§11.1), and the notice still covers
+them.
+
+The warning is repeated at most once a minute, with the running total, since
+a channel that stays behind loses records with every eviction. A disabled
+channel has no tail; what it lost is counted when it is enabled again. A
+cursor saved up to a second behind (§5.8) makes a crash report records
+delivered in that second as lost, if they are evicted before the restart.
+
 ## 6. Outbound
 
 ### 6.1 Delivery model
@@ -308,11 +356,32 @@ delivers in sequence order, one message at a time for HTTP, pipelined up to
 - **Head-of-line blocking is deliberate.** A transient failure blocks the
   channel with exponential backoff (HTTP: 100 ms to 30 s; MQTT reconnect: 1 s to
   60 s) until the target recovers. Lag is visible in metrics and bounded by the
-  log's retention, after which the oldest messages are lost and counted.
+  log's retention, after which the oldest messages are lost, counted and
+  logged as they are evicted (§5.9).
 - **Permanent rejections are skipped.** An HTTP 4xx other than 408/429, or an
   MQTT payload larger than `max_packet_bytes`, is logged with the sequence
   number, counted in `rejected`, and the cursor moves on. Retrying forever
-  would stall the channel on one bad message.
+  would stall the channel on one bad message. The record stays in the log and
+  can be queried until it is evicted.
+- **A skipped record leaves a notice.** An MQTT channel publishes a *drop
+  notice* in place of the records it will not deliver, on the channel's own
+  topic, so that the receiver learns of the gap:
+
+  ```json
+  {"notice": {"event": "lost", "from_seq": 1, "to_seq": 3075, "count": 3075}}
+  {"notice": {"event": "rejected", "seq": 4242, "ts": 1760928000123456, "reason": "payload too large"}}
+  ```
+
+  `lost` covers records that left the log before the channel read them;
+  `rejected` names a record the channel will not deliver, with the time under
+  which `/v1/messages` still returns it. A notice is published like a message,
+  with the channel's QoS, and the cursor passes the records it stands for only
+  once it is acknowledged, so it is delivered at least once and in order. It
+  is never retained, since it would replace the topic's last message for new
+  subscribers. Receivers tell notices apart by the top-level `notice` key,
+  which a producer's own messages should therefore not use. Every notice is
+  at most 256 bytes. The HTTP channel, which is to be replaced, counts and
+  logs the same losses but sends no notice.
 - **New channels start at the head.** A channel without a cursor file forwards
   messages received after it was configured; it does not replay the backlog.
   That start position is persisted immediately. Disabling and re-enabling a
@@ -343,6 +412,10 @@ pure `Tracker` that maps packet ids to sequence numbers:
   (QoS 0) completes the oldest unsent entry immediately.
 - `PubAck` (QoS 1) / `PubComp` (QoS 2) completes the entry holding that id.
 - The cursor is the sequence number after the longest completed prefix.
+- Every publish is an entry, a drop notice included, since the library hands
+  out packet ids in request order. A notice's entry stands for the records it
+  covers, so completing it moves the cursor past them; it counts in
+  `notices`, not in `delivered`.
 
 The daemon manages reconnection itself: on any connection error the client and
 event loop are dropped, every unacknowledged entry is marked unsent, and after a
@@ -352,7 +425,10 @@ and guarantees ordering across reconnects, at the cost of possible duplicates
 (at-least-once). Outstanding publishes are capped at `inflight`, which is also
 the request channel capacity, so `try_publish` never fails on capacity; the
 library's own in-flight window is set to `2 * inflight + 1` so packet ids do not
-collide under normal acknowledgement order.
+collide under normal acknowledgement order. They are also capped at 1 MiB of
+payload plus one message, because the channel and the library each keep a copy
+of a publish until it is acknowledged; an acknowledged payload is released at
+once, even while an earlier publish is still outstanding.
 
 TLS uses rustls with the platform verifier (same trust behaviour as the HTTP
 channel). Username/password, client id, keep-alive, QoS and retain are configurable.
@@ -374,7 +450,7 @@ the key names the cursor file, so renaming a channel starts it at the head.
   "inbound": {
     "path": "/run/uevtd/in.sock",
     "mode": "0660",
-    "max_message_bytes": 1048576,
+    "max_message_bytes": 65536,
     "max_connections": 64
   },
   "storage": {
@@ -423,13 +499,16 @@ default; unknown fields are rejected so typos surface at validation time.
 ### 7.2 Validation
 
 Performed before anything is persisted or applied: socket paths non-empty and
-distinct; `segment_bytes` in 64 KiB..=256 MiB, `max_bytes >= 2 * segment_bytes`
-and at most 1 TiB, `sync_interval_ms <= 60 000`; channel
-names `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they become file names); HTTP URL,
-method and header names/values parse; MQTT host and topic non-empty, topic has
-no wildcards, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol field is
-16 bits), `inflight` in 1..=32767 (the packet-id window is twice that);
-`max_connections` in 1..=65536; log filter parses as a `tracing` directive.
+distinct; `max_message_bytes` in 1..=256 KiB and `max_connections` in 1..=256,
+with `max_connections × max_message_bytes` at most 16 MiB; `segment_bytes` in
+64 KiB..=256 MiB and at least `max_message_bytes + 48`, `max_bytes >= 2 *
+segment_bytes` and at most 1 TiB, `sync_interval_ms <= 60 000`; at most 8
+channels, named `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they become file names);
+HTTP URL, method and header names/values parse; MQTT host and topic non-empty,
+topic has no wildcards, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol
+field is 16 bits), `inflight` in 1..=1024, `max_packet_bytes` at least 256 so
+that a drop notice fits; log filter parses as a `tracing`
+directive. The bounds on sizes and counts are what bounds memory (section 11.1).
 
 ### 7.3 Persistence and live update
 
@@ -474,7 +553,7 @@ operator sees exactly what will be in effect after the cause is fixed.
 | GET    | `/v1/config`    | current configuration                                             |
 | PUT    | `/v1/config`    | replace configuration; returns the applied document               |
 | PATCH  | `/v1/config`    | merge-patch configuration; returns the applied document           |
-| GET    | `/v1/messages`  | `from`, `to` (µs, `to` exclusive), `after` (seq), `limit` (≤10 000) |
+| GET    | `/v1/messages`  | `from`, `to` (µs, `to` exclusive), `after` (seq), `limit` (≤10 000); pages hold at most 1 MiB of payload |
 | GET    | `/v1/status`    | JSON: uptime, storage, inbound, per-channel cursor/lag/errors      |
 | GET    | `/v1/metrics`   | Prometheus text exposition of the same counters                   |
 | GET    | `/v1/health`    | 200 when the daemon is running                                    |
@@ -482,7 +561,9 @@ operator sees exactly what will be in effect after the cause is fixed.
 Errors are `{"error": "..."}` with 400 (validation), 404, or 500. In
 `/v1/messages` responses a payload that is valid JSON is embedded verbatim as
 `data`; any other payload is returned as a string in `text`, so the two cases
-cannot be confused and the response is always valid JSON.
+cannot be confused and the response is always valid JSON. Request bodies are
+limited to 256 KiB (413 beyond that), and one query is read and serialized at a
+time while others wait.
 
 Example: `curl --unix-socket /run/uevtd/api.sock http://uevtd/v1/status`.
 
@@ -500,7 +581,9 @@ events are `debug`/`trace`.
 demand. Gauges: active connections, storage bytes/segments/head/first seq,
 per-channel cursor, lag and connected state. Counters: messages, bytes,
 truncated, oversized, rejected connections, batches, write errors, evictions,
-corrupt records, per-channel delivered, rejected, retries, lost. `/v1/status`
+corrupt records, per-channel delivered, rejected, retries, lost, notices.
+`lost` grows when records are evicted, not when the channel next reads
+(§5.9), and `lag` counts only records still in the log. `/v1/status`
 adds the last error per component with its timestamp and the
 `restart_required` list.
 
@@ -514,10 +597,10 @@ adds the last error per component with its timestamp and the
 | fsync error                               | Unsynced tail discarded and counted; segment sealed; nothing visible lost |
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1) so the service manager restarts it |
-| Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost; others unaffected     |
+| Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost, a notice in its place; others unaffected |
 | Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error` |
 | Cursor file unreadable                    | Channel replays from the oldest retained record                            |
-| Target down for longer than retention     | Channel loses the evicted messages, logs the count, continues at the oldest available |
+| Target down for longer than retention     | Evicted messages counted as lost and logged as they are evicted; once the target is back, the channel sends a notice in their place and continues at the oldest available |
 | Broker drops the session                  | Unacked messages republished (duplicates possible), order preserved       |
 | Another instance already listening        | Startup fails; the socket file is not stolen                              |
 | Config file invalid at startup            | Startup fails with the validation error                                   |
@@ -538,6 +621,42 @@ tasks; drop the writer's senders so it drains and syncs the queue, then join
 it; cancel channels, which abandon any request still in flight (the cursor has
 not advanced, so it is retried later) and persist their cursors; stop the API.
 A second signal exits immediately without waiting.
+
+### 11.1 Memory
+
+The target is a device with 128 MiB of RAM. The backlog lives in the log on
+disk, so memory does not grow with traffic or with how far a channel is behind.
+Every buffer that holds messages has a byte bound:
+
+| Holder | Bound | With the defaults |
+|--------|-------|-------------------|
+| Inbound connections | each holds at most one message and an 8 KiB read buffer; a complete message is copied out only once the queue has room for it; `max_connections × max_message_bytes` ≤ 16 MiB | 64 × 72 KiB |
+| Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when producers outrun the disk |
+| Write batch | 1 MiB of encoded records, or one record | 1 MiB |
+| Each channel | 1 MiB of payload being delivered, plus one message; MQTT keeps a second copy inside rumqttc | about 2 MiB |
+| Each log reader | a 64 KiB read buffer, or one record if larger | 64 KiB |
+| A query | one at a time: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
+| An API request | a 256 KiB body | small |
+
+The JSON of a query page can reach six times the page for binary payloads
+(control bytes are escaped as `\u00XX`); valid JSON payloads are embedded as
+they are.
+
+On glibc the binary fixes the allocator's mmap threshold at 128 KiB and limits
+it to two arenas (`src/main.rs`). By default glibc raises the threshold after
+every large free and keeps a heap per thread, so the buffers of large messages
+stayed with the process after use: under the heaviest load below the resident
+size reached 122 MiB instead of 54 MiB.
+
+Resident size of the release binary, measured on Linux (glibc, 7 cores) while
+48 connections send messages of the maximum size as fast as they can, 16 more
+hold a partial message each, and queries run in a loop:
+
+| Configuration | Peak |
+|---------------|------|
+| Idle, one MQTT and one HTTP channel | 6 MiB |
+| Defaults (64 KiB messages); one MQTT channel and one HTTP target that answers after 2 s | 31 MiB |
+| Every limit at its maximum (256 KiB messages); four MQTT channels and four slow HTTP targets | 54 MiB |
 
 ## 12. Decisions to confirm
 

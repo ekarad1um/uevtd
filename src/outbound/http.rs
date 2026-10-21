@@ -10,7 +10,7 @@ use reqwest::{Client, Method, StatusCode, Url};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::{ChannelMetrics, CursorStore, Feed, backoff};
+use super::{ChannelMetrics, CursorStore, DELIVERY_BYTES, Delivery, Feed, backoff};
 use crate::config;
 use crate::storage::Record;
 
@@ -50,20 +50,27 @@ pub async fn run(
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let records = tokio::select! {
-            records = feed.next(BATCH) => records,
+        let delivery = tokio::select! {
+            delivery = feed.next(BATCH, DELIVERY_BYTES) => delivery,
             _ = flush.tick() => {
                 cursor.flush(false).await;
                 continue;
             }
             _ = token.cancelled() => break,
         };
-        for record in records {
-            if token.is_cancelled() || !deliver(&template, &record, &metrics, &token).await {
-                cursor.flush(true).await;
-                return;
+        match delivery {
+            // Counted and logged by the log; this channel sends no notice.
+            Delivery::Lost { to, .. } => cursor.advance(to + 1),
+            Delivery::Records(records) => {
+                for record in records {
+                    if token.is_cancelled() || !deliver(&template, &record, &metrics, &token).await
+                    {
+                        cursor.flush(true).await;
+                        return;
+                    }
+                    cursor.advance(record.seq + 1);
+                }
             }
-            cursor.advance(record.seq + 1);
         }
         cursor.flush(false).await;
     }

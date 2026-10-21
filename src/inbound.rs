@@ -9,15 +9,18 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::{self, Config};
 use crate::metrics::ErrorSlot;
-use crate::storage::Message;
+use crate::storage::{Message, QueueSender};
 use crate::{now_us, uds};
+
+/// Bytes read from a connection at a time.
+const READ_BUF: usize = 8 << 10;
 
 #[derive(Default)]
 pub struct Metrics {
@@ -33,7 +36,7 @@ pub struct Metrics {
 
 pub async fn run(
     mut cfg: watch::Receiver<Arc<Config>>,
-    sink: mpsc::Sender<Message>,
+    sink: QueueSender,
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -194,14 +197,14 @@ async fn rebind(
 async fn serve(
     mut stream: UnixStream,
     max_line: usize,
-    sink: mpsc::Sender<Message>,
+    sink: QueueSender,
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
     _permit: OwnedSemaphorePermit,
 ) {
     debug!("connected");
     let mut framer = Framer::new(max_line);
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; READ_BUF];
     loop {
         let n = tokio::select! {
             read = stream.read(&mut buf) => match read {
@@ -220,19 +223,20 @@ async fn serve(
         framer.push(&buf[..n]);
         while let Some(frame) = framer.next_frame() {
             match frame {
-                Frame::Line(payload) => {
+                Frame::Line(len) => {
+                    let ts = now_us();
                     metrics.messages.fetch_add(1, Relaxed);
-                    metrics.bytes.fetch_add(payload.len() as u64, Relaxed);
-                    if sink
-                        .send(Message {
-                            ts: now_us(),
-                            payload,
-                        })
-                        .await
-                        .is_err()
-                    {
+                    metrics.bytes.fetch_add(len as u64, Relaxed);
+                    // The message is copied out of the framer only once the
+                    // queue has room for it, so a connection never holds a
+                    // message twice while it waits.
+                    let Ok(permit) = sink.reserve(len).await else {
                         return;
-                    }
+                    };
+                    permit.send(Message {
+                        ts,
+                        payload: framer.take_line(),
+                    });
                 }
                 Frame::Oversized(bytes) => {
                     metrics.oversized.fetch_add(1, Relaxed);
@@ -253,8 +257,9 @@ async fn serve(
 }
 
 pub enum Frame {
-    /// A complete line without its terminator.
-    Line(Vec<u8>),
+    /// A complete line of this many bytes, terminator excluded, is next;
+    /// [`Framer::take_line`] returns it.
+    Line(usize),
     /// A line longer than the limit was dropped; its length in bytes on the wire, newline excluded.
     Oversized(usize),
 }
@@ -268,6 +273,9 @@ pub struct Framer {
     scanned: usize,
     discarding: bool,
     discarded: usize,
+    /// A line at `start` that was announced but not taken yet: its length,
+    /// and the bytes it occupies with its terminator.
+    ready: Option<(usize, usize)>,
 }
 
 impl Framer {
@@ -279,18 +287,34 @@ impl Framer {
             scanned: 0,
             discarding: false,
             discarded: 0,
+            ready: None,
         }
     }
 
+    /// Appends received bytes. Consumed bytes are reclaimed before the buffer
+    /// grows, and it never grows beyond one message plus this chunk, which is
+    /// the most it has to hold once the previous chunk has been framed.
     pub fn push(&mut self, data: &[u8]) {
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
+        let needed = self.buf.len() + data.len();
+        if self.start > 0 && (self.start >= self.buf.len() / 2 || needed > self.buf.capacity()) {
             self.buf.drain(..self.start);
             self.start = 0;
+        }
+        let needed = self.buf.len() + data.len();
+        if needed > self.buf.capacity() {
+            let most = (self.max + 1).saturating_add(data.len()).max(needed);
+            let target = (self.buf.capacity() * 2).clamp(needed, most);
+            self.buf.reserve_exact(target - self.buf.len());
         }
         self.buf.extend_from_slice(data);
     }
 
+    /// The next frame. A line is announced by its length and stays in the
+    /// buffer, announced again by every call, until [`Framer::take_line`].
     pub fn next_frame(&mut self) -> Option<Frame> {
+        if let Some((len, _)) = self.ready {
+            return Some(Frame::Line(len));
+        }
         loop {
             let pending = &self.buf[self.start..];
             let newline = pending[self.scanned..]
@@ -314,17 +338,15 @@ impl Framer {
             }
             match newline {
                 Some(i) => {
-                    let line = pending[..i].strip_suffix(b"\r").unwrap_or(&pending[..i]);
-                    let frame = if line.is_empty() {
-                        None
-                    } else if line.len() > self.max {
-                        Some(Frame::Oversized(i))
+                    let len = pending[..i].strip_suffix(b"\r").map_or(i, <[u8]>::len);
+                    if len == 0 {
+                        self.consume(i + 1);
+                    } else if len > self.max {
+                        self.consume(i + 1);
+                        return Some(Frame::Oversized(i));
                     } else {
-                        Some(Frame::Line(line.to_vec()))
-                    };
-                    self.consume(i + 1);
-                    if frame.is_some() {
-                        return frame;
+                        self.ready = Some((len, i + 1));
+                        return Some(Frame::Line(len));
                     }
                 }
                 None => {
@@ -340,6 +362,14 @@ impl Framer {
                 }
             }
         }
+    }
+
+    /// Copies out the line announced by [`Framer::next_frame`] and consumes it.
+    pub fn take_line(&mut self) -> Vec<u8> {
+        let (len, consumed) = self.ready.take().expect("a line was announced");
+        let line = self.buf[self.start..self.start + len].to_vec();
+        self.consume(consumed);
+        line
     }
 
     /// Bytes of an unterminated message currently held or being discarded.
@@ -367,11 +397,24 @@ mod tests {
         let mut out = Vec::new();
         while let Some(f) = framer.next_frame() {
             out.push(match f {
-                Frame::Line(l) => Ok(String::from_utf8(l).unwrap()),
+                Frame::Line(_) => Ok(String::from_utf8(framer.take_line()).unwrap()),
                 Frame::Oversized(n) => Err(n),
             });
         }
         out
+    }
+
+    #[test]
+    fn an_announced_line_stays_until_taken() {
+        let mut f = Framer::new(100);
+        f.push(b"ab\r\ncd\n");
+        assert!(matches!(f.next_frame(), Some(Frame::Line(2))));
+        assert!(matches!(f.next_frame(), Some(Frame::Line(2))));
+        // More data may arrive while a line waits.
+        f.push(b"ef\n");
+        assert_eq!(f.take_line(), b"ab");
+        assert_eq!(collect(&mut f), vec![Ok("cd".into()), Ok("ef".into())]);
+        assert_eq!(f.pending(), 0);
     }
 
     #[test]
@@ -438,6 +481,29 @@ mod tests {
         drop((one, two, three));
         limiter.reclaim();
         assert_eq!(limiter.semaphore.available_permits(), 3);
+    }
+
+    #[test]
+    fn buffer_holds_at_most_one_message_and_one_read() {
+        let max = 1000;
+        let chunk = 64;
+        let mut stream = Vec::new();
+        for len in [1, 10, 500, 999, 1000, 1001, 3000, 7, 1000] {
+            stream.extend(std::iter::repeat_n(b'x', len));
+            stream.push(b'\n');
+        }
+        let mut f = Framer::new(max);
+        let mut frames = 0;
+        for piece in stream.chunks(chunk) {
+            f.push(piece);
+            frames += collect(&mut f).len();
+            assert!(
+                f.buf.capacity() <= max + 1 + chunk,
+                "capacity {}",
+                f.buf.capacity()
+            );
+        }
+        assert_eq!(frames, 9);
     }
 
     #[test]

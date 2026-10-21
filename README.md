@@ -42,7 +42,7 @@ JSON, every field optional, unknown fields rejected. The defaults:
 
 ```json
 {
-  "inbound": { "path": "/run/uevtd/in.sock", "mode": "0660", "max_message_bytes": 1048576, "max_connections": 64 },
+  "inbound": { "path": "/run/uevtd/in.sock", "mode": "0660", "max_message_bytes": 65536, "max_connections": 64 },
   "storage": { "path": "/var/lib/uevtd", "max_bytes": 268435456, "segment_bytes": 8388608, "sync_interval_ms": 0 },
   "outbound": { "channels": {} },
   "api": { "path": "/run/uevtd/api.sock", "mode": "0660" },
@@ -88,10 +88,17 @@ delivery cursor, so renaming a channel starts it afresh at the current head.
 
 Notes:
 
+- Memory is bounded by sizes and counts, not by traffic: a backlog waits on disk.
+  `inbound.max_message_bytes` is at most 262144 and `max_connections` at most
+  256, and their product at most 16 MiB, because each connection may hold one
+  message. There are at most 8 channels, and MQTT `inflight` is at most 1024.
+  Within these limits the daemon stays below about 60 MiB resident; see
+  ARCHITECTURE.md §11.1 for the budget and measurements.
 - `storage.max_bytes` bounds the log; the oldest whole segment is evicted when
   it is exceeded, so retained data stays within one `segment_bytes` of the limit.
-  `segment_bytes` is between 64 KiB and 256 MiB, `max_bytes` at most 1 TiB and at
-  least `2 * segment_bytes`, and `sync_interval_ms` at most 60000.
+  `segment_bytes` is between 64 KiB and 256 MiB and at least
+  `inbound.max_message_bytes + 48`, `max_bytes` at most 1 TiB and at least
+  `2 * segment_bytes`, and `sync_interval_ms` at most 60000.
 - `storage.sync_interval_ms = 0` fsyncs after every write batch (group commit
   during bursts); a positive value syncs at most once per interval. Records are
   forwarded and queryable only once synced, so a positive interval adds up to
@@ -106,8 +113,27 @@ Notes:
   advances on `PUBACK`/`PUBCOMP` (QoS 1/2) or when written (QoS 0). On a lost
   connection the daemon reconnects with backoff (1 s to 60 s) and republishes
   unacknowledged messages in order, so duplicates are possible. Payloads above
-  `max_packet_bytes` are rejected and skipped; keep it below the broker's packet
-  limit, since MQTT 3.1.1 cannot tell an oversized packet from a lost connection.
+  `max_packet_bytes` (at least 256) are rejected: a notice is published in their
+  place. Keep it below the broker's packet limit, since MQTT 3.1.1 cannot tell an
+  oversized packet from a lost connection.
+- Drop notices: an MQTT channel publishes a notice on its topic in place of the
+  messages it will not deliver, so the receiver learns of the gap:
+
+  ```json
+  {"notice": {"event": "lost", "from_seq": 1, "to_seq": 3075, "count": 3075}}
+  {"notice": {"event": "rejected", "seq": 4242, "ts": 1760928000123456, "reason": "payload too large"}}
+  ```
+
+  `lost` stands for messages evicted from the log before the channel delivered
+  them. `rejected` names one the channel will not deliver; it stays in the log,
+  and `/v1/messages` returns it by `seq` or `ts`. Notices use the channel's QoS,
+  are never retained, and are delivered at least once and in order: the cursor
+  passes the messages a notice stands for once it is acknowledged. Producers
+  should not send messages with a top-level `notice` key. The HTTP channel
+  sends no notices.
+- Messages evicted before a channel delivered them are counted in its `lost`
+  and logged when they are evicted, also while the target is down. `lag`
+  counts only messages still in the log.
 - A new channel starts at the current head; disabling a channel keeps its
   cursor; removing it deletes the cursor.
 - All fields apply live except `storage.path` and `log.format`, which are
@@ -123,11 +149,12 @@ Served over `api.path`; use `curl --unix-socket`.
 | PUT    | `/v1/config`   | Replace the configuration. Validated, persisted, applied. Returns the applied document. |
 | PATCH  | `/v1/config`   | [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) merge patch of the configuration. |
 | GET    | `/v1/messages` | Time-ordered range query, see below. |
-| GET    | `/v1/status`   | JSON status: uptime, `restart_required`, inbound and storage counters, per-channel cursor, lag and last error. |
+| GET    | `/v1/status`   | JSON status: uptime, `restart_required`, inbound and storage counters; per channel the cursor, `lag`, the counts `delivered`, `rejected`, `retries`, `lost` and `notices`, and the last error. |
 | GET    | `/v1/metrics`  | The same counters in Prometheus text format. |
 | GET    | `/v1/health`   | `200 ok`. |
 
-Errors are `{"error": "<message>"}` with status 400, 404 or 500.
+Errors are `{"error": "<message>"}` with status 400, 404 or 500. Request bodies
+are limited to 256 KiB.
 
 ### `GET /v1/messages`
 
@@ -136,7 +163,7 @@ Errors are `{"error": "<message>"}` with status 400, 404 or 500.
 | `from`    | Inclusive lower bound on the receipt timestamp, microseconds since the Unix epoch. |
 | `to`      | Exclusive upper bound, same unit. |
 | `after`   | Return only sequence numbers greater than this (pagination). |
-| `limit`   | 1 to 10000, default 100. |
+| `limit`   | 1 to 10000, default 100. A page also stops at 1 MiB of payload. |
 
 Records are returned in sequence order:
 
@@ -151,8 +178,9 @@ Records are returned in sequence order:
 ```
 
 `data` is the payload embedded verbatim when it is valid JSON; any other payload
-is returned as a string in `text` instead. `next` is the last sequence number
-when the page is full and `null` otherwise; pass it as `after` for the next page.
+is returned as a string in `text` instead. `next` is the page's last sequence
+number when more records follow and `null` on the last page; pass it as `after`
+for the next page.
 
 Examples:
 

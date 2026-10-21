@@ -1,5 +1,5 @@
-//! End-to-end: a daemon with an HTTP channel pointed at a local server,
-//! driven through its inbound socket and HTTP API.
+//! End-to-end: a daemon with channels pointed at a local HTTP server and a
+//! minimal MQTT broker, driven through its inbound socket and HTTP API.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -13,14 +13,14 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::post;
-use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use uevtd::config::{self, Channel, Config, Http};
+use uevtd::config::{self, Channel, Config, Http, Mqtt};
 use uevtd::daemon::{self, Options};
 
 struct Received {
@@ -85,7 +85,8 @@ impl Env {
         }
     }
 
-    fn config(&self, url: &str) -> Config {
+    /// A configuration without channels.
+    fn base(&self) -> Config {
         let mut c = Config::default();
         c.inbound.path = self.inbound.clone();
         c.inbound.max_message_bytes = 1024;
@@ -93,6 +94,11 @@ impl Env {
         c.storage.path = self.config_path.parent().unwrap().join("log");
         c.storage.max_bytes = 2 << 20;
         c.storage.segment_bytes = 64 << 10;
+        c
+    }
+
+    fn config(&self, url: &str) -> Config {
+        let mut c = self.base();
         c.outbound.channels.insert("t".into(), http(url, "1"));
         c
     }
@@ -300,6 +306,11 @@ async fn forwards_queries_reconfigures_and_resumes() {
     let r = next_request(&mut target).await;
     assert_eq!(r.headers.get("x-test").unwrap(), "2");
     assert_eq!(r.body, b"{\"n\":4}");
+    // The target sees the request before the daemon sees the response.
+    wait_for(Duration::from_secs(5), || async {
+        daemon.get("/v1/status").await.1["channels"]["t"]["delivered"] == 4
+    })
+    .await;
 
     let metrics = daemon
         .client
@@ -496,6 +507,175 @@ async fn refuses_to_steal_a_live_socket() {
         CancellationToken::new(),
     )
     .await;
-    assert!(result.unwrap_err().to_string().contains("inbound"));
+    // The bind failure is the reported cause, not a consequence of it.
+    let message = format!("{:#}", result.unwrap_err());
+    assert!(
+        message.starts_with("inbound") && message.contains("in use"),
+        "{message}"
+    );
+    daemon.stop().await;
+}
+
+/// A PUBLISH as the broker received it.
+struct Publish {
+    topic: String,
+    retain: bool,
+    payload: Vec<u8>,
+}
+
+/// A minimal MQTT 3.1.1 broker: accepts every client, acknowledges QoS 1
+/// publishes, and reports publishes in the order they arrive.
+fn broker(listener: TcpListener) -> mpsc::UnboundedReceiver<Publish> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(session(stream, tx.clone()));
+        }
+    });
+    rx
+}
+
+async fn session(mut stream: TcpStream, tx: mpsc::UnboundedSender<Publish>) -> std::io::Result<()> {
+    loop {
+        let header = stream.read_u8().await?;
+        let mut len = 0;
+        for shift in [0, 7, 14, 21] {
+            let byte = stream.read_u8().await?;
+            len |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let mut body = vec![0; len];
+        stream.read_exact(&mut body).await?;
+        match header >> 4 {
+            // CONNECT: accepted.
+            1 => stream.write_all(&[0x20, 2, 0, 0]).await?,
+            // PUBLISH: topic, a packet id for QoS 1, then the payload.
+            3 => {
+                let topic_end = 2 + usize::from(u16::from_be_bytes([body[0], body[1]]));
+                let topic = String::from_utf8(body[2..topic_end].to_vec()).unwrap();
+                let mut payload_start = topic_end;
+                if (header >> 1) & 3 == 1 {
+                    let pkid = [body[topic_end], body[topic_end + 1]];
+                    stream.write_all(&[0x40, 2, pkid[0], pkid[1]]).await?;
+                    payload_start += 2;
+                }
+                let _ = tx.send(Publish {
+                    topic,
+                    retain: header & 1 == 1,
+                    payload: body[payload_start..].to_vec(),
+                });
+            }
+            // PINGREQ
+            12 => stream.write_all(&[0xd0, 0]).await?,
+            // DISCONNECT
+            14 => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+async fn next_publish(publishes: &mut mpsc::UnboundedReceiver<Publish>) -> Publish {
+    tokio::time::timeout(Duration::from_secs(30), publishes.recv())
+        .await
+        .expect("a publish arrives")
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_publishes_notices_in_place_of_lost_and_rejected_records() {
+    // Nothing listens on the broker's port yet, so the channel cannot connect.
+    let addr = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let env = Env::new();
+    let mut config = env.base();
+    config.storage.max_bytes = 256 << 10;
+    config.outbound.channels.insert(
+        "m".into(),
+        Channel::Mqtt(Mqtt {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            topic: "dev/events".into(),
+            retain: true,
+            max_packet_bytes: 512,
+            ..Mqtt::default()
+        }),
+    );
+    let daemon = env.start(config).await;
+
+    // The log overflows while the broker is down. The records evicted are
+    // counted as lost when they are evicted, not when the channel reads.
+    let pad = "p".repeat(400);
+    let lines: Vec<String> = (1..=2000)
+        .map(|n| format!("{{\"n\":{n},\"pad\":\"{pad}\"}}\n"))
+        .collect();
+    env.send(&lines.iter().map(|l| l.as_bytes()).collect::<Vec<_>>())
+        .await;
+    wait_for(Duration::from_secs(10), || async {
+        daemon.get("/v1/status").await.1["storage"]["head_seq"] == 2000
+    })
+    .await;
+    // Larger than max_packet_bytes.
+    let large = format!("{{\"large\":\"{}\"}}\n", "l".repeat(600));
+    env.send(&[large.as_bytes()]).await;
+    wait_for(Duration::from_secs(10), || async {
+        daemon.get("/v1/status").await.1["storage"]["head_seq"] == 2001
+    })
+    .await;
+    let (_, status) = daemon.get("/v1/status").await;
+    let first = status["storage"]["first_seq"].as_u64().unwrap();
+    assert!(first > 1);
+    let channel = &status["channels"]["m"];
+    assert_eq!(channel["connected"], false);
+    assert_eq!(channel["cursor"], 1);
+    assert_eq!(channel["lost"], first - 1);
+    assert_eq!(channel["lag"], 2002 - first);
+
+    // Once the broker is up: a notice in place of the evicted records, the
+    // records still in the log, then a notice in place of the large one.
+    // Notices are never retained.
+    let mut publishes = broker(TcpListener::bind(addr).await.unwrap());
+    let lost = next_publish(&mut publishes).await;
+    assert_eq!((lost.topic.as_str(), lost.retain), ("dev/events", false));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&lost.payload).unwrap(),
+        json!({"notice": {"event": "lost", "from_seq": 1, "to_seq": first - 1, "count": first - 1}})
+    );
+    for n in first..=2000 {
+        let record = next_publish(&mut publishes).await;
+        assert!(record.retain);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&record.payload).unwrap()["n"],
+            n
+        );
+    }
+    let rejected = next_publish(&mut publishes).await;
+    assert!(!rejected.retain);
+    let notice = serde_json::from_slice::<Value>(&rejected.payload).unwrap()["notice"].take();
+    assert_eq!(notice["event"], "rejected");
+    assert_eq!(notice["seq"], 2001);
+    assert_eq!(notice["reason"], "payload too large");
+
+    wait_for(Duration::from_secs(10), || async {
+        daemon.get("/v1/status").await.1["channels"]["m"]["cursor"] == 2002
+    })
+    .await;
+    let (_, status) = daemon.get("/v1/status").await;
+    let channel = &status["channels"]["m"];
+    assert_eq!(channel["delivered"], 2001 - first);
+    assert_eq!(channel["notices"], 2);
+    assert_eq!(channel["rejected"], 1);
+    assert_eq!(channel["lost"], first - 1);
+    assert_eq!(channel["lag"], 0);
+
+    // The rejected record stays in the log, under the time the notice gives.
+    let (_, page) = daemon.get("/v1/messages?after=2000").await;
+    assert_eq!(page["messages"][0]["seq"], 2001);
+    assert_eq!(page["messages"][0]["ts"], notice["ts"]);
+    assert!(page["messages"][0]["data"]["large"].is_string());
     daemon.stop().await;
 }

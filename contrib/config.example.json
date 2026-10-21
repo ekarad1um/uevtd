@@ -2,7 +2,7 @@
   "inbound": {
     "path": "/run/uevtd/in.sock",
     "mode": "0660",
-    "max_message_bytes": 1048576,
+    "max_message_bytes": 65536,
     "max_connections": 64
   },
   "storage": {

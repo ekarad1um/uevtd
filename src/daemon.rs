@@ -6,18 +6,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
 use crate::outbound::Registry;
-use crate::storage::{self, Limits, Message, Storage};
+use crate::storage::{self, Limits, Storage};
 use crate::{api, inbound, logging, outbound};
 
-/// Bounded queue between connection tasks and the log writer.
+/// Bounded queue between connection tasks and the log writer: whichever of
+/// the message count and the payload bytes is reached first applies.
 const QUEUE_DEPTH: usize = 8192;
+const QUEUE_BYTES: u32 = 8 << 20;
 
 pub struct Options {
     pub config_path: PathBuf,
@@ -55,7 +57,7 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
             .with_context(|| format!("opening log at {}", config.storage.path.display()))?,
     );
 
-    let (tx, rx) = mpsc::channel::<Message>(QUEUE_DEPTH);
+    let (tx, rx) = storage::queue(QUEUE_DEPTH, QUEUE_BYTES);
     let thread = {
         let storage = storage.clone();
         let rt = tokio::runtime::Handle::current();
@@ -64,8 +66,10 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
             .spawn(move || storage::run_writer(storage, rx, rt))
             .context("spawning log writer thread")?
     };
-    // The thread ends only once every sender is gone, that is after inbound
-    // stopped; ending earlier is a failure that must stop the daemon.
+    // The thread ends once every sender is gone. This function keeps one
+    // until inbound has stopped, so an earlier end can only be a panic, which
+    // must stop the daemon. Without it, inbound failing at startup would drop
+    // the last sender and the writer's exit could be reported as the cause.
     let mut writer = Component::spawn("log writer", async move {
         match tokio::task::spawn_blocking(move || thread.join()).await {
             Ok(Ok(())) => Ok(()),
@@ -84,6 +88,7 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
         channels: registry.clone(),
         started: Instant::now(),
         last_error: Default::default(),
+        queries: Semaphore::new(api::CONCURRENT_QUERIES),
     });
 
     let tokens = Tokens::default();
@@ -91,7 +96,7 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
         "inbound",
         inbound::run(
             store.subscribe(),
-            tx,
+            tx.clone(),
             inbound_metrics,
             tokens.inbound.clone(),
         ),
@@ -128,6 +133,8 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
 
     info!("shutting down");
     inbound.stop(&tokens.inbound).await;
+    // The last sender: the writer drains what is queued, syncs and stops.
+    drop(tx);
     writer.join().await;
     outbound.stop(&tokens.outbound).await;
     api.stop(&tokens.api).await;

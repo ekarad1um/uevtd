@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::net::UnixListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -26,11 +26,17 @@ use tracing::{error, info, warn};
 use crate::config::{self, Config};
 use crate::metrics::{ErrorSlot, Exposition};
 use crate::outbound::Registry;
-use crate::storage::{Record, Storage};
+use crate::storage::{self, Record, Storage};
 use crate::{inbound, uds};
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 10_000;
+/// Payload bytes per page of `/v1/messages`, beyond its first record.
+const PAGE_BYTES: usize = 1 << 20;
+/// Largest request body; a configuration document is a few KiB.
+const BODY_BYTES: usize = 256 << 10;
+/// Queries read and serialize their page one at a time.
+pub const CONCURRENT_QUERIES: usize = 1;
 
 pub struct AppState {
     pub config: Arc<config::Store>,
@@ -40,6 +46,8 @@ pub struct AppState {
     pub channels: Arc<Registry>,
     pub started: Instant,
     pub last_error: ErrorSlot,
+    /// Holds [`CONCURRENT_QUERIES`] permits.
+    pub queries: Semaphore,
 }
 
 type Shared = Arc<AppState>;
@@ -142,6 +150,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/metrics", get(get_metrics))
         .route("/v1/health", get(|| async { "ok\n" }))
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, "not found".into()) })
+        .layer(DefaultBodyLimit::max(BODY_BYTES))
         .with_state(state)
 }
 
@@ -227,16 +236,19 @@ async fn get_messages(
             return Err(ApiError::bad("to must be greater than from"));
         }
     }
+    let _slot = state.queries.acquire().await.map_err(ApiError::internal)?;
     let storage = state.storage.clone();
-    let records = tokio::task::spawn_blocking(move || storage.query(from, to, after, limit))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
-    let next = (records.len() == limit)
-        .then(|| records.last().map(|r| r.seq))
+    let page =
+        tokio::task::spawn_blocking(move || storage.query(from, to, after, limit, PAGE_BYTES))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+    let next = page
+        .more
+        .then(|| page.records.last().map(|r| r.seq))
         .flatten();
     let body = MessagesBody {
-        messages: records.iter().map(message_view).collect(),
+        messages: page.records.iter().map(message_view).collect(),
         next,
     };
     let json = serde_json::to_vec(&body).map_err(ApiError::internal)?;
@@ -297,11 +309,12 @@ async fn get_status(State(state): State<Shared>) -> Json<Value> {
                     "running": m.running.load(Relaxed),
                     "connected": m.connected.load(Relaxed),
                     "cursor": cursor,
-                    "lag": (storage.head_seq + 1).saturating_sub(cursor),
+                    "lag": lag(&storage, cursor),
                     "delivered": m.delivered.load(Relaxed),
                     "rejected": m.rejected.load(Relaxed),
                     "retries": m.retries.load(Relaxed),
-                    "lost": m.lost.load(Relaxed),
+                    "lost": m.lost.records(),
+                    "notices": m.notices.load(Relaxed),
                     "last_error": m.last_error.get(),
                 }),
             )
@@ -338,6 +351,12 @@ async fn get_status(State(state): State<Shared>) -> Json<Value> {
         },
         "channels": channels,
     }))
+}
+
+/// Records still in the log that a channel has not delivered; those that
+/// left the log undelivered are counted in `lost` instead.
+fn lag(storage: &storage::Status, cursor: u64) -> u64 {
+    (storage.head_seq + 1).saturating_sub(cursor.max(storage.first_seq))
 }
 
 type Sample<'a> = &'a dyn Fn(&crate::outbound::ChannelMetrics) -> u64;
@@ -446,8 +465,7 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
     .value(sm.clock_steps.load(Relaxed));
 
     let channels = state.channels.lock().unwrap();
-    let head_seq = storage.head_seq;
-    let families: [(&str, &str, &str, Sample<'_>); 8] = [
+    let families: [(&str, &str, &str, Sample<'_>); 9] = [
         (
             "uevtd_channel_enabled",
             "gauge",
@@ -487,14 +505,20 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
         (
             "uevtd_channel_lost_total",
             "counter",
-            "Messages evicted before delivery",
-            &|m| m.lost.load(Relaxed),
+            "Messages that left the log before delivery",
+            &|m| m.lost.records(),
+        ),
+        (
+            "uevtd_channel_notices_total",
+            "counter",
+            "Drop notices acknowledged",
+            &|m| m.notices.load(Relaxed),
         ),
         (
             "uevtd_channel_lag",
             "gauge",
-            "Messages waiting for delivery",
-            &|m| (head_seq + 1).saturating_sub(m.cursor.load(Relaxed)),
+            "Messages in the log waiting for delivery",
+            &|m| lag(&storage, m.cursor.load(Relaxed)),
         ),
     ];
     for (name, kind, help, value) in families {
