@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +35,9 @@ pub fn limits(cfg: &config::Storage) -> Limits {
 
 /// Runs the daemon until `shutdown` is cancelled or a component fails at startup.
 pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<()> {
+    // Installed before anything else: until a handler exists, a SIGHUP ends
+    // the process, which is its default disposition.
+    let hup = signal(SignalKind::hangup()).context("installing the SIGHUP handler")?;
     let Options {
         config_path,
         config,
@@ -112,7 +116,7 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
         log,
         tokens.aux.clone(),
     ));
-    let hup = tokio::spawn(reload_on_hup(store.clone(), tokens.aux.clone()));
+    let hup = tokio::spawn(reload_on_hup(store.clone(), hup, tokens.aux.clone()));
 
     let outcome = tokio::select! {
         _ = shutdown.cancelled() => Ok(()),
@@ -233,10 +237,7 @@ async fn apply_changes(
     }
 }
 
-async fn reload_on_hup(store: Arc<config::Store>, token: CancellationToken) {
-    let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else {
-        return;
-    };
+async fn reload_on_hup(store: Arc<config::Store>, mut hup: Signal, token: CancellationToken) {
     loop {
         tokio::select! {
             Some(()) = hup.recv() => match store.reload() {

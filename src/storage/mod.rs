@@ -8,9 +8,10 @@
 
 mod segment;
 
-use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,9 @@ use segment::{HEADER_LEN, Header, Next, Peek, SegmentCursor};
 const CURSOR_DIR: &str = "cursors";
 const MAX_BATCH: usize = 1024;
 const MAX_BATCH_BYTES: usize = 1 << 20;
+/// Stored messages are readable by the owner and the group only.
+const FILE_MODE: u32 = 0o640;
+const DIR_MODE: u32 = 0o750;
 
 /// A message as handed to the writer: receipt time and verbatim payload.
 #[derive(Clone, Debug)]
@@ -91,8 +95,10 @@ impl Storage {
     /// Opens or creates the log, validating the active segment and truncating
     /// a torn tail.
     pub fn open(dir: &Path, limits: Limits) -> io::Result<Storage> {
-        fs::create_dir_all(dir)?;
-        fs::create_dir_all(dir.join(CURSOR_DIR))?;
+        let mut builder = DirBuilder::new();
+        builder.recursive(true).mode(DIR_MODE);
+        builder.create(dir)?;
+        builder.create(dir.join(CURSOR_DIR))?;
         let mut names: Vec<u64> = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_str().and_then(segment::parse_file_name))
@@ -181,7 +187,7 @@ impl Storage {
             index: Mutex::new(index),
             max_bytes: AtomicU64::new(limits.max_bytes),
             segment_bytes: AtomicU64::new(limits.segment_bytes),
-            sync_interval_us: AtomicU64::new(limits.sync_interval.as_micros() as u64),
+            sync_interval_us: AtomicU64::new(micros(limits.sync_interval)),
             head,
             metrics: Metrics::default(),
         };
@@ -194,7 +200,7 @@ impl Storage {
         self.max_bytes.store(limits.max_bytes, Relaxed);
         self.segment_bytes.store(limits.segment_bytes, Relaxed);
         self.sync_interval_us
-            .store(limits.sync_interval.as_micros() as u64, Relaxed);
+            .store(micros(limits.sync_interval), Relaxed);
         self.evict(&mut self.index.lock().unwrap());
     }
 
@@ -292,7 +298,12 @@ impl Storage {
     pub fn save_cursor(&self, name: &str, next_seq: u64) -> io::Result<()> {
         let dir = self.dir.join(CURSOR_DIR);
         let tmp = dir.join(format!(".{name}.tmp"));
-        let mut file = File::create(&tmp)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(FILE_MODE)
+            .open(&tmp)?;
         writeln!(file, "{next_seq}")?;
         file.sync_all()?;
         fs::rename(&tmp, self.cursor_path(name))?;
@@ -305,6 +316,27 @@ impl Storage {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+
+    /// Removes every cursor file whose name is not in `keep`: cursors of
+    /// channels removed from the configuration while the daemon was stopped,
+    /// and temporary files left by an interrupted save.
+    pub fn prune_cursors(&self, keep: &BTreeSet<String>) -> io::Result<()> {
+        for entry in fs::read_dir(self.dir.join(CURSOR_DIR))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|n| keep.contains(n)) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => info!(file = %name.to_string_lossy(), "removed stale cursor file"),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(file = %name.to_string_lossy(), error = %e, "could not remove cursor file")
+                }
+            }
+        }
+        Ok(())
     }
 
     fn cursor_path(&self, name: &str) -> PathBuf {
@@ -353,8 +385,12 @@ fn read_header(file: &File, first_seq: u64) -> io::Result<Header> {
 
 fn sync_dir(dir: &Path) {
     if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
-        debug!(dir = %dir.display(), error = %e, "directory sync failed");
+        warn!(dir = %dir.display(), error = %e, "directory sync failed");
     }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 struct Active {
@@ -549,6 +585,7 @@ impl Writer {
         let mut file = OpenOptions::new()
             .append(true)
             .create_new(true)
+            .mode(FILE_MODE)
             .open(&path)?;
         if let Err(e) = file.write_all(&Header { first_seq, base_ts }.encode()) {
             let _ = fs::remove_file(&path);
@@ -625,20 +662,25 @@ pub fn run_writer(
     let mut writer = Writer::new(storage.clone());
     let mut batch: Vec<Message> = Vec::with_capacity(MAX_BATCH);
     loop {
-        let interval = storage.sync_interval();
-        let first = if writer.unsynced() && !interval.is_zero() {
-            let wait = interval.saturating_sub(writer.since_sync());
+        let first = if writer.unsynced() {
+            // The interval is re-read at least once a second while data is
+            // pending, so a change made meanwhile (to zero in particular)
+            // takes effect without waiting for the next message.
+            let wait = storage.sync_interval().saturating_sub(writer.since_sync());
+            if wait.is_zero() {
+                if let Err(e) = writer.sync() {
+                    error!(error = %e, "periodic sync failed");
+                }
+                continue;
+            }
             // The timer must be created inside the runtime context that
             // `block_on` enters, not before it.
-            match rt.block_on(async { tokio::time::timeout(wait, rx.recv()).await }) {
+            match rt.block_on(async {
+                tokio::time::timeout(wait.min(Duration::from_secs(1)), rx.recv()).await
+            }) {
                 Ok(Some(m)) => m,
                 Ok(None) => break,
-                Err(_) => {
-                    if let Err(e) = writer.sync() {
-                        error!(error = %e, "periodic sync failed");
-                    }
-                    continue;
-                }
+                Err(_) => continue,
             }
         } else {
             match rx.blocking_recv() {
@@ -657,6 +699,7 @@ pub fn run_writer(
                 Err(_) => break,
             }
         }
+        let interval = storage.sync_interval();
         let sync = interval.is_zero() || writer.since_sync() >= interval;
         if let Err(e) = writer.append(&batch, sync) {
             error!(error = %e, records = batch.len(), "write failed; batch dropped");
@@ -711,44 +754,57 @@ impl Reader {
     }
 
     /// Reads up to `max_records` / `max_bytes` of records in sequence order;
-    /// an empty batch means the reader has caught up with the head.
+    /// an empty batch means the reader has caught up with the head. An I/O
+    /// error is returned only if nothing was read or skipped before it;
+    /// otherwise that progress is returned and the error surfaces on the next
+    /// call, which starts at the failing position with nothing to lose.
     pub fn read(&mut self, max_records: usize, max_bytes: usize) -> io::Result<Batch> {
         let mut batch = Batch::default();
         let mut bytes = 0usize;
         let mut reopen_attempts = 0;
         while batch.records.len() < max_records && bytes < max_bytes {
-            let view = match self.locate(&mut batch) {
-                Ok(Some(view)) => view,
+            match self.next(&mut batch) {
+                Ok(Some(record)) => {
+                    bytes += record.payload.len();
+                    batch.records.push(record);
+                }
                 Ok(None) => break,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && reopen_attempts < 3 => {
                     reopen_attempts += 1;
                     self.current = None;
-                    continue;
                 }
+                Err(_) if !batch.records.is_empty() || batch.skipped > 0 => break,
                 Err(e) => return Err(e),
+            }
+        }
+        Ok(batch)
+    }
+
+    /// The record at `next_seq`, or `None` once caught up; records that no
+    /// longer exist on the way are counted in `batch.skipped`.
+    fn next(&mut self, batch: &mut Batch) -> io::Result<Option<Record>> {
+        loop {
+            let Some(view) = self.locate(batch)? else {
+                return Ok(None);
             };
             let open = self.current.as_mut().expect("positioned");
             match open.cursor.next(view.bound)? {
                 Next::Record(record) if record.seq == self.next_seq => {
-                    bytes += record.payload.len();
                     self.next_seq += 1;
-                    batch.records.push(record);
+                    return Ok(Some(record));
                 }
-                Next::Record(_) => {
-                    self.skip_segment(&view, &mut batch, Corrupt("sequence mismatch"))
-                }
+                Next::Record(_) => self.skip_segment(&view, batch, Corrupt("sequence mismatch")),
                 Next::End => match view.next_first_seq {
                     Some(next) => {
                         batch.skipped += next.saturating_sub(self.next_seq);
                         self.next_seq = self.next_seq.max(next);
                         self.current = None;
                     }
-                    None => break,
+                    None => return Ok(None),
                 },
-                Next::Corrupt(c) => self.skip_segment(&view, &mut batch, c),
+                Next::Corrupt(c) => self.skip_segment(&view, batch, c),
             }
         }
-        Ok(batch)
     }
 
     fn skip_segment(&mut self, view: &View, batch: &mut Batch, cause: Corrupt) {
@@ -1192,6 +1248,146 @@ mod tests {
         storage.remove_cursor("a").unwrap();
         storage.remove_cursor("a").unwrap();
         assert_eq!(storage.load_cursor("a").unwrap(), None);
+    }
+
+    #[test]
+    fn writer_thread_syncs_pending_data_once_the_interval_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::from_secs(60),
+        };
+        let storage = Arc::new(Storage::open(dir.path(), l).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let thread = {
+            let (storage, handle) = (storage.clone(), rt.handle().clone());
+            std::thread::spawn(move || run_writer(storage, rx, handle))
+        };
+        // Written but not synced: the interval has not elapsed since the writer started.
+        tx.blocking_send(msg(1, "a")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while storage.metrics().batches.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "batch not written");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(storage.head_seq(), 0);
+
+        storage.set_limits(Limits {
+            sync_interval: Duration::ZERO,
+            ..l
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while storage.head_seq() < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "pending data not committed after the interval was set to zero"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(tx);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn read_error_keeps_the_records_read_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        let payload = "r".repeat(1000);
+        for i in 0..200 {
+            writer
+                .append(
+                    &[Message {
+                        ts: i,
+                        payload: payload.clone().into_bytes(),
+                    }],
+                    false,
+                )
+                .unwrap();
+        }
+        writer.sync().unwrap();
+        let firsts: Vec<u64> = storage
+            .index
+            .lock()
+            .unwrap()
+            .segments
+            .keys()
+            .copied()
+            .collect();
+        assert!(firsts.len() >= 3);
+        // A directory in place of the second segment: opening it works,
+        // reading it fails with EISDIR, whoever runs the test.
+        let second = storage.segment_path(firsts[1]);
+        let saved = fs::read(&second).unwrap();
+        fs::remove_file(&second).unwrap();
+        fs::create_dir(&second).unwrap();
+
+        let mut reader = storage.reader(1);
+        let first = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!(first.records.len() as u64, firsts[1] - 1);
+        assert_eq!(first.skipped, 0);
+        let err = reader.read(1000, 1 << 30).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(reader.next_seq(), firsts[1]);
+
+        fs::remove_dir(&second).unwrap();
+        fs::write(&second, &saved).unwrap();
+        let mut seqs: Vec<u64> = first.records.iter().map(|r| r.seq).collect();
+        loop {
+            let batch = reader.read(1000, 1 << 30).unwrap();
+            assert_eq!(batch.skipped, 0);
+            if batch.records.is_empty() {
+                break;
+            }
+            seqs.extend(batch.records.iter().map(|r| r.seq));
+        }
+        assert_eq!(seqs, (1..=200).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn files_are_not_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        writer.append(&[msg(1, "a")], true).unwrap();
+        storage.save_cursor("c", 2).unwrap();
+        for path in [
+            storage.segment_path(1),
+            storage.cursor_path("c"),
+            dir.path().join(CURSOR_DIR),
+        ] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o027, 0, "{} has mode {mode:o}", path.display());
+        }
+    }
+
+    #[test]
+    fn prune_removes_unconfigured_and_temporary_cursor_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, _) = open(dir.path(), limits(1 << 20, 64 << 10));
+        storage.save_cursor("keep", 1).unwrap();
+        storage.save_cursor("gone", 1).unwrap();
+        let tmp = dir.path().join(CURSOR_DIR).join(".keep.tmp");
+        fs::write(&tmp, b"7\n").unwrap();
+        storage
+            .prune_cursors(&BTreeSet::from(["keep".to_string()]))
+            .unwrap();
+        assert_eq!(storage.load_cursor("keep").unwrap(), Some(1));
+        assert_eq!(storage.load_cursor("gone").unwrap(), None);
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn sync_interval_conversion_saturates() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::MAX,
+        };
+        let (storage, _) = open(dir.path(), l);
+        assert_eq!(storage.sync_interval(), Duration::from_micros(u64::MAX));
     }
 
     #[test]

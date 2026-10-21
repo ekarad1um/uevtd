@@ -4,7 +4,7 @@
 pub mod http;
 pub mod mqtt;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -71,6 +71,8 @@ pub async fn run(
     shutdown: CancellationToken,
 ) {
     let mut running: BTreeMap<String, Running> = BTreeMap::new();
+    let configured: BTreeSet<String> = cfg.borrow().outbound.channels.keys().cloned().collect();
+    prune_cursors(&storage, configured).await;
     loop {
         let desired = cfg.borrow_and_update().outbound.channels.clone();
         reconcile(&desired, &mut running, &storage, &registry).await;
@@ -172,24 +174,41 @@ async fn stop(name: &str, channel: Running) {
     info!(channel = name, "channel stopped");
 }
 
+/// Cursor files of channels that are no longer configured are removed at
+/// startup, as they are when a channel is removed while running.
+async fn prune_cursors(storage: &Arc<Storage>, keep: BTreeSet<String>) {
+    let storage = storage.clone();
+    match tokio::task::spawn_blocking(move || storage.prune_cursors(&keep)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "could not prune cursor files"),
+        Err(e) => error!(error = %e, "cursor prune task failed"),
+    }
+}
+
 /// The persisted cursor, or the current head for a channel without one. A
 /// fresh start is persisted immediately so the backlog that accumulates before
 /// the first delivery survives a restart. A cursor past the head (the log was
-/// repaired by hand) is reset to the head, so new records are not skipped.
+/// repaired by hand) is reset to the head, so new records are not skipped. An
+/// unreadable cursor restarts at the oldest retained record: the position is
+/// unknown, and at-least-once means replaying rather than skipping.
 async fn initial_cursor(storage: &Arc<Storage>, name: &str) -> u64 {
     let fallback = storage.head_seq() + 1;
     let (storage, name) = (storage.clone(), name.to_string());
     let task = tokio::task::spawn_blocking(move || {
-        let head = storage.head_seq();
-        match storage.load_cursor(&name) {
+        let status = storage.status();
+        let head = status.head_seq;
+        let start = match storage.load_cursor(&name) {
             Ok(Some(seq)) if seq <= head + 1 => return seq,
             Ok(Some(seq)) => {
-                warn!(channel = %name, cursor = seq, head, "cursor is past the head; starting at head")
+                warn!(channel = %name, cursor = seq, head, "cursor is past the head; starting at head");
+                head + 1
             }
-            Ok(None) => {}
-            Err(e) => warn!(channel = %name, error = %e, "unreadable cursor; starting at head"),
-        }
-        let start = head + 1;
+            Ok(None) => head + 1,
+            Err(e) => {
+                warn!(channel = %name, error = %e, start_seq = status.first_seq, "unreadable cursor; replaying from the oldest retained record");
+                status.first_seq
+            }
+        };
         if let Err(e) = storage.save_cursor(&name, start) {
             warn!(channel = %name, error = %e, "could not persist initial cursor");
         }
@@ -216,6 +235,8 @@ pub struct Feed {
     next_seq: u64,
     pending: Option<JoinHandle<(Reader, io::Result<Batch>)>>,
     metrics: Arc<ChannelMetrics>,
+    /// The last read failed and `last_error` holds its message.
+    read_failed: bool,
 }
 
 impl Feed {
@@ -229,6 +250,7 @@ impl Feed {
             next_seq: start,
             pending: None,
             metrics,
+            read_failed: false,
         }
     }
 
@@ -244,6 +266,12 @@ impl Feed {
                         self.reader = Some(reader);
                         match result {
                             Ok(batch) => {
+                                if self.read_failed {
+                                    self.read_failed = false;
+                                    self.metrics
+                                        .last_error
+                                        .clear_if(|m| m.starts_with("log read: "));
+                                }
                                 if batch.skipped > 0 {
                                     self.metrics.lost.fetch_add(batch.skipped, Relaxed);
                                     warn!(
@@ -258,6 +286,7 @@ impl Feed {
                             Err(e) => {
                                 warn!(error = %e, "log read failed; retrying");
                                 self.metrics.last_error.set(format!("log read: {e}"));
+                                self.read_failed = true;
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                             }
                         }
@@ -362,6 +391,32 @@ mod tests {
         storage.save_cursor("ahead", 50).unwrap();
         assert_eq!(initial_cursor(&storage, "ahead").await, 1);
         assert_eq!(storage.load_cursor("ahead").unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn unreadable_cursor_replays_from_the_oldest_retained_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
+        let mut writer = crate::storage::Writer::new(storage.clone());
+        for ts in 1..=5 {
+            writer
+                .append(
+                    &[crate::storage::Message {
+                        ts,
+                        payload: b"x".to_vec(),
+                    }],
+                    true,
+                )
+                .unwrap();
+        }
+        std::fs::write(dir.path().join("cursors").join("bad"), b"garbage\n").unwrap();
+        assert_eq!(initial_cursor(&storage, "bad").await, 1);
+        assert_eq!(storage.load_cursor("bad").unwrap(), Some(1));
     }
 
     #[test]

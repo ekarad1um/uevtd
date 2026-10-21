@@ -90,7 +90,8 @@ only place that knows about all of them.
 **Transport.** `SOCK_STREAM` Unix domain socket at `inbound.path`, created with
 `inbound.mode` permissions. A stale socket file is removed only after a connect
 attempt is refused, so a second instance fails fast instead of stealing the path;
-anything at the path that is not a socket is an error, never removed.
+anything at the path that is not a socket is an error, never removed. The probe
+is bounded to one second, and a socket that does not answer counts as live.
 
 **Framing.** One message per line, terminated by `\n` (an optional trailing
 `\r` is stripped; empty lines are ignored). Newline framing was chosen because
@@ -115,8 +116,9 @@ the payload is inspected.
 **Reconfiguration.** A change of `path` or `mode` binds the new socket before
 the old listener is dropped; connections accepted on the old socket keep being
 served until the peer closes. If the new bind fails the old listener stays and
-the error is logged and reported in `/v1/status`. `max_message_bytes` and
-`max_connections` apply to connections accepted after the change.
+the error is logged and reported in `/v1/status`. `max_message_bytes` applies to
+connections accepted after the change; `max_connections` is resized in place, so
+after lowering it no new connection is admitted until enough open ones close.
 
 ## 5. Storage
 
@@ -135,6 +137,8 @@ The log is a sequence of append-only **segments**. The last segment is active;
 all others are sealed and never modified. Eviction removes whole segments from
 the oldest end. This gives the two properties the requirements ask for: a
 message can never be half-evicted, and nothing is ever rewritten in place.
+Segment and cursor files are created with mode 0640 and the directories with
+0750, independent of the umask, since they hold the messages themselves.
 
 ### 5.2 Encoding
 
@@ -194,7 +198,8 @@ Inbound connection tasks send `Message { ts, payload }` into a bounded channel
 3. Encode the batch into one buffer and `write_all` it.
 4. `fdatasync` according to `sync_interval_ms` (0 = after every batch;
    otherwise at most once per interval, with a timer so a trailing batch is
-   never left unsynced). A successful sync *commits*: it publishes the new head
+   never left unsynced; the interval is re-read while data is pending, so a
+   change takes effect within a second). A successful sync *commits*: it publishes the new head
    (`watch<u64>`) and the segment's committed length and wakes tailing readers.
    Until then the batch is invisible, so a positive interval adds up to one
    interval of forwarding latency in exchange for fewer syncs.
@@ -258,7 +263,10 @@ chunks bounded by the committed length and decode as many complete records as
 fit the requested batch. Creating a reader at an arbitrary sequence costs one
 scan from the start of that segment; subsequent reads are O(bytes returned).
 When a reader's segment has been evicted it jumps to the oldest remaining one
-and reports how many records it skipped.
+and reports how many records it skipped. An I/O error is reported only once the
+records read before it have been returned, so a failing segment never costs
+the records in front of it; a channel then retries the failing position every
+second and shows the error in `last_error`.
 
 Readers wait for new data with `watch::Receiver<u64>::wait_for(head >= next)`,
 which is free of lost wake-ups and cancel-safe.
@@ -279,7 +287,11 @@ accumulates before the first successful delivery survive a restart. On restart a
 already-delivered messages may be delivered again (at-least-once). A cursor
 that points below the eviction horizon jumps forward, and the gap is logged
 and counted as lost. A cursor past the head, which only a hand-repaired log
-can produce, is reset to the head so that new records are not skipped.
+can produce, is reset to the head so that new records are not skipped. A cursor
+file that cannot be parsed restarts the channel at the oldest retained record:
+the position is unknown, and at-least-once means replaying rather than
+skipping. Cursor files of channels that are no longer configured are removed at
+startup, as they are when a channel is removed at runtime.
 
 ## 6. Outbound
 
@@ -411,7 +423,8 @@ default; unknown fields are rejected so typos surface at validation time.
 ### 7.2 Validation
 
 Performed before anything is persisted or applied: socket paths non-empty and
-distinct; `segment_bytes >= 64 KiB`, `max_bytes >= 2 * segment_bytes`; channel
+distinct; `segment_bytes` in 64 KiB..=256 MiB, `max_bytes >= 2 * segment_bytes`
+and at most 1 TiB, `sync_interval_ms <= 60 000`; channel
 names `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they become file names); HTTP URL,
 method and header names/values parse; MQTT host and topic non-empty, topic has
 no wildcards, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol field is
@@ -424,8 +437,11 @@ no wildcards, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol field is
 RFC 7386 merge patch to the current document (so a single field can be changed
 without resending secrets). Both validate, write the file atomically (temp
 file with mode 0600, fsync, rename, directory fsync), then publish the new
-configuration on a `watch` channel. `SIGHUP` re-reads the file and applies it
-the same way. Components react to the fields they own:
+configuration on a `watch` channel. A patch reads, merges and writes under one
+lock, so concurrent patches compose. `SIGHUP` re-reads the file and applies it
+the same way. An unchanged configuration is still republished, by `PUT`,
+`PATCH` or `SIGHUP`, which is how a component retries an apply that failed
+earlier, such as a rebind. Components react to the fields they own:
 
 | Field                           | Applied                                                    |
 |---------------------------------|------------------------------------------------------------|
@@ -463,10 +479,10 @@ operator sees exactly what will be in effect after the cause is fixed.
 | GET    | `/v1/metrics`   | Prometheus text exposition of the same counters                   |
 | GET    | `/v1/health`    | 200 when the daemon is running                                    |
 
-Errors are `{"error": "..."}` with 400 (validation), 404, or 500. Message
-payloads are embedded verbatim in `/v1/messages` responses when they are valid
-JSON and as a JSON string otherwise, so the response is always valid JSON even
-for the "typically JSON" case.
+Errors are `{"error": "..."}` with 400 (validation), 404, or 500. In
+`/v1/messages` responses a payload that is valid JSON is embedded verbatim as
+`data`; any other payload is returned as a string in `text`, so the two cases
+cannot be confused and the response is always valid JSON.
 
 Example: `curl --unix-socket /run/uevtd/api.sock http://uevtd/v1/status`.
 
@@ -499,6 +515,8 @@ adds the last error per component with its timestamp and the
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1) so the service manager restarts it |
 | Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost; others unaffected     |
+| Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error` |
+| Cursor file unreadable                    | Channel replays from the oldest retained record                            |
 | Target down for longer than retention     | Channel loses the evicted messages, logs the count, continues at the oldest available |
 | Broker drops the session                  | Unacked messages republished (duplicates possible), order preserved       |
 | Another instance already listening        | Startup fails; the socket file is not stolen                              |

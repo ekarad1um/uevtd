@@ -261,11 +261,22 @@ impl Config {
         ensure(!storage.path.as_os_str().is_empty(), || {
             "storage.path must not be empty".into()
         })?;
-        ensure(storage.segment_bytes >= 64 << 10, || {
-            "storage.segment_bytes must be at least 65536".into()
+        ensure(
+            (64 << 10..=256 << 20).contains(&storage.segment_bytes),
+            || "storage.segment_bytes must be between 65536 and 268435456".into(),
+        )?;
+        ensure(storage.max_bytes <= 1 << 40, || {
+            "storage.max_bytes must be at most 1099511627776".into()
         })?;
-        ensure(storage.max_bytes >= 2 * storage.segment_bytes, || {
-            "storage.max_bytes must be at least twice storage.segment_bytes".into()
+        ensure(
+            storage
+                .segment_bytes
+                .checked_mul(2)
+                .is_some_and(|min| storage.max_bytes >= min),
+            || "storage.max_bytes must be at least twice storage.segment_bytes".into(),
+        )?;
+        ensure(storage.sync_interval_ms <= 60_000, || {
+            "storage.sync_interval_ms must be at most 60000".into()
         })?;
 
         for (name, channel) in &self.outbound.channels {
@@ -289,11 +300,7 @@ impl Config {
                 Channel::Http(c) => {
                     c.url = redacted_url(&c.url);
                     for (name, value) in c.headers.iter_mut() {
-                        let lower = name.to_ascii_lowercase();
-                        if ["authorization", "token", "key", "secret", "cookie"]
-                            .iter()
-                            .any(|s| lower.contains(s))
-                        {
+                        if secret_name(name) {
                             *value = "***".into();
                         }
                     }
@@ -342,15 +349,50 @@ impl Config {
     }
 }
 
-/// The URL with any user information replaced, for logging.
+/// Header and query parameter names that usually carry a secret.
+fn secret_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "authorization",
+        "token",
+        "key",
+        "secret",
+        "cookie",
+        "password",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+}
+
+/// The URL with user information and secret-looking query values replaced,
+/// for logging.
 pub fn redacted_url(url: &str) -> String {
-    match reqwest::Url::parse(url) {
-        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
-            let _ = parsed.set_username("***");
-            let _ = parsed.set_password(None);
-            parsed.to_string()
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+    let mut changed = false;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let _ = parsed.set_username("***");
+        let _ = parsed.set_password(None);
+        changed = true;
+    }
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if pairs.iter().any(|(k, _)| secret_name(k)) {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for (k, v) in &pairs {
+            query.append_pair(k, if secret_name(k) { "***" } else { v });
         }
-        _ => url.to_string(),
+        drop(query);
+        changed = true;
+    }
+    if changed {
+        parsed.to_string()
+    } else {
+        url.to_string()
     }
 }
 
@@ -413,22 +455,29 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
 
 /// Reads and validates the configuration file.
 pub fn load(path: &Path) -> Result<Config, Error> {
-    let text = fs::read_to_string(path)?;
-    let config: Config = serde_json::from_str(&text)?;
-    config.validate()?;
-    Ok(config)
+    parse(&fs::read_to_string(path)?)
 }
 
 /// Like [`load`], but a missing file yields the defaults, which are written
-/// to the path so the effective configuration is visible on disk.
+/// to the path so the effective configuration is visible on disk. Any other
+/// failure to read the file is an error, never a reason to overwrite it.
 pub fn load_or_init(path: &Path) -> Result<Config, Error> {
-    if path.exists() {
-        return load(path);
+    match fs::read_to_string(path) {
+        Ok(text) => parse(&text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let config = Config::default();
+            config.validate()?;
+            save(path, &config)?;
+            info!(path = %path.display(), "configuration file not found; wrote defaults");
+            Ok(config)
+        }
+        Err(e) => Err(e.into()),
     }
-    let config = Config::default();
+}
+
+fn parse(text: &str) -> Result<Config, Error> {
+    let config: Config = serde_json::from_str(text)?;
     config.validate()?;
-    save(path, &config)?;
-    info!(path = %path.display(), "configuration file not found; wrote defaults");
     Ok(config)
 }
 
@@ -511,30 +560,46 @@ impl Store {
 
     /// Validates, persists and publishes a new configuration.
     pub fn update(&self, config: Config) -> Result<Arc<Config>, Error> {
-        config.validate()?;
         let _guard = self.write.lock().unwrap();
-        if *self.current() == config {
-            return Ok(self.current());
-        }
-        save(&self.path, &config)?;
-        Ok(self.publish(config))
+        self.commit(config)
+    }
+
+    /// Applies an RFC 7386 merge patch to the current configuration and
+    /// commits the result. Read, merge and write happen under one lock, so
+    /// concurrent patches compose instead of overwriting each other.
+    pub fn patch(&self, patch: &Value) -> Result<Arc<Config>, Error> {
+        let _guard = self.write.lock().unwrap();
+        let mut document = serde_json::to_value(self.current().as_ref())?;
+        merge_patch(&mut document, patch);
+        self.commit(serde_json::from_value(document)?)
     }
 
     /// Re-reads the file and publishes it without writing it back.
     pub fn reload(&self) -> Result<Arc<Config>, Error> {
         let _guard = self.write.lock().unwrap();
         let config = load(&self.path)?;
-        if *self.current() == config {
-            return Ok(self.current());
+        Ok(self.publish(config))
+    }
+
+    fn commit(&self, config: Config) -> Result<Arc<Config>, Error> {
+        config.validate()?;
+        if *self.current() != config {
+            save(&self.path, &config)?;
         }
         Ok(self.publish(config))
     }
 
+    /// Publishes even an unchanged configuration: a component whose last
+    /// apply failed (a rebind, say) retries when it sees the value again.
     fn publish(&self, config: Config) -> Arc<Config> {
         let changed = self.current().changed_sections(&config);
         let config = Arc::new(config);
         self.tx.send_replace(config.clone());
-        info!(sections = ?changed, "configuration updated");
+        if changed.is_empty() {
+            info!("configuration re-applied");
+        } else {
+            info!(sections = ?changed, "configuration updated");
+        }
         config
     }
 }
@@ -579,6 +644,16 @@ mod tests {
     fn validation_rejects_bad_values() {
         let mut config = Config::default();
         config.storage.max_bytes = config.storage.segment_bytes;
+        assert!(config.validate().is_err());
+
+        // Would overflow `2 * segment_bytes`.
+        let mut config = Config::default();
+        config.storage.segment_bytes = 1 << 63;
+        config.storage.max_bytes = 1;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.storage.sync_interval_ms = 60_001;
         assert!(config.validate().is_err());
 
         let mut config = Config::default();
@@ -633,6 +708,63 @@ mod tests {
         assert_eq!(c.headers["Authorization"], "***");
         assert_eq!(c.headers["X-Id"], "1");
         assert_eq!(redacted_url("https://h/x"), "https://h/x");
+        assert_eq!(redacted_url("https://h/x?a=1&b=2"), "https://h/x?a=1&b=2");
+        assert_eq!(
+            redacted_url("wss://u:p@h/x?device=42&token=abc"),
+            "wss://***@h/x?device=42&token=***"
+        );
+    }
+
+    #[test]
+    fn load_or_init_keeps_an_unparsable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "{").unwrap();
+        assert!(matches!(load_or_init(&path), Err(Error::Parse(_))));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{");
+    }
+
+    #[test]
+    fn concurrent_patches_compose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = Store::new(path.clone(), Config::default());
+        let rounds = 20u64;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 1..=rounds {
+                    store
+                        .patch(&serde_json::json!({"storage": {"sync_interval_ms": i}}))
+                        .unwrap();
+                }
+            });
+            s.spawn(|| {
+                for i in 1..=rounds {
+                    store
+                        .patch(&serde_json::json!({"inbound": {"max_connections": 100 + i}}))
+                        .unwrap();
+                }
+            });
+        });
+        let current = store.current();
+        assert_eq!(current.storage.sync_interval_ms, rounds);
+        assert_eq!(current.inbound.max_connections as u64, 100 + rounds);
+        assert_eq!(load(&path).unwrap(), *current);
+    }
+
+    #[test]
+    fn unchanged_configuration_is_republished() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = load_or_init(&path).unwrap();
+        let store = Store::new(path, config.clone());
+        let mut rx = store.subscribe();
+        rx.borrow_and_update();
+        store.update(config).unwrap();
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        store.reload().unwrap();
+        assert!(rx.has_changed().unwrap());
     }
 
     #[test]

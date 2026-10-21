@@ -52,6 +52,7 @@ pub async fn run(
     let app = router(state.clone());
     let mut current = cfg.borrow_and_update().api.clone();
     let listener = uds::bind(&current.path, current.mode.0)
+        .await
         .with_context(|| format!("binding api socket {}", current.path.display()))?;
     info!(path = %current.path.display(), "api listening");
     let mut server = Server::spawn(listener, app.clone());
@@ -67,7 +68,7 @@ pub async fn run(
                     continue;
                 }
                 if next.path != current.path {
-                    match uds::bind(&next.path, next.mode.0) {
+                    match uds::bind(&next.path, next.mode.0).await {
                         Ok(fresh) => {
                             let old = std::mem::replace(&mut server, Server::spawn(fresh, app.clone()));
                             old.stop().await;
@@ -177,21 +178,19 @@ async fn get_config(State(state): State<Shared>) -> Json<Config> {
 
 async fn put_config(State(state): State<Shared>, body: Bytes) -> Result<Json<Config>, ApiError> {
     let config: Config = serde_json::from_slice(&body).map_err(ApiError::bad)?;
-    apply(state, config).await
+    apply(move || state.config.update(config)).await
 }
 
 async fn patch_config(State(state): State<Shared>, body: Bytes) -> Result<Json<Config>, ApiError> {
     let patch: Value = serde_json::from_slice(&body).map_err(ApiError::bad)?;
-    let mut document =
-        serde_json::to_value(state.config.current().as_ref()).map_err(ApiError::internal)?;
-    config::merge_patch(&mut document, &patch);
-    let config: Config = serde_json::from_value(document).map_err(ApiError::bad)?;
-    apply(state, config).await
+    apply(move || state.config.patch(&patch)).await
 }
 
-/// Validates, persists and publishes on the blocking pool (the save fsyncs).
-async fn apply(state: Shared, config: Config) -> Result<Json<Config>, ApiError> {
-    let applied = tokio::task::spawn_blocking(move || state.config.update(config))
+/// Runs a store operation on the blocking pool (the save fsyncs).
+async fn apply(
+    operation: impl FnOnce() -> Result<Arc<Config>, config::Error> + Send + 'static,
+) -> Result<Json<Config>, ApiError> {
+    let applied = tokio::task::spawn_blocking(operation)
         .await
         .map_err(ApiError::internal)??;
     Ok(Json(applied.as_ref().clone()))
@@ -254,29 +253,27 @@ struct MessagesBody<'a> {
 struct MessageView<'a> {
     seq: u64,
     ts: i64,
-    data: Data<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a RawValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<Cow<'a, str>>,
 }
 
-/// Payloads that are valid JSON are embedded verbatim; anything else becomes a string.
-#[derive(Serialize)]
-#[serde(untagged)]
-enum Data<'a> {
-    Json(&'a RawValue),
-    Text(Cow<'a, str>),
-}
-
+/// A payload that is valid JSON is embedded verbatim as `data`; any other
+/// payload is a string in `text`, with invalid UTF-8 replaced.
 fn message_view(record: &Record) -> MessageView<'_> {
-    let data = match std::str::from_utf8(&record.payload) {
-        Ok(text) => match serde_json::from_str::<&RawValue>(text) {
-            Ok(raw) => Data::Json(raw),
-            Err(_) => Data::Text(Cow::Borrowed(text)),
+    let (data, text) = match std::str::from_utf8(&record.payload) {
+        Ok(s) => match serde_json::from_str::<&RawValue>(s) {
+            Ok(raw) => (Some(raw), None),
+            Err(_) => (None, Some(Cow::Borrowed(s))),
         },
-        Err(_) => Data::Text(String::from_utf8_lossy(&record.payload)),
+        Err(_) => (None, Some(String::from_utf8_lossy(&record.payload))),
     };
     MessageView {
         seq: record.seq,
         ts: record.ts,
         data,
+        text,
     }
 }
 

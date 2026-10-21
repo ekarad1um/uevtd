@@ -39,9 +39,10 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut current = cfg.borrow_and_update().inbound.clone();
     let mut listener = uds::bind(&current.path, current.mode.0)
+        .await
         .with_context(|| format!("binding inbound socket {}", current.path.display()))?;
     info!(path = %current.path.display(), "inbound listening");
-    let mut limiter = Arc::new(Semaphore::new(current.max_connections));
+    let mut limiter = Limiter::new(current.max_connections);
     let mut conns = JoinSet::new();
     let mut next_id = 0u64;
 
@@ -57,7 +58,8 @@ pub async fn run(
                     }
                 };
                 metrics.connections.fetch_add(1, Relaxed);
-                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                limiter.reclaim();
+                let Some(permit) = limiter.try_acquire() else {
                     metrics.rejected.fetch_add(1, Relaxed);
                     warn!(max = current.max_connections, "connection limit reached; closing new connection");
                     continue;
@@ -72,6 +74,7 @@ pub async fn run(
             }
             Some(finished) = conns.join_next() => {
                 metrics.active.fetch_sub(1, Relaxed);
+                limiter.reclaim();
                 if let Err(e) = finished {
                     error!(error = %e, "connection task failed");
                 }
@@ -85,9 +88,9 @@ pub async fn run(
                     continue;
                 }
                 if next.max_connections != current.max_connections {
-                    limiter = Arc::new(Semaphore::new(next.max_connections));
+                    limiter.resize(next.max_connections);
                 }
-                current = rebind(&mut listener, current, next, &metrics);
+                current = rebind(&mut listener, current, next, &metrics).await;
             }
             _ = shutdown.cancelled() => break,
         }
@@ -101,16 +104,61 @@ pub async fn run(
     Ok(())
 }
 
+/// The connection limit as a semaphore that is resized in place, so
+/// connections accepted under the old limit keep counting: raising it adds
+/// permits at once; lowering it forgets permits as connections close.
+struct Limiter {
+    semaphore: Arc<Semaphore>,
+    max: usize,
+    /// Permits still to be forgotten after the limit was lowered.
+    deficit: usize,
+}
+
+impl Limiter {
+    fn new(max: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max)),
+            max,
+            deficit: 0,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    fn resize(&mut self, max: usize) {
+        if max >= self.max {
+            let grow = max - self.max;
+            let cancelled = self.deficit.min(grow);
+            self.deficit -= cancelled;
+            self.semaphore.add_permits(grow - cancelled);
+        } else {
+            self.deficit += self.max - max;
+        }
+        self.max = max;
+        self.reclaim();
+    }
+
+    /// Forgets permits owed by an earlier decrease; called whenever a permit
+    /// may have been released.
+    fn reclaim(&mut self) {
+        if self.deficit > 0 {
+            self.deficit -= self.semaphore.forget_permits(self.deficit);
+        }
+    }
+}
+
 /// Applies a socket path or mode change; on failure keeps the old socket and
 /// records the error, so producers are never left without a listener.
-fn rebind(
+async fn rebind(
     listener: &mut tokio::net::UnixListener,
     current: config::Inbound,
     next: config::Inbound,
     metrics: &Metrics,
 ) -> config::Inbound {
     if next.path != current.path {
-        match uds::bind(&next.path, next.mode.0) {
+        match uds::bind(&next.path, next.mode.0).await {
             Ok(fresh) => {
                 *listener = fresh;
                 uds::remove(&current.path);
@@ -361,6 +409,35 @@ mod tests {
         assert!(collect(&mut f).is_empty());
         f.push(b"\nx\n");
         assert_eq!(collect(&mut f), vec![Err(7), Ok("x".into())]);
+    }
+
+    #[test]
+    fn limiter_resizes_without_losing_track_of_open_connections() {
+        let mut limiter = Limiter::new(3);
+        let held: Vec<_> = (0..3).map(|_| limiter.try_acquire().unwrap()).collect();
+        assert!(limiter.try_acquire().is_none());
+
+        // Lowering to 1 with 3 open: nothing is admitted until two close.
+        limiter.resize(1);
+        let mut held = held.into_iter();
+        for _ in 0..2 {
+            drop(held.next());
+            limiter.reclaim();
+            assert!(limiter.try_acquire().is_none());
+        }
+        drop(held.next());
+        limiter.reclaim();
+        let one = limiter.try_acquire().unwrap();
+        assert!(limiter.try_acquire().is_none());
+
+        // Raising again while permits are still owed cancels the debt first.
+        limiter.resize(3);
+        let two = limiter.try_acquire().unwrap();
+        let three = limiter.try_acquire().unwrap();
+        assert!(limiter.try_acquire().is_none());
+        drop((one, two, three));
+        limiter.reclaim();
+        assert_eq!(limiter.semaphore.available_permits(), 3);
     }
 
     #[test]

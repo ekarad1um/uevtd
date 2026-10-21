@@ -4,33 +4,49 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
+use std::time::Duration;
 
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tracing::warn;
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Binds a listening socket at `path` with the given permission bits.
 ///
 /// An existing socket file is removed only if nothing accepts connections on
 /// it, so a running instance never has its socket stolen. Any other kind of
 /// file at the path is left alone and reported as an error.
-pub fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
+pub async fn bind(path: &Path, mode: u32) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
             // Linux reports ECONNREFUSED for any non-socket path too, hence
-            // the type check above before anything is removed.
-            match std::os::unix::net::UnixStream::connect(path) {
-                Ok(_) => {
+            // the type check above before anything is removed. The probe is
+            // bounded: a listener that never completes the connection (a hung
+            // process with a full backlog) counts as live.
+            match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
+                Ok(Ok(_)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
                         format!("{} is in use by another process", path.display()),
                     ));
                 }
-                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(path)?,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "{} did not answer a connection within {PROBE_TIMEOUT:?}; assuming it is in use",
+                            path.display()
+                        ),
+                    ));
+                }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    fs::remove_file(path)?
+                }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {}
+                Ok(Err(e)) => return Err(e),
             }
         }
         Ok(_) => {
@@ -68,19 +84,19 @@ mod tests {
     async fn replaces_stale_sockets_but_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s");
-        let live = bind(&path, 0o600).unwrap();
+        let live = bind(&path, 0o600).await.unwrap();
         assert_eq!(
-            bind(&path, 0o600).unwrap_err().kind(),
+            bind(&path, 0o600).await.unwrap_err().kind(),
             io::ErrorKind::AddrInUse
         );
         drop(live);
         assert!(path.exists());
-        drop(bind(&path, 0o600).unwrap());
+        drop(bind(&path, 0o600).await.unwrap());
 
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"x").unwrap();
         assert_eq!(
-            bind(&path, 0o600).unwrap_err().kind(),
+            bind(&path, 0o600).await.unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&path).unwrap(), b"x");

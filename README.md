@@ -90,7 +90,8 @@ Notes:
 
 - `storage.max_bytes` bounds the log; the oldest whole segment is evicted when
   it is exceeded, so retained data stays within one `segment_bytes` of the limit.
-  `max_bytes` must be at least `2 * segment_bytes`.
+  `segment_bytes` is between 64 KiB and 256 MiB, `max_bytes` at most 1 TiB and at
+  least `2 * segment_bytes`, and `sync_interval_ms` at most 60000.
 - `storage.sync_interval_ms = 0` fsyncs after every write batch (group commit
   during bursts); a positive value syncs at most once per interval. Records are
   forwarded and queryable only once synced, so a positive interval adds up to
@@ -143,15 +144,15 @@ Records are returned in sequence order:
 {
   "messages": [
     { "seq": 1041, "ts": 1760928000123456, "data": { "event": "boot", "uptime": 3 } },
-    { "seq": 1042, "ts": 1760928000223456, "data": "not json" }
+    { "seq": 1042, "ts": 1760928000223456, "text": "not json" }
   ],
   "next": 1042
 }
 ```
 
-`data` is the payload embedded verbatim when it is valid JSON and a string
-otherwise. `next` is the last sequence number when the page is full and `null`
-otherwise; pass it as `after` for the next page.
+`data` is the payload embedded verbatim when it is valid JSON; any other payload
+is returned as a string in `text` instead. `next` is the last sequence number
+when the page is full and `null` otherwise; pass it as `after` for the next page.
 
 Examples:
 
@@ -173,6 +174,7 @@ curl --unix-socket /run/uevtd/api.sock 'http://uevtd/v1/messages?from=1760928000
 
 Every record carries a CRC-32; a torn write at the end of the active segment
 is truncated on start, and corruption elsewhere is skipped and counted. Files
+are created with mode 0640 and directories with 0750. Files
 can be inspected offline: a segment is a 24-byte header followed by
 `crc32 | len | seq | ts | payload` frames (little-endian; see
 `src/storage/segment.rs`).

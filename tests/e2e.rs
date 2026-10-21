@@ -245,7 +245,8 @@ async fn forwards_queries_reconfigures_and_resumes() {
     assert_eq!(messages["next"], 2);
     let (_, page) = daemon.get("/v1/messages?after=2").await;
     assert_eq!(page["messages"][0]["seq"], 3);
-    assert_eq!(page["messages"][0]["data"], "not json");
+    assert_eq!(page["messages"][0]["text"], "not json");
+    assert_eq!(page["messages"][0].get("data"), None);
     assert_eq!(page["next"], Value::Null);
     let ts = messages["messages"][1]["ts"].as_i64().unwrap();
     let (_, ranged) = daemon
@@ -450,6 +451,30 @@ async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
         }
     }
     assert_eq!(seen, vec![4, 5]);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_patches_compose() {
+    let target = target().await;
+    let env = Env::new();
+    let daemon = env.start(env.config(&target.url)).await;
+    for i in 1..=10u64 {
+        let a = daemon.patch(serde_json::json!({"storage": {"sync_interval_ms": i}}));
+        let b = daemon.patch(serde_json::json!({"inbound": {"max_connections": 100 + i}}));
+        let ((status_a, _), (status_b, _)) = tokio::join!(a, b);
+        assert_eq!((status_a, status_b), (StatusCode::OK, StatusCode::OK));
+    }
+    let (_, config) = daemon.get("/v1/config").await;
+    assert_eq!(config["storage"]["sync_interval_ms"], 10);
+    assert_eq!(config["inbound"]["max_connections"], 110);
+    assert_eq!(
+        config::load(&env.config_path)
+            .unwrap()
+            .inbound
+            .max_connections,
+        110
+    );
     daemon.stop().await;
 }
 

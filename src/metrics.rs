@@ -30,6 +30,15 @@ impl ErrorSlot {
         *self.0.lock().unwrap() = None;
     }
 
+    /// Clears the slot if its message satisfies `pred`, so that one component
+    /// can retract its own error without touching another's.
+    pub fn clear_if(&self, pred: impl FnOnce(&str) -> bool) {
+        let mut slot = self.0.lock().unwrap();
+        if slot.as_ref().is_some_and(|e| pred(&e.message)) {
+            *slot = None;
+        }
+    }
+
     pub fn get(&self) -> Option<LastError> {
         self.0.lock().unwrap().clone()
     }
