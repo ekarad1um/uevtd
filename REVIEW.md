@@ -1165,6 +1165,111 @@ Residual:
   that persists a new file's data but not its directory entry, a power loss can then take a committed
   segment. The cursor floor protects what channels delivered from it.
 
+**Step 10, the API and configuration (2026-10-22).** Fixed M10, M11, L13, L14, L15, L16, L19, L26
+and L28 of §9.
+
+- M10: the API serves its connections itself, on hyper, since `axum::serve` cannot bound them.
+  - At most 16 are open at once. A slot is taken before a connection is accepted, so more wait in the
+    listen queue, where they hold none of the daemon's descriptors.
+  - hyper's header-read timer, set to 10 s, closes a connection that has sent no request head. It
+    starts again after every response, so it covers idle connections.
+  - A watchdog on each connection's stream fails a read or write that has waited 60 s with no byte
+    passing either way. That cuts off a client that stops sending its request or reading its
+    response, and also a request that takes longer to answer, as on a stalled disk; its work goes on.
+  - At startup the daemon raises its soft limit on open files to the hard one. macOS, which reports no
+    hard limit, is left alone.
+  - hyper and hyper-util become direct dependencies, with the features that axum compiled already, so
+    the lock file gains no package.
+- M11: a document's shape is checked before serde reads it: the root, every section, `channels` and
+  every channel must be JSON objects. A patch must be an object; its error names RFC 7386, since `[]`
+  is likelier an empty JSON Patch. Errors in the file keep their line and column: the shape is checked
+  on a parsed `Value`, and the struct is still read from the text. Besides the review's cases, serde
+  read `{"inbound": ["/run/x.sock"]}` as an `inbound.path`, and a channel written as
+  `["websocket", true, "ws://h/x"]` as a WebSocket channel.
+- L13: a query's permit is owned. It moves into the blocking task, which now serializes the page as
+  well, and from there into the response's bytes (`Bytes::from_owner`), which hyper frees once it has
+  written them. hyper is set to queue a response's bytes as they are instead of copying them into its
+  own buffer (`writev`); the release depends on that. A client that stops reading keeps the slot until
+  the watchdog cuts it off.
+- L14: client ids are no longer checked by `validate`. A change (`PUT`, `PATCH`, `SIGHUP`) is refused
+  only if it makes two channels share an id that they do not share in the configuration in effect,
+  and at startup nothing is refused; this replaces step 8's refusal at startup. Outbound finds the
+  conflicts at every reconciliation and logs a new one. Each channel keeps its conflict and shows it in
+  `last_error` once a session is up, where a CONNACK cleared it before. The review's fix still refused
+  every unrelated change after a host was renamed; a change that leaves a conflict as it is is taken
+  now.
+- L15: defaults are written only when nothing at all is at the path. A link to a missing file stops
+  the startup, and the link is kept. Saves follow a link and replace the file it names; before, the
+  first save replaced the link with a regular file, and failed on a read-only root file system.
+- L16: socket paths must be shorter than a socket address's `sun_path`, 108 bytes on Linux and 104 on
+  macOS, taken from libc's `sockaddr_un`, and like `storage.path` free of U+0000.
+- L19: the receipt-time lookup keeps an entry for every configured channel, and looks one up only
+  while something waits for it.
+- L26: `SIGHUP`'s reload runs on the blocking pool. Eviction marks its victims under the index lock,
+  removes their files without it, and drops their entries under it again. Evictions take turns under a
+  lock of their own, which also holds when a failure was last logged. A reader that finds a marked
+  segment's file gone treats the segment as evicted; without the mark it would fail after three
+  retries, in a window that did not exist while the lock covered the removal. The writer publishes
+  the new head before it evicts.
+- L28: once the file is renamed into place, a failed directory sync is a warning.
+
+Found while implementing, and fixed:
+
+- Removing a channel deleted its cursor file under the channel registry's lock, on a runtime thread.
+  With one CPU a slow removal stopped the runtime: in the probe below, the `PATCH` itself took 5 s. It
+  runs on the blocking pool now, without the lock.
+- Serializing a query's page, up to 6 MiB of JSON, ran on a runtime thread; it runs in the query's
+  blocking task now.
+- The README still said that a read error in the newest segment at startup costs the rest of the
+  segment, which step 9 changed.
+
+Verified with unit tests, end-to-end tests and probes of the release binary:
+
+- Each fix's test fails when its old behaviour is put back: 19 reverts, each applied alone. A FIFO in
+  place of a segment, or of the configuration file, makes a read or a reload wait as long as a test
+  needs. A guard opens it when the test ends, so that a failing test cannot hang the runtime's
+  shutdown, which waits for blocking reads.
+- 13 new unit tests: the API's connection limit, idle timer and watchdog; the query slot through a
+  response and through an abandoned read; the receipt-time lookup; eviction without the index lock;
+  the reload; documents' shapes; socket paths; links; the directory sync; client ids shared already.
+  Two new end-to-end tests: documents not shaped like a configuration, over HTTP; and a client id
+  shared at startup, from loading the file to the change that resolves it.
+- macOS and Linux: 123 unit and 18 end-to-end tests pass; on Linux 25 of 25 repeated end-to-end runs
+  and 15 of 15 unit runs pass, as do the log's model tests at 200 000 seeds and the writer race at
+  20 000.
+
+Against the release binary on Linux, before (step 9, `edae6d6`) and after; "one CPU" is `taskset`,
+which leaves the runtime one thread:
+
+| Probe | Before | After |
+|-------|--------|-------|
+| p19: 200 idle API connections, 128 descriptors, then 300 messages | 128 of 128 descriptors in use; all 300 dropped, "Too many open files" | 29 in use; the first 16 closed within 12 s; all 300 committed |
+| Soft limit on open files 128, hard 4 096 | 128 | raised to 4 096 |
+| p20: `PATCH []`, `PATCH {"outbound": []}`, `PUT []`, a channel as an array | 200, without channels (§9) | 400 each; the channel and its cursor kept |
+| p14: four queries abandoned after 0.5 s, every read taking 1 s | four threads reading at once | one |
+| 16 clients that ask for a page of 6 MiB of JSON and read none of it | 108 MB resident; a 17th request answered at once | 12 MB; the 17th answered after 57 s, once the watchdog cut them off |
+| p24: two channels without a `client_id` to one broker, in the file | exit 1 | starts; the connected one shows the conflict; a change elsewhere 200, a third channel 400 |
+| p24: the configuration path a link to a missing file | replaced by defaults (§9) | exit 1, naming the target; the link kept, and saves through it keep it |
+| p24: a 139-byte socket path; U+0000 in `api.path` and `storage.path` | 200 each | 400 each |
+| One CPU: eviction of three segments, each removal taking 5 s | status answered after 14.5 s | in 1.5 ms |
+| One CPU: `SIGHUP` with the configuration file a pipe nothing writes | status and health timed out after 20 s | 0.2 ms |
+| One CPU: removing a channel whose cursor file takes 5 s to remove | the `PATCH` answered after 5.0 s | in 16 ms |
+| The directory sync after a save's rename fails (EIO injected) | 500; the file holds the change, which is not applied | 200 and a warning; applied |
+
+Residual:
+
+- A client that keeps opening connections and leaves them open delays the others: connections are
+  accepted in turn, 16 at a time, and one that sends nothing holds its place for 10 s.
+- A request that takes longer than 60 s to answer is cut off while its work goes on: a configuration
+  saved meanwhile applies, though its client saw no answer.
+- A client that reads a page slowly but steadily holds the query slot for as long as it reads; the
+  watchdog ends only one that stops.
+- After the host is renamed, a conflict is reported from the next reconciliation, whether or not the
+  channels concerned have restarted with the new name.
+- Binding the sockets and removing a socket file still happen on the runtime's threads; their
+  directories are usually on a tmpfs.
+- On macOS the soft limit on open files is not raised.
+
 ## 9. Second review (2026-10-22)
 
 Reviewed at `407be9d`, after steps 1–8, for defects that the fixes introduced or left, with the
@@ -1581,7 +1686,8 @@ Three steps, in order of risk; each fix gets a regression test that fails withou
 
 - **Step 9, the log:** H3, H4, M12, L17, L18, L24, L25 and L27. The model tests of this review join
   the suite. Done; see §8, step 9.
-- **Step 10, the API and configuration:** M10, M11, L13, L14, L15, L16, L19, L26 and L28.
+- **Step 10, the API and configuration:** M10, M11, L13, L14, L15, L16, L19, L26 and L28. Done; see §8,
+  step 10.
 - **Step 11, the channels:** M13, M14, L20, L21, L22, L23 and L29, and the decision on the design note.
 
 ## Appendix: probes

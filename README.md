@@ -15,9 +15,12 @@ cargo build --release
 ./target/release/uevtd --config /etc/uevtd/config.json
 ```
 
-If the configuration file does not exist it is created with defaults. The
-daemon stops cleanly on `SIGTERM`/`SIGINT` (a second signal exits at once) and
-re-reads its configuration file on `SIGHUP`. A full example configuration is in
+If nothing is at the configuration path, a file of defaults is created there.
+A link at the path is followed, and saves replace the file it names; a link to
+a file that does not exist stops the daemon instead, so that a configuration on
+a partition that mounts late is not replaced by defaults. The daemon stops
+cleanly on `SIGTERM`/`SIGINT` (a second signal exits at once) and re-reads its
+configuration file on `SIGHUP`. A full example configuration is in
 [contrib/config.example.json](contrib/config.example.json).
 
 Two things are left to the system that runs it:
@@ -29,8 +32,11 @@ Two things are left to the system that runs it:
   thread panics; a channel that panics is restarted inside the daemon. A clean
   stop exits with 0, a second signal with 130 and a usage error with 2.
 - Write access for the daemon's user to the directory of the configuration
-  file, where the API saves it through a temporary file and a missing file is
-  created, as well as to `storage.path` and the directories of both sockets.
+  file, or of the file it links to, where the API saves it through a temporary
+  file and a missing file is created, as well as to `storage.path` and the
+  directories of both sockets.
+
+At startup the daemon raises its soft limit on open files to the hard limit.
 
 Logs go to stderr; the filter (`log.filter`) uses `tracing` directives such as
 `info` or `info,uevtd::storage=debug` and can be changed at runtime.
@@ -128,10 +134,11 @@ Notes:
   that much latency and a crash can lose at most the unsynced tail, never a
   record that was already seen.
 - At startup the newest segment is checked and synced before its records are
-  forwarded. A read error in it, such as a bad sector, costs the rest of that
-  segment, counted as lost with a notice in its place, but not the startup; an
-  older segment that cannot be read is retried by the channels, with the error
-  in `last_error`.
+  forwarded. A read error in it, such as a bad sector, does not stop the
+  startup: the segment is kept, the channels retry the part that fails, with
+  the error in `last_error`, and new messages are numbered past anything that
+  part could hold. An older segment that cannot be read is retried the same
+  way.
 - WebSocket: one long-lived connection (`ws://` or `wss://`); `headers` go with
   the handshake. Every message is a text frame in the shape `/v1/messages`
   returns, `{"seq": 7, "ts": 1760928000123456, "data": {...}}`, or `"text"`
@@ -155,9 +162,12 @@ Notes:
 - MQTT `client_id`: without one, a channel connects with the host name, so
   devices that share a broker need host names of their own. The id is logged
   when the channel starts. A configured `client_id` is used exactly as given,
-  including a `"uevtd"` saved by an earlier version. Two enabled channels to the
-  same host cannot connect with the same id, so a second channel to a broker
-  needs a `client_id`. A host without a name, an empty one or `(none)`, connects
+  including a `"uevtd"` saved by an earlier version. A change cannot make two
+  enabled channels to the same host connect with the same id, so a second
+  channel to a broker needs a `client_id`. A configuration file in which two
+  channels share an id still loads at startup, as one saved before the host was
+  renamed can: both channels run, and both show the conflict in `last_error`.
+  A host without a name, an empty one or `(none)`, connects
   as `uevtd` and 16 hex digits instead, new at every start. MQTT 3.1.1 brokers
   need only accept ids of up to 23 letters and digits; one that refuses the host
   name says so in `last_error`, and then the channel needs a `client_id`.
@@ -210,7 +220,14 @@ Served over `api.path`; use `curl --unix-socket`.
 | GET    | `/v1/health`   | `200 ok` while the log takes writes; `503` with the reason after a failed write or sync until a batch is committed again, while one write or sync takes more than 30 s, and while eviction cannot remove a segment, so that the log grows past `storage.max_bytes`. |
 
 Errors are `{"error": "<message>"}` with status 400, 404, 405, 413, 500 or 503.
-Request bodies are limited to 256 KiB.
+Request bodies are limited to 256 KiB. A `PATCH` body must be a JSON object, a
+merge patch, and in a `PUT` the document, its sections and its channels must
+be objects.
+
+At most 16 connections are served at once; others wait until one closes. A
+connection is closed after 10 s without a request, and once a read or write has
+waited 60 s: a client that stops sending its request or reading its response is
+cut off. A query holds the one query slot until its response is written.
 
 ### Status and metrics
 

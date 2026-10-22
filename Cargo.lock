@@ -1559,6 +1559,8 @@ dependencies = [
  "axum",
  "crc32fast",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "reqwest",
  "rumqttc",

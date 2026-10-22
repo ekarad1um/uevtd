@@ -2,9 +2,11 @@
 //! live distribution to components through a `watch` channel.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -14,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::outbound::notice::MAX_NOTICE_BYTES;
 use crate::storage::SEGMENT_OVERHEAD;
@@ -301,14 +303,12 @@ fn ensure(ok: bool, message: impl FnOnce() -> String) -> Result<(), Error> {
 }
 
 impl Config {
+    /// Checks every field. Client ids that two channels share are checked
+    /// against the configuration in effect instead ([`Store`]).
     pub fn validate(&self) -> Result<(), Error> {
         let inbound = &self.inbound;
-        ensure(!inbound.path.as_os_str().is_empty(), || {
-            "inbound.path must not be empty".into()
-        })?;
-        ensure(!self.api.path.as_os_str().is_empty(), || {
-            "api.path must not be empty".into()
-        })?;
+        socket_path("inbound.path", &inbound.path)?;
+        socket_path("api.path", &self.api.path)?;
         ensure(inbound.path != self.api.path, || {
             "inbound.path and api.path must differ".into()
         })?;
@@ -332,6 +332,9 @@ impl Config {
         let storage = &self.storage;
         ensure(!storage.path.as_os_str().is_empty(), || {
             "storage.path must not be empty".into()
+        })?;
+        ensure(!storage.path.as_os_str().as_bytes().contains(&0), || {
+            "storage.path must not contain U+0000".into()
         })?;
         ensure(
             (64 << 10..=256 << 20).contains(&storage.segment_bytes),
@@ -370,11 +373,23 @@ impl Config {
                 Channel::Mqtt(c) => validate_mqtt(name, c)?,
             }
         }
-        check_client_ids(&self.outbound.channels, host_name().as_deref())?;
 
         tracing_subscriber::EnvFilter::try_new(&self.log.filter)
             .map_err(|e| Error::Invalid(format!("log.filter: {e}")))?;
         Ok(())
+    }
+
+    /// Refuses a client id that two channels of this configuration would
+    /// share, unless they share it in `current` already. The host name is
+    /// read now, so a host renamed since `current` was applied can make
+    /// channels share one; a change that leaves them alone need not resolve
+    /// that, and outbound reports it ([`client_id_conflicts`]).
+    fn check_client_ids(&self, current: &Config) -> Result<(), Error> {
+        check_client_ids(
+            &self.outbound.channels,
+            &current.outbound.channels,
+            host_name().as_deref(),
+        )
     }
 
     /// Copy with secrets replaced, for logging.
@@ -481,6 +496,27 @@ pub fn redacted_url(url: &str) -> String {
     }
 }
 
+/// Bytes a socket address holds for its path, the terminating NUL included:
+/// 108 on Linux, 104 on macOS.
+const SOCKET_PATH_ROOM: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
+/// A path that a socket can be bound at, so that neither a rebind nor the
+/// next start can fail on the path itself.
+fn socket_path(field: &str, path: &Path) -> Result<(), Error> {
+    let bytes = path.as_os_str().as_bytes();
+    ensure(!bytes.is_empty(), || format!("{field} must not be empty"))?;
+    ensure(!bytes.contains(&0), || {
+        format!("{field} must not contain U+0000")
+    })?;
+    ensure(bytes.len() < SOCKET_PATH_ROOM, || {
+        format!(
+            "{field} must be at most {} bytes, as a socket address holds",
+            SOCKET_PATH_ROOM - 1
+        )
+    })
+}
+
 fn validate_name(name: &str) -> Result<(), Error> {
     let mut chars = name.chars();
     let ok = name.len() <= 64
@@ -542,36 +578,90 @@ fn validate_websocket(name: &str, c: &WebSocket) -> Result<(), Error> {
     })
 }
 
-/// Refuses two enabled MQTT channels that would connect to one host with the
-/// same client id, configured or the default for `host_name`. A broker
+/// The host, without case, and the client id that an enabled MQTT channel
+/// connects with, configured or the default for `host_name`.
+fn connection(name: &str, channel: &Channel, host_name: Option<&str>) -> Option<(String, String)> {
+    match channel {
+        Channel::Mqtt(c) if c.enabled => {
+            Some((c.host.to_ascii_lowercase(), c.client_id_on(host_name, name)))
+        }
+        _ => None,
+    }
+}
+
+/// Two channels that connect to one host with the same client id. A broker
 /// disconnects a client when another connects with its id, on any of its
-/// ports, so the two would take turns.
+/// ports, so the two take turns.
+struct Conflict {
+    channels: (String, String),
+    message: String,
+}
+
+/// Every channel that connects like one before it, paired with that one.
+fn conflicts(channels: &BTreeMap<String, Channel>, host_name: Option<&str>) -> Vec<Conflict> {
+    let mut ids = BTreeMap::new();
+    let mut found = Vec::new();
+    for (name, channel) in channels {
+        let (Channel::Mqtt(c), Some(key)) = (channel, connection(name, channel, host_name)) else {
+            continue;
+        };
+        let default = c.client_id.is_none();
+        match ids.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert((name, default));
+            }
+            Entry::Occupied(entry) => {
+                let &(other, other_default) = entry.get();
+                let which = if default || other_default {
+                    ", the host name used without a client_id"
+                } else {
+                    ""
+                };
+                found.push(Conflict {
+                    channels: (other.clone(), name.clone()),
+                    message: format!(
+                        "channels {other} and {name} both connect to {} as client_id {:?}{which}; \
+                         a broker disconnects one when the other connects",
+                        c.host,
+                        entry.key().1
+                    ),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Refuses two channels that would share a client id, unless they share it
+/// in `current` already.
 fn check_client_ids(
     channels: &BTreeMap<String, Channel>,
+    current: &BTreeMap<String, Channel>,
     host_name: Option<&str>,
 ) -> Result<(), Error> {
-    let mut ids = BTreeMap::new();
-    for (name, channel) in channels {
-        let Channel::Mqtt(c) = channel else { continue };
-        if !c.enabled {
-            continue;
-        }
-        let key = (c.host.to_ascii_lowercase(), c.client_id_on(host_name, name));
-        let default = c.client_id.is_none();
-        if let Some((other, other_default)) = ids.insert(key.clone(), (name, default)) {
-            let which = if default || other_default {
-                ", the host name used without a client_id"
-            } else {
-                ""
-            };
-            return Err(Error::Invalid(format!(
-                "channels {other} and {name} both connect to {} as client_id {:?}{which}; \
-                 a broker disconnects one when the other connects",
-                c.host, key.1
-            )));
+    let before = |name: &str| connection(name, current.get(name)?, host_name);
+    for conflict in conflicts(channels, host_name) {
+        let (a, b) = &conflict.channels;
+        if before(a).is_none_or(|key| before(b) != Some(key)) {
+            return Err(Error::Invalid(conflict.message));
         }
     }
     Ok(())
+}
+
+/// For every channel that shares its client id with another, the message
+/// that names the two. Validation refuses a change that makes two channels
+/// share one, but a configuration loaded at startup may, as can one saved
+/// before the host was renamed (§6.3).
+pub fn client_id_conflicts(channels: &BTreeMap<String, Channel>) -> BTreeMap<String, String> {
+    let mut by_channel = BTreeMap::new();
+    for Conflict { channels, message } in conflicts(channels, host_name().as_deref()) {
+        by_channel
+            .entry(channels.0)
+            .or_insert_with(|| message.clone());
+        by_channel.entry(channels.1).or_insert(message);
+    }
+    by_channel
 }
 
 fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
@@ -631,13 +721,21 @@ pub fn load(path: &Path) -> Result<Config, Error> {
     parse(&fs::read_to_string(path)?)
 }
 
-/// Like [`load`], but a missing file yields the defaults, which are written
-/// to the path so the effective configuration is visible on disk. Any other
-/// failure to read the file is an error, never a reason to overwrite it.
+/// Like [`load`], but when nothing at all is at the path, the defaults are
+/// used and written there, so the effective configuration is visible on
+/// disk. Any other failure to read the file is an error, never a reason to
+/// overwrite it. That includes a link to a file that does not exist: its
+/// target may only be missing for now, as on a partition not mounted yet.
 pub fn load_or_init(path: &Path) -> Result<Config, Error> {
     match fs::read_to_string(path) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Ok(target) = fs::read_link(path) {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("a link to {}, which does not exist", target.display()),
+                )));
+            }
             let config = Config::default();
             config.validate()?;
             save(path, &config)?;
@@ -649,14 +747,62 @@ pub fn load_or_init(path: &Path) -> Result<Config, Error> {
 }
 
 fn parse(text: &str) -> Result<Config, Error> {
-    let config: Config = serde_json::from_str(text)?;
+    let config = read(text.as_bytes())?;
     config.validate()?;
     Ok(config)
 }
 
+/// Reads a configuration document, which must have the shape of one
+/// ([`check_shape`]). It is not validated.
+pub fn read(text: &[u8]) -> Result<Config, Error> {
+    check_shape(&serde_json::from_slice(text)?)?;
+    Ok(serde_json::from_slice(text)?)
+}
+
+/// Refuses a document that serde would read in another shape than its own:
+/// it reads a struct from an array as well, element by element and with
+/// defaults for the rest, which `deny_unknown_fields` does not cover. `[]`
+/// would read as the defaults, `{"outbound": []}` as no channels, and a
+/// channel from an array of its fields.
+fn check_shape(document: &Value) -> Result<(), Error> {
+    let object = |value: Option<&Value>, what: &str| {
+        ensure(value.is_none_or(Value::is_object), || {
+            format!("{what} must be a JSON object")
+        })
+    };
+    object(Some(document), "the configuration")?;
+    for section in ["inbound", "storage", "outbound", "api", "log"] {
+        object(document.get(section), section)?;
+    }
+    let channels = document.get("outbound").and_then(|o| o.get("channels"));
+    object(channels, "outbound.channels")?;
+    for (name, channel) in channels.and_then(Value::as_object).into_iter().flatten() {
+        object(Some(channel), &format!("channel {name}"))?;
+    }
+    Ok(())
+}
+
 /// Writes the configuration atomically: temp file (mode 0600), fsync, rename,
-/// directory fsync.
+/// directory fsync. A link at the path is followed, so that the file it
+/// points to is replaced, not the link.
 pub fn save(path: &Path, config: &Config) -> io::Result<()> {
+    save_with(path, config, |dir| File::open(dir)?.sync_all())
+}
+
+fn save_with(
+    path: &Path,
+    config: &Config,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let path = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("following the link {}: {e}", path.display()),
+            )
+        })?,
+        _ => path.to_path_buf(),
+    };
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -676,8 +822,12 @@ pub fn save(path: &Path, config: &Config) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut file, config).map_err(io::Error::other)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    fs::rename(&tmp, path)?;
-    File::open(&dir)?.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    // The new file is in place, and the next start reads it. Failing now
+    // would report the configuration as not applied while the file holds it.
+    if let Err(e) = sync_dir(&dir) {
+        warn!(dir = %dir.display(), error = %e, "could not sync the configuration directory");
+    }
     Ok(())
 }
 
@@ -741,9 +891,15 @@ impl Store {
     /// commits the result. Read, merge and write happen under one lock, so
     /// concurrent patches compose instead of overwriting each other.
     pub fn patch(&self, patch: &Value) -> Result<Arc<Config>, Error> {
+        // Any other patch replaces the whole document (RFC 7386), and is
+        // likelier a JSON Patch (RFC 6902), where `[]` changes nothing.
+        ensure(patch.is_object(), || {
+            "a patch must be a JSON object, an RFC 7386 merge patch".into()
+        })?;
         let _guard = self.write.lock().unwrap();
         let mut document = serde_json::to_value(self.current().as_ref())?;
         merge_patch(&mut document, patch);
+        check_shape(&document)?;
         self.commit(serde_json::from_value(document)?)
     }
 
@@ -751,11 +907,13 @@ impl Store {
     pub fn reload(&self) -> Result<Arc<Config>, Error> {
         let _guard = self.write.lock().unwrap();
         let config = load(&self.path)?;
+        config.check_client_ids(&self.current())?;
         Ok(self.publish(config))
     }
 
     fn commit(&self, config: Config) -> Result<Arc<Config>, Error> {
         config.validate()?;
+        config.check_client_ids(&self.current())?;
         if *self.current() != config {
             save(&self.path, &config)?;
         }
@@ -1030,11 +1188,7 @@ mod tests {
         // two such channels collide; on a host without a name each gets an
         // id of its own.
         let ids = |channels: &[(&str, &Mqtt)], host_name| {
-            let channels: BTreeMap<String, Channel> = channels
-                .iter()
-                .map(|(name, c)| (name.to_string(), Channel::Mqtt((*c).clone())))
-                .collect();
-            check_client_ids(&channels, host_name)
+            check_client_ids(&mqtt_channels(channels), &BTreeMap::new(), host_name)
         };
         let default = base("h", 1883, None);
         let x = base("h", 1883, Some("x"));
@@ -1074,6 +1228,157 @@ mod tests {
         assert!(field(&|c| c.username = Some("a\0".into())).is_err());
         assert!(field(&|c| c.password = Some("a\0".into())).is_ok());
         assert!(field(&|c| c.password = Some(long.clone())).is_err());
+    }
+
+    fn mqtt_channels(channels: &[(&str, &Mqtt)]) -> BTreeMap<String, Channel> {
+        channels
+            .iter()
+            .map(|(name, c)| (name.to_string(), Channel::Mqtt((*c).clone())))
+            .collect()
+    }
+
+    #[test]
+    fn a_client_id_shared_already_is_not_refused_again() {
+        let base = |client_id: Option<&str>| Mqtt {
+            host: "h".into(),
+            topic: "t".into(),
+            client_id: client_id.map(Into::into),
+            ..Mqtt::default()
+        };
+        let (default, x) = (base(None), base(Some("x")));
+        let check = |new: &[(&str, &Mqtt)], current: &[(&str, &Mqtt)]| {
+            check_client_ids(&mqtt_channels(new), &mqtt_channels(current), Some("dev42"))
+        };
+        // Two channels that share an id now, as after the host was renamed,
+        // may stay as they are while anything else changes, and the change
+        // that resolves it is taken too.
+        let shared: &[(&str, &Mqtt)] = &[("a", &default), ("b", &default)];
+        assert!(check(shared, shared).is_ok());
+        assert!(check(&[("a", &default), ("b", &x)], shared).is_ok());
+        // A channel that would share it as well is refused, also beside a
+        // pair that shares it already, and so is a pair that did not before.
+        let three = [("a", &default), ("b", &default), ("c", &default)];
+        let err = check(&three, shared).unwrap_err();
+        assert!(err.to_string().contains("channels a and c"), "{err}");
+        assert!(check(shared, &[("a", &default), ("b", &x)]).is_err());
+        assert!(check(shared, &[("a", &default)]).is_err());
+        // Taking one out of three that share it leaves two that did.
+        assert!(check(&three[1..], &three).is_ok());
+
+        // Validation alone no longer depends on the host name, so a file
+        // saved before the host was renamed still loads.
+        let mut config = Config::default();
+        config.outbound.channels = mqtt_channels(shared);
+        config.validate().unwrap();
+        let conflicts = conflicts(&config.outbound.channels, Some("dev42"));
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].channels, ("a".into(), "b".into()));
+    }
+
+    #[test]
+    fn documents_must_have_the_shape_of_a_configuration() {
+        for text in [
+            "[]",
+            r#"{"outbound": []}"#,
+            r#"{"inbound": ["/run/x.sock"]}"#,
+            r#"{"outbound": {"channels": []}}"#,
+            r#"{"outbound": {"channels": {"a": ["websocket", true, "ws://h/x"]}}}"#,
+        ] {
+            assert!(matches!(parse(text), Err(Error::Invalid(_))), "{text}");
+            assert!(read(text.as_bytes()).is_err(), "{text}");
+        }
+        let err = parse("[]").unwrap_err();
+        assert_eq!(err.to_string(), "the configuration must be a JSON object");
+        // A syntax error still says where it is.
+        let err = parse("{\n\"inbound\": {\"max_connections\": x}}").unwrap_err();
+        assert!(err.to_string().contains("line 2"), "{err}");
+
+        // A patch must be an object, and so must every section of what it
+        // makes; neither removes the channels.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config
+            .outbound
+            .channels
+            .insert("a".into(), websocket("ws://h/x"));
+        save(&path, &config).unwrap();
+        let store = Store::new(path.clone(), config.clone());
+        for patch in [
+            serde_json::json!([]),
+            serde_json::json!("x"),
+            serde_json::json!({"outbound": []}),
+            serde_json::json!({"outbound": {"channels": {"a": []}}}),
+        ] {
+            assert!(
+                matches!(store.patch(&patch), Err(Error::Invalid(_))),
+                "{patch}"
+            );
+        }
+        // An empty JSON Patch is told what PATCH takes.
+        let err = store.patch(&serde_json::json!([])).unwrap_err();
+        assert!(err.to_string().contains("RFC 7386"), "{err}");
+        assert_eq!(*store.current(), config);
+        assert_eq!(load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn socket_paths_must_fit_a_socket_address() {
+        let check = |f: &dyn Fn(&mut Config)| {
+            let mut config = Config::default();
+            f(&mut config);
+            config.validate()
+        };
+        let path = |len: usize| PathBuf::from(format!("/{}", "s".repeat(len - 1)));
+        let most = SOCKET_PATH_ROOM - 1;
+        assert!(check(&|c| c.inbound.path = path(most)).is_ok());
+        let err = check(&|c| c.inbound.path = path(most + 1)).unwrap_err();
+        assert!(
+            err.to_string().starts_with("inbound.path must be at most"),
+            "{err}"
+        );
+        assert!(check(&|c| c.api.path = path(most + 1)).is_err());
+        assert!(check(&|c| c.api.path = "/run/a\0b".into()).is_err());
+        assert!(check(&|c| c.inbound.path = "/run/a\0b".into()).is_err());
+        assert!(check(&|c| c.storage.path = "/var/a\0b".into()).is_err());
+        // Linux and macOS hold 107 and 103 bytes.
+        assert!([107, 103].contains(&most), "{most}");
+    }
+
+    #[test]
+    fn a_link_to_a_missing_file_is_neither_read_as_defaults_nor_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("data/config.json");
+        let link = dir.path().join("config.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = load_or_init(&link).unwrap_err();
+        assert!(err.to_string().contains("which does not exist"), "{err}");
+        assert!(matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::NotFound));
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(save(&link, &Config::default()).is_err());
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+
+        // Once the target is there, the file it names is read and saved,
+        // and the link stays.
+        fs::create_dir(target.parent().unwrap()).unwrap();
+        save(&target, &Config::default()).unwrap();
+        let store = Store::new(link.clone(), load_or_init(&link).unwrap());
+        store
+            .patch(&serde_json::json!({"storage": {"sync_interval_ms": 7}}))
+            .unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(load(&target).unwrap().storage.sync_interval_ms, 7);
+    }
+
+    #[test]
+    fn a_save_whose_directory_sync_fails_after_the_rename_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.storage.sync_interval_ms = 9;
+        save_with(&path, &config, |_| Err(io::Error::other("injected"))).unwrap();
+        assert_eq!(load(&path).unwrap(), config);
     }
 
     #[test]

@@ -70,11 +70,21 @@ error names the field and its allowed range.
   given: a configuration file saved by an earlier version holds
   `"client_id": "uevtd"`, since the daemon writes every field, and keeps
   connecting as `uevtd` until it is set to `null`.
-- Two enabled MQTT channels to the same host may not connect with the same
-  client id, on any port, whether it is configured or the host name: a second
-  channel to one broker needs a `client_id`. MQTT `topic`, `client_id`,
-  `username` and `password` are at most 65535 bytes, and only `password` may
-  contain U+0000.
+- A change to the configuration may not make two enabled MQTT channels to the
+  same host connect with the same client id, on any port, whether it is
+  configured or the host name: a second channel to one broker needs a
+  `client_id`. A configuration file in which two channels share one, as one
+  saved by an earlier version with `"client_id": "uevtd"` twice, still loads;
+  both channels report the conflict in `last_error`, and a change elsewhere is
+  not refused for it. MQTT `topic`, `client_id`, `username` and `password` are
+  at most 65535 bytes, and only `password` may contain U+0000.
+- `inbound.path` and `api.path` are at most 107 bytes, or 103 on macOS, as a
+  socket address holds, and like `storage.path` may not contain U+0000. Such a
+  path was accepted before, and the next start failed on it.
+- The API serves at most 16 connections at once; more wait to be accepted. A
+  connection is closed after 10 s without a request, and once a read or write
+  has waited 60 s, so a client that stops reading a response is cut off.
+- At startup the daemon raises its soft limit on open files to the hard limit.
 - An MQTT message above `max_packet_bytes` stays rejected, but the cursor now
   passes it once its notice is acknowledged, not at once. A channel passes
   messages evicted before delivery the same way, once their notice is
@@ -93,9 +103,10 @@ error names the field and its allowed range.
 ### Fixed
 
 - Memory is bounded under any load: the writer queue holds at most 8 MiB, each
-  channel at most 1 MiB in flight, queries run one at a time, and on glibc the
-  allocator returns large buffers to the system. Peak resident size under the
-  heaviest load is about 54 MiB, down from 144 MiB.
+  channel at most 1 MiB in flight, queries run one at a time, each from its
+  read until its response is written, also when its client has left, and on
+  glibc the allocator returns large buffers to the system. Peak resident size
+  under the heaviest load is about 54 MiB, down from 144 MiB.
 - A single large message could evict the whole log; segments no longer grow past
   `storage.segment_bytes`.
 - Messages evicted before a channel delivered them are counted in `lost` and
@@ -161,6 +172,25 @@ error names the field and its allowed range.
   the first publish, was retried once a second without end. Reconnects now back
   off to once a minute, and the wait shortens again only when the broker
   acknowledges something.
+- Idle API connections were neither limited nor closed. A client that leaked
+  them used up the daemon's file descriptors, and the log writer then dropped
+  every message ("Too many open files").
+- `PATCH /v1/config` with `[]`, an empty JSON Patch, or with
+  `{"outbound": []}`, and `PUT` with `[]`, were read as the defaults for what
+  they left out. Every channel and its cursor file were removed, the sockets
+  moved and the storage limits reset. A configuration file holding an array
+  loaded the same way. Only JSON objects are read as a configuration now, its
+  sections and channels included.
+- A link at the configuration path to a missing file, as on a partition not
+  mounted yet, was replaced by a file of defaults, and the device ran without
+  channels from then on; a save replaced a link with a file. Links are
+  followed now, and a link to a missing file stops the startup.
+- On a stalled disk, a `SIGHUP`, an eviction or the removal of a channel could
+  stop the runtime's threads, `/v1/health` included. They waited for the disk
+  on those threads, or under a lock that status and metrics take there.
+- A configuration save whose directory sync failed after the file was replaced
+  answered 500, and the configuration was not applied, though the file held it
+  and the next start applied it. The save succeeds with a warning now.
 - Concurrent `PATCH /v1/config` requests no longer lose each other's changes.
 - Setting `storage.sync_interval_ms` to 0 commits pending data within a second
   instead of waiting for the next message.

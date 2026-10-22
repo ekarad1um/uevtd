@@ -3,8 +3,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -15,11 +18,15 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::net::UnixListener;
-use tokio::sync::{Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -40,6 +47,15 @@ const BODY_BYTES: usize = 256 << 10;
 pub const CONCURRENT_QUERIES: usize = 1;
 /// How often [`Times`] is brought up to date.
 const TIMES_INTERVAL: Duration = Duration::from_secs(1);
+/// How the API serves its connections (§8).
+const SERVE: Serve = Serve {
+    connections: 16,
+    idle: Duration::from_secs(10),
+    stall: Duration::from_secs(60),
+};
+/// The warning that the connections reached their limit repeats at most this
+/// often.
+const LIMIT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct AppState {
     pub config: Arc<config::Store>,
@@ -50,8 +66,9 @@ pub struct AppState {
     pub channels: Arc<Registry>,
     pub started: Instant,
     pub last_error: ErrorSlot,
-    /// Holds [`CONCURRENT_QUERIES`] permits.
-    pub queries: Semaphore,
+    /// Holds [`CONCURRENT_QUERIES`] permits. A query's permit stays with its
+    /// read, and then with its response until that is written.
+    pub queries: Arc<Semaphore>,
     pub times: Mutex<Times>,
 }
 
@@ -99,7 +116,7 @@ pub async fn run(
         .await
         .with_context(|| format!("binding api socket {}", current.path.display()))?;
     info!(path = %current.path.display(), "api listening");
-    let mut server = Server::spawn(listener, app.clone());
+    let mut server = Server::spawn(listener, app.clone(), SERVE);
     let times = tokio::spawn(keep_times(state.clone()));
 
     loop {
@@ -115,7 +132,7 @@ pub async fn run(
                 if next.path != current.path {
                     match uds::bind(&next.path, next.mode.0).await {
                         Ok(fresh) => {
-                            let old = std::mem::replace(&mut server, Server::spawn(fresh, app.clone()));
+                            let old = std::mem::replace(&mut server, Server::spawn(fresh, app.clone(), SERVE));
                             old.stop().await;
                             uds::remove(&current.path);
                             state.last_error.clear();
@@ -145,35 +162,24 @@ pub async fn run(
     Ok(())
 }
 
-/// Keeps [`Times`] up to date. A lookup reads on from where the one before
-/// it left off, so following a channel that delivers costs about as much as
-/// reading what it delivered.
+/// Keeps [`Times`] up to date.
 async fn keep_times(state: Shared) {
     let mut tick = tokio::time::interval(TIMES_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let status = state.storage.status();
-        let waiting: BTreeMap<String, u64> = state
+        let cursors: BTreeMap<String, u64> = state
             .channels
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(name, m)| {
-                let cursor = m.cursor.load(Relaxed);
-                (lag(&status, cursor) > 0).then(|| (name.clone(), cursor.max(status.first_seq)))
-            })
+            .map(|(name, m)| (name.clone(), m.cursor.load(Relaxed)))
             .collect();
         let mut times = state.times.lock().unwrap().clone();
         let storage = state.storage.clone();
         let looked_up = tokio::task::spawn_blocking(move || {
-            if status.first_seq <= status.head_seq {
-                times.first.update(&storage, status.first_seq);
-            }
-            times.waiting.retain(|name, _| waiting.contains_key(name));
-            for (name, seq) in waiting {
-                times.waiting.entry(name).or_default().update(&storage, seq);
-            }
+            times.refresh(&storage, &status, &cursors);
             times
         });
         match looked_up.await {
@@ -183,35 +189,264 @@ async fn keep_times(state: Shared) {
     }
 }
 
+/// Bounds on the API's connections, which would otherwise use up the file
+/// descriptors that the log and the producers need.
+#[derive(Clone, Copy)]
+struct Serve {
+    /// Open at once; more wait to be accepted, holding no descriptor.
+    connections: usize,
+    /// For a request's head, so that an idle connection is closed after it.
+    idle: Duration,
+    /// For a read or write that waits, with no byte passing either way.
+    stall: Duration,
+}
+
 struct Server {
     token: CancellationToken,
-    task: JoinHandle<std::io::Result<()>>,
+    task: JoinHandle<()>,
 }
 
 impl Server {
-    fn spawn(listener: UnixListener, app: Router) -> Server {
+    fn spawn(listener: UnixListener, app: Router, limits: Serve) -> Server {
         let token = CancellationToken::new();
-        let signal = token.clone().cancelled_owned();
-        let task = tokio::spawn(
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal)
-                .into_future(),
-        );
+        let task = tokio::spawn(serve(listener, app, limits, token.clone()));
         Server { token, task }
     }
 
+    /// Stops accepting, lets the requests in progress finish for up to 5 s,
+    /// and closes every connection.
     async fn stop(self) {
         self.token.cancel();
         let mut task = self.task;
         match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => warn!(error = %e, "api server error"),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => error!(error = %e, "api server task failed"),
             Err(_) => {
                 warn!("api server did not stop in time; aborting");
                 task.abort();
             }
         }
+    }
+}
+
+/// Accepts connections and serves each on a task of its own, at most
+/// `limits.connections` at once, until `token` is cancelled; then waits for
+/// them to finish.
+async fn serve(listener: UnixListener, app: Router, limits: Serve, token: CancellationToken) {
+    let slots = Arc::new(Semaphore::new(limits.connections));
+    let mut connections = JoinSet::new();
+    let mut warned: Option<Instant> = None;
+    'serve: loop {
+        // A slot first: a connection past the limit waits in the listen
+        // queue, where it holds no descriptor of the daemon's.
+        let slot = match slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                if warned.is_none_or(|t| t.elapsed() >= LIMIT_WARN_INTERVAL) {
+                    warn!(
+                        max = limits.connections,
+                        "api connection limit reached; new connections wait"
+                    );
+                    warned = Some(Instant::now());
+                }
+                tokio::select! {
+                    slot = slots.clone().acquire_owned() => slot.expect("never closed"),
+                    Some(done) = connections.join_next() => {
+                        ended(done);
+                        continue;
+                    }
+                    _ = token.cancelled() => break,
+                }
+            }
+        };
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(connection(stream, app.clone(), limits, token.clone(), slot));
+                }
+                // The client's own error; another, such as running out of
+                // descriptors, may last, and is waited out.
+                Err(e) if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                ) => debug!(error = %e, "api accept failed"),
+                Err(e) => {
+                    warn!(error = %e, "api accept failed");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = token.cancelled() => break 'serve,
+                    }
+                }
+            },
+            Some(done) = connections.join_next() => ended(done),
+            _ = token.cancelled() => break,
+        }
+    }
+    drop(listener);
+    while let Some(done) = connections.join_next().await {
+        ended(done);
+    }
+}
+
+fn ended(connection: Result<(), JoinError>) {
+    if let Err(e) = connection {
+        error!(error = %e, "api connection task failed");
+    }
+}
+
+/// Serves one connection. It is closed once it has waited `limits.idle` for
+/// a request, or `limits.stall` for a read or write; or, after the request
+/// in progress, once `token` is cancelled.
+async fn connection(
+    stream: UnixStream,
+    app: Router,
+    limits: Serve,
+    token: CancellationToken,
+    _slot: OwnedSemaphorePermit,
+) {
+    let io = TokioIo::new(Watchdog::new(stream, limits.stall));
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        // Runs from the end of each response too, while the connection idles.
+        .header_read_timeout(limits.idle)
+        // Bytes of a response are queued as they are, not copied: the query
+        // slot they hold is released only once they are written.
+        .writev(true);
+    let served = builder.serve_connection(io, TowerToHyperService::new(app));
+    let mut served = std::pin::pin!(served);
+    let ended = tokio::select! {
+        ended = served.as_mut() => ended,
+        _ = token.cancelled() => {
+            served.as_mut().graceful_shutdown();
+            served.await
+        }
+    };
+    if let Err(e) = ended {
+        debug!(error = %e, "api connection closed");
+    }
+}
+
+/// A connection's stream whose reads and writes fail once one of them has
+/// waited `stall` with no byte passing either way. A client that stops
+/// reading its response, or sending its request, then loses the connection,
+/// and the query slot a response holds.
+struct Watchdog<S> {
+    stream: S,
+    stall: Duration,
+    timer: Pin<Box<tokio::time::Sleep>>,
+    /// The timer runs: something waits, and nothing has passed since.
+    armed: bool,
+}
+
+impl<S> Watchdog<S> {
+    fn new(stream: S, stall: Duration) -> Self {
+        Self {
+            stream,
+            stall,
+            timer: Box::pin(tokio::time::sleep(stall)),
+            armed: false,
+        }
+    }
+
+    /// For an operation that waits: whether it has waited too long. The
+    /// waker is registered to find out.
+    fn expired(&mut self, cx: &mut TaskContext<'_>) -> bool {
+        if !self.armed {
+            self.armed = true;
+            let deadline = tokio::time::Instant::now() + self.stall;
+            self.timer.as_mut().reset(deadline);
+        }
+        self.timer.as_mut().poll(cx).is_ready()
+    }
+
+    fn passed(&mut self, bytes: usize) {
+        if bytes > 0 {
+            self.armed = false;
+        }
+    }
+
+    /// What an operation that waits returns.
+    fn wait<T>(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Result<T>> {
+        if self.expired(cx) {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no progress for {:?}", self.stall),
+            )))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn wrote(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        written: Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<usize>> {
+        match written {
+            Poll::Ready(Ok(n)) => {
+                self.passed(n);
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => self.wait(cx),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watchdog<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut this.stream).poll_read(cx, buf) {
+            Poll::Ready(read) => {
+                this.passed(buf.filled().len() - before);
+                Poll::Ready(read)
+            }
+            Poll::Pending => this.wait(cx),
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watchdog<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.stream).poll_write(cx, buf);
+        this.wrote(cx, written)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
+        this.wrote(cx, written)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.stream).poll_flush(cx) {
+            Poll::Pending => this.wait(cx),
+            flushed => flushed,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }
 
@@ -275,7 +510,7 @@ async fn put_config(
     State(state): State<Shared>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Config>, ApiError> {
-    let config: Config = serde_json::from_slice(&body?).map_err(ApiError::bad)?;
+    let config = config::read(&body?)?;
     apply(move || state.config.update(config)).await
 }
 
@@ -328,23 +563,45 @@ async fn get_messages(
             return Err(ApiError::bad("to must be greater than from"));
         }
     }
-    let _slot = state.queries.acquire().await.map_err(ApiError::internal)?;
+    // Owned, so that it goes with the read if the client leaves mid-query,
+    // and then with the response until its bytes are written.
+    let slot = state
+        .queries
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
     let storage = state.storage.clone();
-    let page =
-        tokio::task::spawn_blocking(move || storage.query(from, to, after, limit, PAGE_BYTES))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)?;
-    let next = page
-        .more
-        .then(|| page.records.last().map(|r| r.seq))
-        .flatten();
-    let body = MessagesBody {
-        messages: page.records.iter().map(view::record).collect(),
-        next,
-    };
-    let json = serde_json::to_vec(&body).map_err(ApiError::internal)?;
+    let json = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
+        let page = storage.query(from, to, after, limit, PAGE_BYTES)?;
+        let next = page
+            .more
+            .then(|| page.records.last().map(|r| r.seq))
+            .flatten();
+        let body = MessagesBody {
+            messages: page.records.iter().map(view::record).collect(),
+            next,
+        };
+        let json = serde_json::to_vec(&body).map_err(io::Error::other)?;
+        Ok(Bytes::from_owner(JsonPage { json, _slot: slot }))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], json).into_response())
+}
+
+/// A page as JSON, holding the query slot until its bytes are freed, which
+/// hyper does once it has written them.
+struct JsonPage {
+    json: Vec<u8>,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for JsonPage {
+    fn as_ref(&self) -> &[u8] {
+        &self.json
+    }
 }
 
 #[derive(Serialize)]
@@ -430,6 +687,28 @@ async fn get_status(State(state): State<Shared>) -> Json<Value> {
 }
 
 impl Times {
+    /// Looks up the times for the log at `status` and the channels at
+    /// `cursors`. A lookup reads on from where the one before it left off,
+    /// and a channel keeps its lookup while nothing waits for it, so
+    /// following a channel costs about as much as reading what it delivered.
+    fn refresh(
+        &mut self,
+        storage: &Storage,
+        status: &storage::Status,
+        cursors: &BTreeMap<String, u64>,
+    ) {
+        if status.first_seq <= status.head_seq {
+            self.first.update(storage, status.first_seq);
+        }
+        self.waiting.retain(|name, _| cursors.contains_key(name));
+        for (name, &cursor) in cursors {
+            let lookup = self.waiting.entry(name.clone()).or_default();
+            if lag(status, cursor) > 0 {
+                lookup.update(storage, cursor.max(status.first_seq));
+            }
+        }
+    }
+
     /// The oldest retained record's receipt time, while the log holds one.
     fn first_ts(&self, storage: &storage::Status) -> Option<i64> {
         self.first
@@ -753,4 +1032,273 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
         e.finish(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    use axum::routing::put;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::storage::{Limits, Message, Writer};
+
+    /// A state whose log holds `records` messages of 1 000 bytes, received
+    /// at 0, 1, 2 and so on, in segments of 64 KiB.
+    fn state(dir: &Path, records: i64) -> Shared {
+        let limits = Limits {
+            max_bytes: 64 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(&dir.join("log"), limits).unwrap());
+        let mut writer = Writer::new(storage.clone());
+        for ts in 0..records {
+            let message = Message {
+                ts,
+                payload: vec![b'x'; 1000],
+            };
+            writer.append(&[message], false).unwrap();
+        }
+        writer.sync().unwrap();
+        let (queue, _) = storage::queue(16, 1 << 20);
+        Arc::new(AppState {
+            config: Arc::new(config::Store::new(
+                dir.join("config.json"),
+                Config::default(),
+            )),
+            boot: Arc::new(Config::default()),
+            storage,
+            queue: queue.depth(),
+            inbound: Arc::default(),
+            channels: Arc::default(),
+            started: Instant::now(),
+            last_error: ErrorSlot::default(),
+            queries: Arc::new(Semaphore::new(CONCURRENT_QUERIES)),
+            times: Mutex::default(),
+        })
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "not in time");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn a_channel_keeps_its_lookup_while_nothing_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 100);
+        let (storage, status) = (&state.storage, state.storage.status());
+        let mut times = Times::default();
+        let cursors = |cursor: u64| BTreeMap::from([("t".to_string(), cursor)]);
+        times.refresh(storage, &status, &cursors(50));
+        assert_eq!(times.waiting_ts("t", lag(&status, 50)), Some(49));
+        let mark = format!("{:?}", times.waiting["t"].mark);
+        // Caught up, it has no time to show, and the lookup stays where it
+        // was, for the next one to read on from.
+        let caught_up = status.head_seq + 1;
+        times.refresh(storage, &status, &cursors(caught_up));
+        assert_eq!(times.waiting_ts("t", lag(&status, caught_up)), None);
+        assert_eq!(format!("{:?}", times.waiting["t"].mark), mark);
+        // Behind again, it reads on from there.
+        times.refresh(storage, &status, &cursors(60));
+        assert_eq!(times.waiting_ts("t", lag(&status, 60)), Some(59));
+        // A channel that is gone takes its lookup with it.
+        times.refresh(storage, &status, &BTreeMap::new());
+        assert!(times.waiting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_query_holds_its_slot_until_its_response_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 100);
+        let query = Query(BTreeMap::from([("limit".to_string(), "1000".to_string())]));
+        let Ok(response) = get_messages(State(state.clone()), query).await else {
+            panic!("query failed");
+        };
+        // The response's bytes hold the slot, not the handler that made them.
+        assert_eq!(state.queries.available_permits(), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.len() > 100_000, "{}", body.len());
+        drop(body);
+        assert_eq!(state.queries.available_permits(), 1);
+    }
+
+    /// A pipe in place of a file, which a read waits on until it is opened
+    /// for writing; dropping this does that, also when a test fails, so
+    /// that the runtime, which waits for its blocking reads, can stop.
+    struct Pipe(PathBuf);
+
+    impl Pipe {
+        fn new(path: &Path) -> Pipe {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid path.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            Pipe(path.to_path_buf())
+        }
+    }
+
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            let path = self.0.clone();
+            // Waits for a reader on a thread of its own, which nothing joins.
+            std::thread::spawn(move || fs::OpenOptions::new().write(true).open(path));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_query_keeps_its_slot_until_its_read_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 100);
+        let first = dir.path().join("log/00000000000000000001.seg");
+        fs::rename(&first, dir.path().join("first.seg")).unwrap();
+        let pipe = Pipe::new(&first);
+        let query = tokio::spawn(get_messages(State(state.clone()), Query(BTreeMap::new())));
+        until(|| state.queries.available_permits() == 0).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The client goes away, as hyper then drops the handler, and the
+        // read goes on with the slot.
+        query.abort();
+        assert!(matches!(query.await, Err(e) if e.is_cancelled()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.queries.available_permits(), 0);
+        // Once the read ends, the slot is free.
+        drop(pipe);
+        until(|| state.queries.available_permits() == 1).await;
+    }
+
+    /// A server with `limits` in `dir`, which answers `/` with `ok`, sends
+    /// 4 MiB for `/big` and echoes what is put to `/echo`.
+    fn server(dir: &Path, limits: Serve) -> (Server, PathBuf) {
+        let path = dir.join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route("/big", get(|| async { vec![b'b'; 4 << 20] }))
+            .route("/echo", put(|body: Bytes| async move { body }));
+        (Server::spawn(listener, app, limits), path)
+    }
+
+    async fn get_root(stream: &mut UnixStream) {
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nhost: uevtd\r\n\r\n")
+            .await
+            .unwrap();
+    }
+
+    /// Reads the response to `get_root`; false if the connection ends first.
+    async fn answered(stream: &mut UnixStream) -> bool {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !got.ends_with(b"\r\n\r\nok") {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        true
+    }
+
+    /// Reads until the connection ends; how many bytes came.
+    async fn until_closed(stream: &mut UnixStream) -> usize {
+        let mut got = 0;
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return got,
+                Ok(n) => got += n,
+            }
+        }
+    }
+
+    const LONG: Duration = Duration::from_secs(60);
+
+    #[tokio::test]
+    async fn connections_past_the_limit_wait_until_one_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Serve {
+            connections: 2,
+            idle: LONG,
+            stall: LONG,
+        };
+        let (server, path) = server(dir.path(), limits);
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            let mut stream = UnixStream::connect(&path).await.unwrap();
+            get_root(&mut stream).await;
+            assert!(answered(&mut stream).await);
+            open.push(stream);
+        }
+        let mut third = UnixStream::connect(&path).await.unwrap();
+        get_root(&mut third).await;
+        let waited = tokio::time::timeout(Duration::from_millis(300), answered(&mut third)).await;
+        assert!(waited.is_err(), "answered past the limit");
+        drop(open.pop());
+        let answer = tokio::time::timeout(Duration::from_secs(5), answered(&mut third)).await;
+        assert!(answer.unwrap());
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn idle_connections_are_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Serve {
+            connections: 2,
+            idle: Duration::from_millis(200),
+            stall: LONG,
+        };
+        let (server, path) = server(dir.path(), limits);
+        // One that never sends a request, and one after its response.
+        let mut silent = UnixStream::connect(&path).await.unwrap();
+        let mut served = UnixStream::connect(&path).await.unwrap();
+        get_root(&mut served).await;
+        assert!(answered(&mut served).await);
+        for stream in [&mut silent, &mut served] {
+            let closed = tokio::time::timeout(Duration::from_secs(5), until_closed(stream)).await;
+            assert!(closed.is_ok(), "still open");
+        }
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_sending_or_reading_loses_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Serve {
+            connections: 1,
+            idle: LONG,
+            stall: Duration::from_secs(1),
+        };
+        let (server, path) = server(dir.path(), limits);
+        // A body that stops coming, and a response that is never read: each
+        // holds the one connection until it stalls for a second.
+        let requests: [&[u8]; 2] = [
+            b"PUT /echo HTTP/1.1\r\nhost: uevtd\r\ncontent-length: 100\r\n\r\nabc",
+            b"GET /big HTTP/1.1\r\nhost: uevtd\r\n\r\n",
+        ];
+        for request in requests {
+            let mut stuck = UnixStream::connect(&path).await.unwrap();
+            stuck.write_all(request).await.unwrap();
+            let mut next = UnixStream::connect(&path).await.unwrap();
+            get_root(&mut next).await;
+            let waited =
+                tokio::time::timeout(Duration::from_millis(200), answered(&mut next)).await;
+            assert!(
+                waited.is_err(),
+                "answered while the other connection held the slot"
+            );
+            let answer = tokio::time::timeout(Duration::from_secs(5), answered(&mut next)).await;
+            assert!(answer.unwrap());
+            assert!(until_closed(&mut stuck).await < 4 << 20);
+        }
+        server.stop().await;
+    }
 }

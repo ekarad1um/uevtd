@@ -67,8 +67,8 @@ pub async fn run(
                         let completed = match event {
                             Some(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
                                 connected = true;
+                                metrics.session_up();
                                 metrics.connected.store(true, Relaxed);
-                                metrics.last_error.clear();
                                 info!(outstanding = tracker.outstanding(), "connected");
                                 None
                             }

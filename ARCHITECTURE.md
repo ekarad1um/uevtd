@@ -278,6 +278,13 @@ eviction: the log grows past `max_bytes`, `/v1/health` fails with the error,
 which is also the log's `last_error`, and the error is logged once a minute,
 until the segment can be removed. Eviction then catches up at the next commit.
 
+Files are removed without the index lock, which status, metrics and readers
+take, the first two on the runtime's threads: removing a file can take long
+on a slow disk, and need not end on a stalled one. One eviction at a time
+marks the segments it will remove, removes their files, and then drops their
+entries under the lock. A reader that finds a marked segment's file gone
+meanwhile has found the segment evicted.
+
 ### 5.6 Recovery
 
 **Lock.** Before anything else the daemon takes an exclusive `flock` on `lock`
@@ -572,10 +579,14 @@ clients sharing one take turns. Without a configured id, a channel connects
 with the host name, read when the channel starts: it names the device, stays
 the same across restarts, and is what a broker's access rules and logs can
 refer to. Devices that share a broker therefore need distinct host names; those
-built from one image share theirs until they are given their own. Validation
-refuses two enabled channels that would connect to one host with the same id,
-configured or the host name, so a second channel to a broker needs a
-`client_id` (§7.2). A configured id is used exactly as given. A host without a
+built from one image share theirs until they are given their own. A change to
+the configuration may not make two enabled channels connect to one host with
+the same id, configured or the host name, so a second channel to a broker
+needs a `client_id` (§7.2). A configuration in which two channels share an id
+already still applies: one loaded at startup, or one saved before the host was
+renamed. Both channels run and take turns, and each shows the conflict in
+`last_error`, also while its session is up, which otherwise clears it. A
+configured id is used exactly as given. A host without a
 name, an empty one or Linux's `(none)`, which the kernel reports when nothing
 has set one, gets `uevtd` and 16 hex digits instead: a SipHash of the channel
 name and the process start time, keyed from the OS's random source once per
@@ -678,8 +689,13 @@ default; unknown fields are rejected so typos surface at validation time.
 
 ### 7.2 Validation
 
-Performed before anything is persisted or applied: socket paths non-empty and
-distinct; `max_message_bytes` in 1..=256 KiB and `max_connections` in 1..=256,
+Performed before anything is persisted or applied. The document, each of its
+sections, `channels` and each channel must be JSON objects: serde reads a
+struct from an array too, element by element, so `[]` would read as the
+defaults and `{"outbound": []}` as no channels. Then: socket paths non-empty,
+distinct, without U+0000, and at most 107 bytes, or 103 on macOS, as a socket
+address holds; `storage.path` without U+0000; `max_message_bytes` in 1..=256
+KiB and `max_connections` in 1..=256,
 with `max_connections × max_message_bytes` at most 16 MiB; `segment_bytes` in
 64 KiB..=256 MiB and at least `max_message_bytes + 48`, `max_bytes >= 2 *
 segment_bytes` and at most 1 TiB, `sync_interval_ms <= 60 000`; at most 8
@@ -691,7 +707,8 @@ handshake's own headers alone, `ca_file` only with `wss`, `timeout_ms` at least
 least 256; MQTT host and topic non-empty, topic has no wildcards, `client_id`
 non-empty when set, no two enabled channels connecting to one host with the
 same client id, configured or the host name (on any port, the host compared
-without case), topic, `client_id` and `username` at
+without case), unless they share it already (below), topic, `client_id` and
+`username` at
 most 65535 bytes and without U+0000, `password` at most 65535 bytes (MQTT
 strings have 16-bit lengths, which the library would truncate, and only the
 password is binary), `ca_file` only with `tls`, QoS in 0..=2, `keep_alive_s` in
@@ -701,15 +718,31 @@ The minimum sizes make room for a drop notice, and the bounds on sizes and
 counts are what bounds memory (section 11.1). A `ca_file` is not read at
 validation; a missing file shows when the channel connects (§6.5).
 
+Client ids are checked against the configuration in effect, and with the host
+name as it is at the check. A change (`PUT`, `PATCH`, `SIGHUP`) is refused if
+it makes two channels share an id that they do not share already; a change
+elsewhere is not, so a conflict that a renamed host brought blocks no other
+change. At startup nothing is in effect yet, and a conflict is reported
+instead of refused (§6.3): refusing would stop the daemon, and a supervisor
+would restart it in a loop.
+
 ### 7.3 Persistence and live update
 
 `PUT /v1/config` replaces the whole document; `PATCH /v1/config` applies an
 RFC 7386 merge patch to the current document (so a single field can be changed
 without resending secrets). Both validate, write the file atomically (temp
 file with mode 0600, fsync, rename, directory fsync), then publish the new
-configuration on a `watch` channel. A patch reads, merges and writes under one
-lock, so concurrent patches compose. `SIGHUP` re-reads the file and applies it
-the same way. An unchanged configuration is still republished, by `PUT`,
+configuration on a `watch` channel. Once the file is renamed into place, a
+failed directory sync is only a warning, since the file holds the new
+configuration either way. A link at the path is followed, and the file it
+points to is replaced, not the link. A link to a file that does not exist is
+never replaced, not even by the defaults at startup, which fails instead: its
+target may only be missing for now, as on a partition not mounted yet. A
+patch must be a JSON object; any other value would replace the whole
+document (RFC 7386), and `[]`, an empty JSON Patch (RFC 6902), would read as
+the defaults. A patch reads, merges and writes under one lock, so concurrent
+patches compose. `SIGHUP` re-reads the file, on the blocking pool, and applies
+it the same way. An unchanged configuration is still republished, by `PUT`,
 `PATCH` or `SIGHUP`, which is how a component retries an apply that failed
 earlier, such as a rebind. Components react to the fields they own:
 
@@ -757,6 +790,20 @@ cannot be confused and the response is always valid JSON. Request bodies are
 limited to 256 KiB (413 beyond that), and one query is read and serialized at a
 time while others wait.
 
+At most 16 connections are served at once. More wait in the socket's listen
+queue, where they hold none of the daemon's file descriptors, until one
+closes. A connection is closed once it has waited 10 s for a request's head,
+which covers one left idle between requests. It is also closed once a read or
+write has waited 60 s with no byte passing either way. That cuts off a client
+that stops sending its request or reading its response, and also a request
+that takes longer to answer, as on a stalled disk. Leaked connections thus
+cannot use up the descriptors that the log and the producers need; the daemon
+also raises its soft limit on open files to the hard one at startup, as a
+margin for what these bounds miss. A query holds its slot from its read until
+its response has been written, also when its client leaves first, so only one
+page at a time is held in memory. When the daemon stops, or the API moves to a
+new path, requests in progress have 5 s to finish.
+
 Example: `curl --unix-socket /run/uevtd/api.sock http://uevtd/v1/status`.
 
 ## 9. Observability
@@ -790,9 +837,11 @@ and for each channel that of the oldest record waiting for it, at its cursor or,
 if it lost the records before, at the oldest retained one. A task in the API
 looks them up once a second, so that a request never waits for the disk, and
 the values can be a second old. A lookup reads the record's segment, from its
-start or from where the previous lookup for the channel stopped in it. Following
-a channel that delivers therefore costs about as much as reading what it
-delivered, and a channel that waits costs nothing after the first lookup.
+start or from where the previous lookup for the channel stopped in it, which a
+channel keeps while nothing waits for it. Following a channel that delivers
+therefore costs about as much as reading what it delivered, whether it stays
+behind or keeps up, and a channel that waits costs nothing after the first
+lookup.
 
 **Health.** `/v1/health` fails with 503 from a failed write or sync until a
 batch is committed again, while one batch or sync has taken more than 30 s,
@@ -809,7 +858,7 @@ itself carries on.
 | Crash between delivery and cursor save    | Up to ~1 s of messages redelivered                                        |
 | Disk full / write error                   | Batch dropped, counted in `dropped`; file rolled back to its previous length; health fails until a batch is committed |
 | fsync error                               | Unsynced tail discarded, counted in `dropped`; segment sealed; nothing visible lost; health fails until a batch is committed |
-| A write or sync hangs (stalled disk)      | Producers block once the writer queue is full; health fails after 30 s    |
+| A write, sync or eviction hangs (stalled disk) | Producers block once the writer queue is full; health fails after 30 s; status and metrics still answer |
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1); the process supervisor, which a deployment must provide (README), starts it again |
 | Channel task panics                       | Reported in `last_error`; started again from its cursor after 1 s, doubling to 60 s while it makes no progress; `restarts` counts it |
@@ -829,7 +878,10 @@ itself carries on.
 | Another instance on the same log          | Startup fails at the log's lock, naming the holder's process id, before anything is changed |
 | Another instance already listening        | Startup fails; the socket file is not stolen                              |
 | Config file invalid at startup            | Startup fails with the validation error                                   |
-| Config file missing at startup            | Defaults are used and written to the path                                 |
+| Nothing at the config path at startup     | Defaults are used and written there                                       |
+| Config path is a link to a missing file   | Startup fails; the link is left alone, not replaced by defaults           |
+| Two channels share a client id in the config, as after the host was renamed | Loaded; both run, take turns on the broker and show it in `last_error`; a change that makes two share one is refused |
+| API clients leak connections or stop reading | At most 16 are served and the rest wait to be accepted; idle ones are closed after 10 s, stalled ones after 60 s |
 | Producer floods beyond disk bandwidth     | Writer queue fills, producers block on the socket; nothing dropped        |
 | Backwards clock step                      | Timestamps clamp to the previous value and are counted in `clock_steps`; logged if > 1 s |
 
@@ -837,11 +889,17 @@ itself carries on.
 
 Tokio multi-thread runtime. Tasks: inbound acceptor + one task per connection;
 one supervisor + one task per channel (+ one event-loop task per MQTT
-channel, one frame writer per WebSocket session); API server and its
-receipt-time lookup (§9); config applier.
-One OS thread: the log writer. Blocking file reads for channels and queries,
-and reading a CA file, run on `spawn_blocking`, with the reader handed in and
-out so cancellation never loses it.
+channel, one frame writer per WebSocket session); API acceptor + one task per
+connection, at most 16 (§8), and its receipt-time lookup (§9); config applier;
+`SIGHUP` handler.
+One OS thread: the log writer. Work that blocks runs on `spawn_blocking`: file
+reads for channels and queries, with the reader handed in and out so
+cancellation never loses it, and serializing a query's page; configuration
+saves and `SIGHUP`'s reload; cursor loads, saves and removals; reading a CA
+file. No file operation happens under the log's index lock, which status and
+metrics take on the runtime's threads (§5.5), nor under the channel registry's
+lock, which they take as well. A stalled disk under the log thus holds up
+what waits for it, but not the runtime: `/v1/health` keeps answering.
 
 Shutdown (SIGTERM/SIGINT): stop the inbound acceptor and cancel connection
 tasks; drop the writer's senders so it drains and syncs the queue, then join
@@ -863,8 +921,8 @@ Every buffer that holds messages has a byte bound:
 | Write batch | 1 MiB of encoded records, or one record | 1 MiB |
 | Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc; WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
 | Each log reader, and the API's receipt-time lookup | a 64 KiB read buffer, or one record if larger; a frame claiming more than 1 MiB is checked a chunk at a time, so a corrupt length costs no more | 64 KiB |
-| A query | one at a time: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
-| An API request | a 256 KiB body | small |
+| A query | one at a time, from its read until its response is written, also when its client has left: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
+| API connections | at most 16 (§8), each with hyper's read buffer of at most 408 KiB and a request body of at most 256 KiB | 11 MiB, with 16 large requests at once |
 
 The JSON of a query page, or of a WebSocket frame, can reach six times the
 payload for binary payloads (control bytes are escaped as `\u00XX`); valid JSON

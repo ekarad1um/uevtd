@@ -89,7 +89,7 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
         channels: registry.clone(),
         started: Instant::now(),
         last_error: Default::default(),
-        queries: Semaphore::new(api::CONCURRENT_QUERIES),
+        queries: Arc::new(Semaphore::new(api::CONCURRENT_QUERIES)),
         times: Default::default(),
     });
 
@@ -249,11 +249,78 @@ async fn apply_changes(
 async fn reload_on_hup(store: Arc<config::Store>, mut hup: Signal, token: CancellationToken) {
     loop {
         tokio::select! {
-            Some(()) = hup.recv() => match store.reload() {
-                Ok(_) => info!(path = %store.path().display(), "configuration reloaded from file"),
-                Err(e) => error!(error = %e, "reload failed; keeping current configuration"),
-            },
+            Some(()) = hup.recv() => reload(&store).await,
             _ = token.cancelled() => break,
         }
+    }
+}
+
+/// Re-reads the configuration file on the blocking pool: reading it, and
+/// waiting for a save that holds the store's lock across its syncs, would
+/// otherwise stop a thread of the runtime.
+async fn reload(store: &Arc<config::Store>) {
+    let task = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.reload())
+    };
+    match task.await {
+        Ok(Ok(_)) => info!(path = %store.path().display(), "configuration reloaded from file"),
+        Ok(Err(e)) => error!(error = %e, "reload failed; keeping current configuration"),
+        Err(e) => error!(error = %e, "reload task failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    use super::*;
+
+    #[test]
+    fn a_reload_leaves_the_runtime_free_while_it_waits_for_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // A pipe: reading it waits until it is opened for writing.
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let store = Arc::new(config::Store::new(path.clone(), Config::default()));
+        let ran = Arc::new(AtomicBool::new(false));
+        // After a second, notes whether the runtime ran meanwhile, and then
+        // writes the file.
+        let writer = {
+            let ran = ran.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                let ran = ran.load(SeqCst);
+                let mut config = Config::default();
+                config.storage.sync_interval_ms = 5;
+                std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+                ran
+            })
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let reloaded = tokio::spawn({
+                let store = store.clone();
+                async move { reload(&store).await }
+            });
+            let ran = ran.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                ran.store(true, SeqCst);
+            });
+            reloaded.await.unwrap();
+        });
+        assert!(
+            writer.join().unwrap(),
+            "the runtime's thread waited for the file"
+        );
+        assert_eq!(store.current().storage.sync_interval_ms, 5);
     }
 }

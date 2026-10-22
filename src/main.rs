@@ -15,7 +15,7 @@ const USAGE: &str = "\
 usage: uevtd [--config PATH]
 
   -c, --config PATH   configuration file (default: /etc/uevtd/config.json);
-                      written with defaults when it does not exist
+                      written with defaults when nothing is at the path
   -V, --version       print the version
   -h, --help          print this help";
 
@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         error!(%info, "panic");
         default_hook(info);
     }));
+    raise_file_limit();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -115,6 +116,38 @@ fn tune_allocator() {
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
+
+/// Raises the soft limit on open files to the hard one. The daemon's own
+/// limits keep it well below the usual 1024; this is the margin for what
+/// they miss, since the log writer and the producers are what fail when the
+/// descriptors run out (ARCHITECTURE.md §11).
+fn raise_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: the pointer is valid for the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+        || limit.rlim_cur >= limit.rlim_max
+        // macOS has no hard limit to report, and refuses more than its own.
+        || limit.rlim_max == libc::RLIM_INFINITY
+    {
+        return;
+    }
+    let soft = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
+        info!(
+            from = soft,
+            to = limit.rlim_max,
+            "raised the open file limit"
+        );
+    } else {
+        let e = std::io::Error::last_os_error();
+        warn!(error = %e, soft, hard = limit.rlim_max, "could not raise the open file limit");
+    }
+}
 
 fn usage_error(message: &str) -> ExitCode {
     eprintln!("uevtd: {message}\n{USAGE}");

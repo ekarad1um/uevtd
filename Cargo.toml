@@ -10,6 +10,10 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 crc32fast = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The API's connections (src/api.rs), served without axum::serve to bound
+# them; both are dependencies of axum, with these features, already.
+hyper = { version = "1.12", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["http1", "server", "service", "tokio"] }
 # The host name (src/config.rs) and allocator tuning on glibc (src/main.rs);
 # already a dependency of tokio.
 libc = "0.2"

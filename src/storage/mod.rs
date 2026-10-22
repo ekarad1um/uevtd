@@ -4,8 +4,10 @@
 //! Concurrency model: one writer (a dedicated thread) mutates files and the
 //! index; readers hold their own file handles and only read below the
 //! committed length published in the index, which covers synced data only.
-//! Eviction removes whole sealed segments under the index lock, and counts
-//! what channels lose by it under the same lock.
+//! Eviction removes whole sealed segments, their files outside the index
+//! lock and then their entries under it, and counts what channels lose by
+//! it under the same lock. No file operation happens under the index lock
+//! once the log is open.
 
 mod queue;
 mod segment;
@@ -119,8 +121,10 @@ struct Index {
     /// Channel positions kept for loss accounting, by [`Tail`] id.
     tails: BTreeMap<u64, TailState>,
     next_tail: u64,
-    /// When a failed eviction was last logged, while eviction fails.
-    evict_warned: Option<Instant>,
+    /// Segments below this are being evicted: their files are removed
+    /// outside the lock, and their entries go after. A reader that finds one
+    /// of their files gone has found it evicted.
+    evicting_below: u64,
 }
 
 impl Index {
@@ -140,6 +144,9 @@ pub struct Storage {
     /// Holds the log's lock while the log is open.
     _lock: File,
     index: Mutex<Index>,
+    /// Held by the eviction in progress, so that there is one at a time:
+    /// when its failure was last logged, while eviction fails.
+    eviction: Mutex<Option<Instant>>,
     max_bytes: AtomicU64,
     segment_bytes: AtomicU64,
     sync_interval_us: AtomicU64,
@@ -177,7 +184,7 @@ impl Storage {
             bytes: 0,
             tails: BTreeMap::new(),
             next_tail: 0,
-            evict_warned: None,
+            evicting_below: 0,
         };
         // Trailing files that hold no record are removed, so the previous
         // segment becomes the active one again. One that cannot be read
@@ -279,6 +286,7 @@ impl Storage {
             dir: dir.to_path_buf(),
             _lock: lock,
             index: Mutex::new(index),
+            eviction: Mutex::new(None),
             max_bytes: AtomicU64::new(limits.max_bytes),
             segment_bytes: AtomicU64::new(limits.segment_bytes),
             sync_interval_us: AtomicU64::new(micros(limits.sync_interval)),
@@ -288,7 +296,7 @@ impl Storage {
             busy_since: AtomicU64::new(0),
         };
         storage.metrics.corrupt_segments.fetch_add(damaged, Relaxed);
-        storage.evict(&mut storage.index.lock().unwrap());
+        storage.evict();
         Ok(storage)
     }
 
@@ -298,7 +306,7 @@ impl Storage {
         self.segment_bytes.store(limits.segment_bytes, Relaxed);
         self.sync_interval_us
             .store(micros(limits.sync_interval), Relaxed);
-        self.evict(&mut self.index.lock().unwrap());
+        self.evict();
     }
 
     pub fn sync_interval(&self) -> Duration {
@@ -557,14 +565,39 @@ impl Storage {
     /// records go first, so a segment that cannot be removed stops eviction:
     /// the log then grows past its limit, and its health fails, until the
     /// segment can be removed.
-    fn evict(&self, index: &mut Index) {
+    fn evict(&self) {
+        self.evict_with(|path| fs::remove_file(path));
+    }
+
+    /// [`Storage::evict`], with `remove` removing each file. The files go
+    /// without the index lock, which status and readers take on the
+    /// runtime's threads, since removing them can take long on a slow disk
+    /// or never end on a stalled one.
+    fn evict_with(&self, mut remove: impl FnMut(&Path) -> io::Result<()>) {
+        let mut warned = self.eviction.lock().unwrap();
         let max = self.max_bytes.load(Relaxed);
-        let mut evicted = false;
+        let victims: Vec<(u64, u64)> = {
+            let mut index = self.index.lock().unwrap();
+            let mut bytes = index.bytes;
+            let mut left = index.segments.len();
+            let mut victims = Vec::new();
+            for (&first_seq, segment) in &index.segments {
+                if bytes <= max || left <= 1 {
+                    break;
+                }
+                bytes -= segment.len;
+                left -= 1;
+                victims.push((first_seq, segment.len));
+            }
+            if let Some(&(last, _)) = victims.last() {
+                index.evicting_below = last + 1;
+            }
+            victims
+        };
+        let mut removed = 0;
         let mut failed = None;
-        while index.bytes > max && index.segments.len() > 1 {
-            let (&first_seq, segment) = index.segments.iter().next().expect("non-empty");
-            let len = segment.len;
-            match fs::remove_file(self.segment_path(first_seq)) {
+        for &(first_seq, _) in &victims {
+            match remove(&self.segment_path(first_seq)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
@@ -572,9 +605,16 @@ impl Storage {
                     break;
                 }
             }
-            index.segments.remove(&first_seq);
+            removed += 1;
+        }
+
+        let mut index = self.index.lock().unwrap();
+        index.evicting_below = 0;
+        for &(first_seq, len) in &victims[..removed] {
+            if index.segments.remove(&first_seq).is_none() {
+                continue;
+            }
             index.bytes -= len;
-            evicted = true;
             self.metrics.evictions.fetch_add(1, Relaxed);
             debug!(
                 segment = first_seq,
@@ -587,26 +627,23 @@ impl Storage {
             Some((segment, e)) => {
                 // Eviction runs at every commit; the error is logged at most
                 // once a minute.
-                if index
-                    .evict_warned
-                    .is_none_or(|t| t.elapsed() >= LOSS_WARN_INTERVAL)
-                {
+                if warned.is_none_or(|t| t.elapsed() >= LOSS_WARN_INTERVAL) {
                     error!(segment, error = %e, bytes = index.bytes, max_bytes = max,
                         "eviction failed; the log grows past max_bytes until the segment can be removed");
-                    index.evict_warned = Some(Instant::now());
+                    *warned = Some(Instant::now());
                 }
                 self.metrics
                     .evict_error
                     .set(format!("removing segment {segment}: {e}"));
             }
             None => {
-                if index.evict_warned.take().is_some() {
+                if warned.take().is_some() {
                     info!(bytes = index.bytes, max_bytes = max, "eviction works again");
                 }
                 self.metrics.evict_error.clear();
             }
         }
-        if evicted {
+        if removed > 0 {
             let first = index.first_seq();
             for tail in index.tails.values_mut().filter(|t| !t.reading) {
                 tail.claim(first);
@@ -1190,11 +1227,11 @@ impl Writer {
             let records = self.head_seq - index.head_seq;
             index.head_seq = self.head_seq;
             index.head_ts = self.head_ts;
-            self.storage.evict(&mut index);
             self.storage.metrics.records.fetch_add(records, Relaxed);
         }
         self.storage.metrics.bytes.fetch_add(added, Relaxed);
         self.storage.head.send_replace(self.head_seq);
+        self.storage.evict();
         Ok(())
     }
 
@@ -1466,6 +1503,8 @@ struct View {
     bound: u64,
     next_first_seq: Option<u64>,
     head_seq: u64,
+    /// Eviction is removing the segment.
+    evicting: bool,
 }
 
 struct Open {
@@ -1673,10 +1712,20 @@ impl Reader {
                     .next()
                     .map(|(k, _)| *k),
                 head_seq: index.head_seq,
+                evicting: first_seq < index.evicting_below,
             }
         };
         if self.current.as_ref().map(|o| o.first_seq) != Some(view.first_seq) {
-            let file = File::open(self.storage.segment_path(view.first_seq))?;
+            let file = match File::open(self.storage.segment_path(view.first_seq)) {
+                Ok(file) => file,
+                // Removed by eviction, which takes the entry once all its
+                // files are gone.
+                Err(e) if e.kind() == io::ErrorKind::NotFound && view.evicting => {
+                    let next = view.next_first_seq.unwrap_or(view.head_seq + 1);
+                    return Ok(Located::Evicted(next));
+                }
+                Err(e) => return Err(e),
+            };
             let mut cursor = SegmentCursor::new(file, HEADER_LEN as u64);
             loop {
                 match cursor.peek(view.bound)? {
@@ -3022,6 +3071,42 @@ mod tests {
         writer.append(&[msg(201, &payload)], true).unwrap();
         assert_eq!(storage.health(), Ok(()));
         assert!(storage.status().bytes <= 4000);
+    }
+
+    #[test]
+    fn eviction_removes_files_without_the_index_and_readers_find_them_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        write_records(&mut writer, 300);
+        let before = storage.status();
+        assert!(before.segments >= 4, "{before:?}");
+        let loss = Arc::new(Loss::default());
+        let tail = storage.tail("t", 1, loss.clone());
+        let mut reader = tail.reader(1);
+        storage.max_bytes.store(128 << 10, Relaxed);
+        let (mut removed, mut locked, mut read) = (0, false, None);
+        storage.evict_with(|path| {
+            // Status, readers and lookups go on while files are removed.
+            locked |= storage.index.try_lock().is_err();
+            fs::remove_file(path)?;
+            removed += 1;
+            if removed == 1 && !locked {
+                read = Some(reader.read(10, 1 << 20));
+            }
+            Ok(())
+        });
+        assert!(!locked, "the index was locked while a file was removed");
+        // A reader that finds a file gone before its entry finds the records
+        // evicted, and no error.
+        let batch = read.expect("a read").unwrap();
+        assert!(batch.records.is_empty() && batch.skipped > 0, "{batch:?}");
+        let after = storage.status();
+        assert!(after.bytes <= 128 << 10, "{after:?}");
+        assert_eq!(after.segments, before.segments - removed);
+        // Counted once: by the reader for its segment, by eviction for the
+        // rest.
+        assert_eq!(loss.records(), after.first_seq - 1);
+        assert_eq!(storage.health(), Ok(()));
     }
 
     #[test]

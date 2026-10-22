@@ -757,6 +757,39 @@ async fn concurrent_patches_compose() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_document_not_shaped_like_a_configuration_changes_nothing() {
+    let receiver = Receiver::start(listen().await, None);
+    let env = Env::new();
+    let daemon = env.start(env.config(&receiver.url)).await;
+    let cursor = env.base().storage.path.join("cursors/t");
+    wait_for(Duration::from_secs(10), || async { cursor.exists() }).await;
+    // An empty JSON Patch, a section as an array, and an array for the
+    // whole: serde would read each as a configuration without channels.
+    for (method, body) in [
+        (reqwest::Method::PATCH, "[]"),
+        (reqwest::Method::PATCH, r#"{"outbound": []}"#),
+        (reqwest::Method::PUT, "[]"),
+    ] {
+        let response = daemon
+            .client
+            .request(method.clone(), "http://uevtd/v1/config")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{method} {body}"
+        );
+    }
+    let (_, config) = daemon.get("/v1/config").await;
+    assert!(config["outbound"]["channels"]["t"].is_object(), "{config}");
+    assert!(cursor.exists());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn refuses_to_steal_a_live_socket() {
     let receiver = Receiver::start(listen().await, None);
     let env = Env::new();
@@ -1294,6 +1327,73 @@ async fn mqtt_channels_connect_with_the_host_name_or_their_own_id() {
         ids.push(next_client_id(&mut events).await);
     }
     assert_eq!(ids, ["uevtd", host_name.as_str()]);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_id_shared_at_startup_is_reported_not_refused() {
+    let host_name = host_name();
+    let listener = listen().await;
+    let addr = listener.local_addr().unwrap();
+    let mut events = broker(listener, None, false);
+    let env = Env::new();
+    // As a file saved while the host had no name: now both channels connect
+    // with the name it has.
+    let mut config = env.base();
+    for (name, topic) in [("a", "dev/a"), ("b", "dev/b")] {
+        config
+            .outbound
+            .channels
+            .insert(name.into(), Channel::Mqtt(mqtt(addr, topic)));
+    }
+    config::save(&env.config_path, &config).unwrap();
+    let daemon = env.start(config::load(&env.config_path).unwrap()).await;
+    for _ in 0..2 {
+        assert_eq!(next_client_id(&mut events).await, host_name);
+    }
+    let conflict = |name: &'static str| {
+        let daemon = &daemon;
+        async move {
+            let channel = daemon.channel(name).await;
+            let message = channel["last_error"]["message"].as_str().unwrap_or("");
+            message.contains("channels a and b both connect")
+        }
+    };
+    // Shown while a session is up, which would otherwise clear it.
+    for name in ["a", "b"] {
+        wait_for(Duration::from_secs(5), || async {
+            daemon.channel(name).await["connected"] == true && conflict(name).await
+        })
+        .await;
+    }
+
+    // A change elsewhere is taken; a third channel that would share the id
+    // is not.
+    let (status, body) = daemon
+        .patch(json!({"inbound": {"max_connections": 32}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = daemon
+        .patch(json!({"outbound": {"channels": {"c": {
+            "type": "mqtt",
+            "host": addr.ip().to_string(),
+            "port": addr.port(),
+            "topic": "dev/c",
+        }}}}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("channels a and c"), "{error}");
+
+    // An id of its own for one of them resolves it, for both.
+    let (status, body) = daemon
+        .patch(json!({"outbound": {"channels": {"b": {"client_id": "b"}}}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next_client_id(&mut events).await, "b");
+    for name in ["a", "b"] {
+        wait_for(Duration::from_secs(5), || async { !conflict(name).await }).await;
+    }
     daemon.stop().await;
 }
 

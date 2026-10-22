@@ -18,7 +18,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
-use crate::config::{Channel, Config};
+use crate::config::{self, Channel, Config};
 use crate::metrics::ErrorSlot;
 use crate::storage::{Batch, Loss, Reader, Record, Storage, Tail};
 
@@ -50,6 +50,10 @@ pub struct ChannelMetrics {
     /// Drop notices the target acknowledged.
     pub notices: AtomicU64,
     pub last_error: ErrorSlot,
+    /// While the channel shares its client id with another, why. The two
+    /// take turns on the broker, so `last_error` shows it while a session is
+    /// up, rather than nothing.
+    conflict: Mutex<Option<String>>,
 }
 
 impl ChannelMetrics {
@@ -68,6 +72,38 @@ impl ChannelMetrics {
             lost: Arc::default(),
             notices: AtomicU64::new(0),
             last_error: ErrorSlot::default(),
+            conflict: Mutex::default(),
+        }
+    }
+
+    /// Clears `last_error` once a session is up, unless the channel shares
+    /// its client id, which it then shows instead.
+    pub fn session_up(&self) {
+        match self.conflict.lock().unwrap().as_ref() {
+            Some(conflict) => self.last_error.set(conflict),
+            None => self.last_error.clear(),
+        }
+    }
+
+    /// Records whether the channel shares its client id; true when that is
+    /// new.
+    fn set_conflict(&self, conflict: Option<&String>) -> bool {
+        let mut slot = self.conflict.lock().unwrap();
+        if slot.as_ref() == conflict {
+            return false;
+        }
+        let old = std::mem::replace(&mut *slot, conflict.cloned());
+        match conflict {
+            Some(conflict) => {
+                self.last_error.set(conflict);
+                true
+            }
+            None => {
+                if let Some(old) = old {
+                    self.last_error.clear_if(|message| message == old);
+                }
+                false
+            }
         }
     }
 
@@ -255,22 +291,33 @@ async fn reconcile(
     // so do disabling and removing it, which leave it stopped.
     waiting.retain(|name, w| desired.get(name) == Some(&w.config));
 
-    {
+    let removed: Vec<String> = {
         let mut registry = registry.lock().unwrap();
         let removed: Vec<String> = registry
             .keys()
             .filter(|k| !desired.contains_key(*k))
             .cloned()
             .collect();
-        for name in removed {
-            registry.remove(&name);
-            if let Err(e) = storage.remove_cursor(&name) {
-                warn!(channel = %name, error = %e, "could not remove cursor");
-            }
-            info!(channel = %name, "channel removed");
+        for name in &removed {
+            registry.remove(name);
         }
+        removed
+    };
+    // Off the runtime's threads, and without the registry, which status
+    // and metrics take there.
+    for name in removed {
+        let (storage, file) = (storage.clone(), name.clone());
+        match tokio::task::spawn_blocking(move || storage.remove_cursor(&file)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(channel = %name, error = %e, "could not remove cursor"),
+            Err(e) => error!(channel = %name, error = %e, "cursor removal task failed"),
+        }
+        info!(channel = %name, "channel removed");
     }
 
+    // Validation refuses a change that makes two channels share a client id,
+    // but one loaded at startup may, or one saved before the host was renamed.
+    let conflicts = config::client_id_conflicts(desired);
     let now = tokio::time::Instant::now();
     for (name, channel) in desired {
         let metrics = {
@@ -283,6 +330,9 @@ async fn reconcile(
             }
             entry.clone()
         };
+        if metrics.set_conflict(conflicts.get(name)) {
+            error!(channel = %name, error = %conflicts[name], "client id shared with another channel");
+        }
         metrics.enabled.store(channel.enabled(), Relaxed);
         if !channel.enabled() {
             // Shows where a channel disabled since startup will resume.
