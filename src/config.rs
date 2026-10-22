@@ -142,7 +142,8 @@ pub struct Mqtt {
     /// PEM certificates trusted instead of the platform's store.
     pub ca_file: Option<PathBuf>,
     pub topic: String,
-    pub client_id: String,
+    /// Generated for the channel when `None` (ARCHITECTURE.md §6.3).
+    pub client_id: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub qos: u8,
@@ -163,7 +164,7 @@ impl Default for Mqtt {
             tls: false,
             ca_file: None,
             topic: String::new(),
-            client_id: "uevtd".into(),
+            client_id: None,
             username: None,
             password: None,
             qos: 1,
@@ -326,6 +327,22 @@ impl Config {
             match channel {
                 Channel::WebSocket(c) => validate_websocket(name, c)?,
                 Channel::Mqtt(c) => validate_mqtt(name, c)?,
+            }
+        }
+        // A broker disconnects a client when another connects with its id,
+        // on any of its ports, so two such channels would take turns.
+        let mut client_ids = BTreeMap::new();
+        for (name, channel) in &self.outbound.channels {
+            let Channel::Mqtt(c) = channel else { continue };
+            let (true, Some(id)) = (c.enabled, &c.client_id) else {
+                continue;
+            };
+            if let Some(other) = client_ids.insert((c.host.to_ascii_lowercase(), id), name) {
+                return Err(Error::Invalid(format!(
+                    "channels {other} and {name} both connect to {} as client_id {id:?}; \
+                     a broker disconnects one when the other connects",
+                    c.host
+                )));
             }
         }
 
@@ -513,9 +530,27 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
         !c.topic.is_empty() && rumqttc::valid_topic(&c.topic),
         || format!("channel {name}: topic must be a non-empty publish topic without wildcards"),
     )?;
-    ensure(!c.client_id.is_empty(), || {
-        format!("channel {name}: client_id must not be empty")
+    ensure(c.client_id.as_ref().is_none_or(|id| !id.is_empty()), || {
+        format!("channel {name}: client_id must not be empty; leave it out for a generated one")
     })?;
+    // MQTT strings carry a 16-bit length, which the library truncates
+    // silently, and a broker closes the connection on U+0000 in one; the
+    // password is binary. Either would end every session, and in the topic
+    // every publish.
+    for (field, value) in [
+        ("topic", Some(&c.topic)),
+        ("client_id", c.client_id.as_ref()),
+        ("username", c.username.as_ref()),
+    ] {
+        ensure(
+            value.is_none_or(|v| v.len() <= 65_535 && !v.contains('\0')),
+            || format!("channel {name}: {field} must be at most 65535 bytes, without U+0000"),
+        )?;
+    }
+    ensure(
+        c.password.as_ref().is_none_or(|p| p.len() <= 65_535),
+        || format!("channel {name}: password must be at most 65535 bytes"),
+    )?;
     ensure(c.qos <= 2, || {
         format!("channel {name}: qos must be 0, 1 or 2")
     })?;
@@ -911,6 +946,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown variant `http`"), "{err}");
+    }
+
+    #[test]
+    fn mqtt_channels_are_validated() {
+        let check = |channels: &[(&str, &Mqtt)]| {
+            let mut config = Config::default();
+            for (name, c) in channels {
+                let c = Channel::Mqtt((*c).clone());
+                config.outbound.channels.insert(name.to_string(), c);
+            }
+            config.validate()
+        };
+        let base = |host: &str, port, client_id: Option<&str>| Mqtt {
+            host: host.into(),
+            port,
+            topic: "t".into(),
+            client_id: client_id.map(Into::into),
+            ..Mqtt::default()
+        };
+
+        // Generated client ids never collide. Explicit ones may not on one
+        // host, whatever the port or the case of the host name, unless one
+        // of the channels is disabled.
+        let generated = base("h", 1883, None);
+        let x = base("h", 1883, Some("x"));
+        assert!(check(&[("a", &generated), ("b", &generated)]).is_ok());
+        assert!(check(&[("a", &x), ("b", &generated)]).is_ok());
+        assert!(check(&[("a", &x), ("b", &base("g", 1883, Some("x")))]).is_ok());
+        let err = check(&[("a", &x), ("b", &base("H", 8883, Some("x")))]).unwrap_err();
+        assert!(err.to_string().contains("channels a and b"), "{err}");
+        let disabled = Mqtt {
+            enabled: false,
+            ..x.clone()
+        };
+        assert!(check(&[("a", &x), ("b", &disabled)]).is_ok());
+        assert!(check(&[("a", &base("h", 1883, Some("")))]).is_err());
+
+        // MQTT strings have 16-bit lengths and no U+0000, but the password
+        // is binary.
+        let field = |f: &dyn Fn(&mut Mqtt)| {
+            let mut c = generated.clone();
+            f(&mut c);
+            check(&[("a", &c)])
+        };
+        let long = "x".repeat(65_536);
+        assert!(field(&|c| c.topic = long[1..].into()).is_ok());
+        assert!(field(&|c| c.topic = long.clone()).is_err());
+        assert!(field(&|c| c.topic = "a\0b".into()).is_err());
+        assert!(field(&|c| c.client_id = Some(long.clone())).is_err());
+        assert!(field(&|c| c.client_id = Some("a\0".into())).is_err());
+        assert!(field(&|c| c.username = Some("a\0".into())).is_err());
+        assert!(field(&|c| c.password = Some("a\0".into())).is_ok());
+        assert!(field(&|c| c.password = Some(long.clone())).is_err());
     }
 
     #[test]

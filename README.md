@@ -76,7 +76,7 @@ delivery cursor, so renaming a channel starts it afresh at the current head.
         "tls": true,
         "ca_file": "/etc/uevtd/broker-ca.pem",
         "topic": "devices/42/events",
-        "client_id": "uevtd-42",
+        "client_id": null,
         "username": "device",
         "password": "secret",
         "qos": 1,
@@ -128,6 +128,11 @@ Notes:
   256) are rejected: a notice is published in their place. Keep it below the
   broker's packet limit, since MQTT 3.1.1 cannot tell an oversized packet from a
   lost connection.
+- MQTT `client_id`: without one, a channel connects as `uevtd` and 16 hex
+  digits, logged when the channel starts. The id stays the same until the
+  daemon restarts and differs for every channel and device, so they never take
+  over each other's session on a broker. Set it when the broker expects a fixed
+  id; two enabled channels to the same host cannot share one.
 - Reconnects of both channels back off from 1 s to 60 s, and the wait shortens
   again only once the target acknowledges something: a target that accepts
   connections but takes nothing is retried less and less often. `retries`

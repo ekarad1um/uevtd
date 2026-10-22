@@ -848,6 +848,49 @@ implementation of the protocol, and it acknowledges each frame 2 s late, which k
 window full. Peaks were 5.5 MiB idle, 31.3 MiB with the defaults and 53.3 MiB with every limit
 at its maximum, against 6.0, 30.5 and 53.8 MiB with HTTP channels.
 
+**Step 5, MQTT client id (2026-10-21).** Fixed L10.
+
+- `client_id` is optional and `null` by default. Without one, a channel connects as `uevtd` and
+  16 hex digits. The digits are a SipHash of the channel name and the process start time, keyed
+  from the OS's random source once per process. A channel keeps its id across sessions and
+  restarts while the daemon runs, and gets a new one when the daemon restarts, which clean
+  sessions allow. The form, 21 letters and digits, is within the 1 to 23 that every MQTT 3.1.1
+  broker must accept, and the channel logs the id when it starts.
+- This departs from the suggestion above to derive the default from the host name and the
+  channel name. Devices built from one image share a host name, and on a public broker (Q6) a
+  predictable id can collide with another user's.
+- Validation rejects two enabled channels with the same configured `client_id` on one host.
+  The port does not matter, since a broker's client ids span its listeners, and disabled
+  channels are exempt. Host names are compared without case; aliases such as `localhost` and
+  `127.0.0.1` go undetected. An empty `client_id` is refused, with a hint to leave it out.
+- Found while checking how rumqttc encodes the id: it writes the 16-bit length of every MQTT
+  string unchecked, and nothing rejected U+0000, which MQTT forbids in strings. Validation now
+  bounds `topic`, `client_id` and `username` to 65535 bytes without U+0000, and `password`,
+  which is binary, to 65535 bytes. What the previous build did with mosquitto 2.0.21:
+  - With U+0000 in the topic or the client id, the broker closed every connection, and the
+    channel never delivered.
+  - With a topic of 70 000 bytes, each attempt published the message under the first 4 464
+    bytes of the topic (70 000 mod 65 536). It then failed on the PUBACK for a packet id read
+    from the topic ("unsolicited ack pkid: 30840"). Three copies went to the wrong topic in 8 s.
+- The examples in README.md and `contrib/config.example.json` now have `"client_id": null`,
+  since a copied example with a fixed id would recreate the problem.
+
+Verified with unit tests and an end-to-end test. The unit tests cover the generated id's form,
+stability and distinctness, an explicit id used as given, and the validation rules. In the
+end-to-end test the test broker reports each CONNECT's client id: a second channel gets an id
+of its own, a channel restarted by a configuration change keeps its id, and an explicit id is
+used as given. macOS and Linux: 75 unit and 14 end-to-end tests pass; on Linux 25 of 25
+repeated end-to-end runs pass.
+
+Against mosquitto 2.0.21, over about 12 s each:
+
+| Setup | Build | Result |
+|-------|-------|--------|
+| One daemon, two channels to one broker, no `client_id` | new | Two distinct ids at the broker, no retries |
+| Two daemons, standing in for two devices, no `client_id` | new | Two distinct ids, no takeovers, no retries |
+| The same | previous | Both as `uevtd`: 8 takeovers ("Client uevtd already connected, closing old connection"), 4 retries each |
+| `client_id` `dev42` on two channels to one host, ports 18830 and 18831 | new | Refused at startup, naming both channels |
+
 ## Appendix: probes
 
 These ran in a temporary crate outside the repository that depended on `uevtd` by path, so the review

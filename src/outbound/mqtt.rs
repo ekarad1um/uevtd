@@ -4,9 +4,10 @@
 //! records that are skipped (ARCHITECTURE.md §6.3).
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime};
 
 use rumqttc::{
     AsyncClient, ConnectionError, Event, MqttOptions, Outgoing, Packet, QoS, TlsConfiguration,
@@ -25,6 +26,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn run(
     cfg: config::Mqtt,
+    name: String,
     mut feed: Feed,
     mut cursor: CursorStore,
     metrics: Arc<ChannelMetrics>,
@@ -41,11 +43,15 @@ pub async fn run(
     let mut attempt = 0u32;
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    info!(host = %cfg.host, port = cfg.port, topic = %cfg.topic, qos = cfg.qos, "forwarding over mqtt");
+    let client_id = client_id(&cfg, &name);
+    info!(
+        host = %cfg.host, port = cfg.port, topic = %cfg.topic, qos = cfg.qos, client_id = %client_id,
+        "forwarding over mqtt"
+    );
 
     'run: loop {
         let failure = 'session: {
-            let (client, mut events) = match connect(&cfg, limit).await {
+            let (client, mut events) = match connect(&cfg, &client_id, limit).await {
                 Ok(session) => session,
                 Err(e) => break 'session e,
             };
@@ -103,12 +109,33 @@ pub async fn run(
     cursor.flush(true).await;
 }
 
+/// The configured client id, or `uevtd` and 16 hex digits: distinct for every
+/// channel and process, and within the 23 letters and digits that every MQTT
+/// 3.1.1 broker must accept. A channel keeps it when it restarts.
+fn client_id(cfg: &config::Mqtt, channel: &str) -> String {
+    // Keys from the OS's random source, drawn once per process. The start
+    // time goes in as well, in case that source is weak early in boot.
+    static KEYS: LazyLock<(RandomState, SystemTime)> =
+        LazyLock::new(|| (RandomState::new(), SystemTime::now()));
+    match &cfg.client_id {
+        Some(id) => id.clone(),
+        None => {
+            let (keys, started) = &*KEYS;
+            format!("uevtd{:016x}", keys.hash_one((channel, started)))
+        }
+    }
+}
+
 type Events = mpsc::Receiver<Result<Event, ConnectionError>>;
 
 /// Builds a client and drives its event loop on a task that forwards events;
 /// the task ends on the first connection error or when the receiver is dropped.
-async fn connect(cfg: &config::Mqtt, limit: usize) -> Result<(AsyncClient, Events), String> {
-    let mut options = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
+async fn connect(
+    cfg: &config::Mqtt,
+    client_id: &str,
+    limit: usize,
+) -> Result<(AsyncClient, Events), String> {
+    let mut options = MqttOptions::new(client_id, cfg.host.clone(), cfg.port);
     options
         .set_keep_alive(Duration::from_secs(cfg.keep_alive_s.max(1)))
         .set_clean_session(true)
@@ -369,6 +396,22 @@ mod tests {
 
     const RECORD: Option<Completed> = Some(Completed::Record);
     const NOTICE: Option<Completed> = Some(Completed::Notice);
+
+    #[test]
+    fn generated_client_ids_are_short_distinct_and_stable() {
+        let cfg = config::Mqtt::default();
+        let a = client_id(&cfg, "a");
+        assert_eq!(a.len(), 21, "{a}");
+        assert!(a.starts_with("uevtd"), "{a}");
+        assert!(a[5..].bytes().all(|b| b.is_ascii_hexdigit()), "{a}");
+        assert_eq!(client_id(&cfg, "a"), a);
+        assert_ne!(client_id(&cfg, "b"), a);
+        let fixed = config::Mqtt {
+            client_id: Some("device-42".into()),
+            ..cfg
+        };
+        assert_eq!(client_id(&fixed, "a"), "device-42");
+    }
 
     #[test]
     fn qos1_in_order() {

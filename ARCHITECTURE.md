@@ -479,6 +479,18 @@ once, even while an earlier publish is still outstanding.
 With `tls` the connection uses the TLS configuration of §6.5. Username and
 password, client id, keep-alive, QoS and retain are configurable.
 
+A broker disconnects a client when another connects with its client id, so two
+clients sharing one take turns. Without a configured id, a channel connects as
+`uevtd` and 16 hex digits: a SipHash of the channel name and the process start
+time, keyed from the OS's random source once per process. Every session of the
+channel uses the same id while the process runs, ids differ across channels
+and devices, and the form, 21 letters and digits, is one that every MQTT 3.1.1
+broker must accept (up to 23). The host name would not do: devices built from
+one image share it, and on a public broker a predictable id can collide with
+someone else's. Sessions are clean, so nothing depends on the id surviving a
+restart. Validation rejects two enabled channels with the same configured id
+on one host (§7.2).
+
 ### 6.4 Reconciliation
 
 The supervisor diffs the configured channel map against the running tasks on
@@ -538,7 +550,7 @@ connection failure. Client certificates are not supported.
         "tls": true,
         "ca_file": null,
         "topic": "uevtd/events",
-        "client_id": "uevtd",
+        "client_id": null,
         "username": null,
         "password": null,
         "qos": 1,
@@ -570,13 +582,17 @@ WebSocket URL parses with scheme `ws` or `wss`, no credentials (they belong in
 `headers`) and no fragment, header names and values parse and leave the
 handshake's own headers alone, `ca_file` only with `wss`, `timeout_ms` at least
 1, `keep_alive_s` in 1..=65535, `inflight` in 1..=1024, `max_frame_bytes` at
-least 256; MQTT host and topic non-empty, topic has no wildcards, `ca_file`
-only with `tls`, QoS in 0..=2, `keep_alive_s` in 1..=65535 (the protocol field
-is 16 bits), `inflight` in 1..=1024, `max_packet_bytes` at least 256; log
-filter parses as a `tracing` directive. The minimum sizes make room for a drop
-notice, and the bounds on sizes and counts are what bounds memory (section
-11.1). A `ca_file` is not read at validation; a missing file shows when the
-channel connects (§6.5).
+least 256; MQTT host and topic non-empty, topic has no wildcards, `client_id`
+non-empty when set and not shared by two enabled channels to one host (on any
+port, the host compared without case), topic, `client_id` and `username` at
+most 65535 bytes and without U+0000, `password` at most 65535 bytes (MQTT
+strings have 16-bit lengths, which the library would truncate, and only the
+password is binary), `ca_file` only with `tls`, QoS in 0..=2, `keep_alive_s` in
+1..=65535 (the protocol field is 16 bits), `inflight` in 1..=1024,
+`max_packet_bytes` at least 256; log filter parses as a `tracing` directive.
+The minimum sizes make room for a drop notice, and the bounds on sizes and
+counts are what bounds memory (section 11.1). A `ca_file` is not read at
+validation; a missing file shows when the channel connects (§6.5).
 
 ### 7.3 Persistence and live update
 
@@ -670,6 +686,7 @@ adds the last error per component with its timestamp and the
 | Cursor file unreadable                    | Channel replays from the oldest retained record                            |
 | Target down for longer than retention     | Evicted messages counted as lost and logged as they are evicted; once the target is back, the channel sends a notice in their place and continues at the oldest available |
 | Broker or receiver drops the session      | Unacknowledged messages sent again (duplicates possible), order preserved |
+| Another client connects with the MQTT client id | The broker drops the older session, so the two take turns; generated ids avoid it, and validation rejects one configured id on two channels to a host (§6.3) |
 | Target accepts connections but takes nothing | Reconnects back off to once a minute; the cursor stays; `retries` and `last_error` show it |
 | Receiver stops answering pings            | Session ends after `timeout_ms`; reconnect with backoff                   |
 | TLS verification fails, e.g. a wrong clock | Connection fails, reported in `last_error`, retried with backoff          |

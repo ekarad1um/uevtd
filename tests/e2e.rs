@@ -846,7 +846,8 @@ struct Publish {
 }
 
 enum BrokerEvent {
-    Connected(Instant),
+    /// When, and the client id.
+    Connected(Instant, String),
     Published(Publish),
 }
 
@@ -900,10 +901,13 @@ where
         let mut body = vec![0; len];
         stream.read_exact(&mut body).await?;
         match header >> 4 {
-            // CONNECT: accepted.
+            // CONNECT: accepted. The client id follows the protocol name,
+            // level, flags and keep-alive.
             1 => {
                 stream.write_all(&[0x20, 2, 0, 0]).await?;
-                let _ = tx.send(BrokerEvent::Connected(Instant::now()));
+                let len = usize::from(u16::from_be_bytes([body[10], body[11]]));
+                let client_id = String::from_utf8(body[12..12 + len].to_vec()).unwrap();
+                let _ = tx.send(BrokerEvent::Connected(Instant::now(), client_id));
             }
             // PUBLISH: topic, a packet id for QoS 1, then the payload.
             3 if drop_publishes => return Ok(()),
@@ -948,8 +952,16 @@ async fn next_publish(events: &mut mpsc::UnboundedReceiver<BrokerEvent>) -> Publ
 
 async fn next_connection(events: &mut mpsc::UnboundedReceiver<BrokerEvent>) -> Instant {
     loop {
-        if let BrokerEvent::Connected(at) = broker_event(events).await {
+        if let BrokerEvent::Connected(at, _) = broker_event(events).await {
             return at;
+        }
+    }
+}
+
+async fn next_client_id(events: &mut mpsc::UnboundedReceiver<BrokerEvent>) -> String {
+    loop {
+        if let BrokerEvent::Connected(_, client_id) = broker_event(events).await {
+            return client_id;
         }
     }
 }
@@ -1062,6 +1074,47 @@ async fn mqtt_reconnects_back_off_while_the_broker_takes_nothing() {
     let channel = daemon.channel("m").await;
     assert_eq!(channel["delivered"], 0);
     assert!(channel["retries"].as_u64().unwrap() >= 2);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_channels_connect_with_client_ids_of_their_own() {
+    let listener = listen().await;
+    let addr = listener.local_addr().unwrap();
+    let mut events = broker(listener, None, false);
+    let env = Env::new();
+    let mut config = env.base();
+    config
+        .outbound
+        .channels
+        .insert("a".into(), Channel::Mqtt(mqtt(addr, "dev/a")));
+    let daemon = env.start(config).await;
+    let a = next_client_id(&mut events).await;
+    assert_eq!(a.len(), 21, "{a}");
+    assert!(a.starts_with("uevtd"), "{a}");
+
+    // A second channel to the same broker gets an id of its own, a channel
+    // restarted by a configuration change keeps its id, and an explicit one
+    // is used as given.
+    let b = json!({
+        "type": "mqtt",
+        "host": addr.ip().to_string(),
+        "port": addr.port(),
+        "topic": "dev/b"
+    });
+    let patches = [
+        json!({"outbound": {"channels": {"b": b}}}),
+        json!({"outbound": {"channels": {"a": {"topic": "dev/a2"}}}}),
+        json!({"outbound": {"channels": {"b": {"client_id": "device-42"}}}}),
+    ];
+    let mut ids = Vec::new();
+    for patch in patches {
+        assert_eq!(daemon.patch(patch).await.0, StatusCode::OK);
+        ids.push(next_client_id(&mut events).await);
+    }
+    assert_ne!(ids[0], a);
+    assert_eq!(ids[1], a);
+    assert_eq!(ids[2], "device-42");
     daemon.stop().await;
 }
 

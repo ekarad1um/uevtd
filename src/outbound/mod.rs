@@ -157,7 +157,15 @@ async fn reconcile(
                 websocket::run(c, feed, cursor, metrics.clone(), token.clone()).instrument(span),
             ),
             Channel::Mqtt(c) => tokio::spawn(
-                mqtt::run(c, feed, cursor, metrics.clone(), token.clone()).instrument(span),
+                mqtt::run(
+                    c,
+                    name.clone(),
+                    feed,
+                    cursor,
+                    metrics.clone(),
+                    token.clone(),
+                )
+                .instrument(span),
             ),
         };
         metrics.running.store(true, Relaxed);

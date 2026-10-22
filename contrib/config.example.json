@@ -32,7 +32,7 @@
         "tls": true,
         "ca_file": null,
         "topic": "devices/42/events",
-        "client_id": "uevtd-42",
+        "client_id": null,
         "username": null,
         "password": null,
         "qos": 1,

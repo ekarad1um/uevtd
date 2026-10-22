@@ -43,6 +43,14 @@ error names the field and its allowed range.
   `storage.sync_interval_ms` is at most 60000.
 - At most 8 channels. MQTT `inflight` is at most 1024 (before: 32767), and MQTT
   `max_packet_bytes` at least 256 (before: 1), so that a notice fits.
+- MQTT `client_id` is `null` by default (before: `"uevtd"`). The channel then
+  connects as `uevtd` and 16 hex digits, unique to the channel and the running
+  daemon, and logs the id when it starts. A configuration file saved by an
+  earlier version holds `"client_id": "uevtd"`, since the daemon writes every
+  field; set it to `null`, or to an id of your own.
+- Two enabled MQTT channels to the same host may not share a `client_id`, on
+  any port. MQTT `topic`, `client_id`, `username` and `password` are at most
+  65535 bytes, and only `password` may contain U+0000.
 - An MQTT message above `max_packet_bytes` stays rejected, but the cursor now
   passes it once its notice is acknowledged, not at once. A channel passes
   messages evicted before delivery the same way, once their notice is
@@ -70,6 +78,13 @@ error names the field and its allowed range.
   logged when they are evicted. Before, they were counted only once the
   channel delivered again, so the loss stayed invisible during an outage and
   for good if the target never came back.
+- Two MQTT channels on one broker, or two devices with the default
+  configuration, no longer disconnect each other in turn. They all connected as
+  `uevtd`, and a broker drops a client when another connects with its id.
+- An MQTT topic or client id that MQTT cannot carry broke the channel for good.
+  With U+0000 in it, the broker closed every connection. A topic longer than
+  65535 bytes was cut short on the wire, so every attempt published the message
+  under a truncated topic and then failed on the acknowledgement.
 - An MQTT broker that accepts the connection and then drops it, for example on
   the first publish, was retried once a second without end. Reconnects now back
   off to once a minute, and the wait shortens again only when the broker
