@@ -3,10 +3,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -142,7 +144,7 @@ pub struct Mqtt {
     /// PEM certificates trusted instead of the platform's store.
     pub ca_file: Option<PathBuf>,
     pub topic: String,
-    /// Generated for the channel when `None` (ARCHITECTURE.md §6.3).
+    /// The host name when `None`; see [`Mqtt::client_id`].
     pub client_id: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -174,6 +176,45 @@ impl Default for Mqtt {
             max_packet_bytes: 1 << 20,
         }
     }
+}
+
+impl Mqtt {
+    /// The client id the channel `name` connects with: the configured one
+    /// as given, or else the host name (ARCHITECTURE.md §6.3).
+    pub fn client_id(&self, name: &str) -> String {
+        self.client_id_on(host_name().as_deref(), name)
+    }
+
+    /// The client id on a host named `host_name`. A host without a name gets
+    /// `uevtd` and 16 hex digits, distinct for every channel and process, and
+    /// within the 23 letters and digits that every MQTT 3.1.1 broker accepts.
+    fn client_id_on(&self, host_name: Option<&str>, name: &str) -> String {
+        // Keys from the OS's random source, drawn once per process. The start
+        // time goes in as well, in case that source is weak early in boot.
+        static KEYS: LazyLock<(RandomState, SystemTime)> =
+            LazyLock::new(|| (RandomState::new(), SystemTime::now()));
+        match (&self.client_id, host_name) {
+            (Some(id), _) => id.clone(),
+            (None, Some(host_name)) => host_name.to_string(),
+            (None, None) => {
+                let (keys, started) = &*KEYS;
+                format!("uevtd{:016x}", keys.hash_one((name, started)))
+            }
+        }
+    }
+}
+
+/// The host's name, unless it has none: an empty one, or Linux's `(none)`,
+/// which the kernel reports when nothing has set it.
+fn host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for writes of its whole length.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..len]).into_owned();
+    (!name.is_empty() && name != "(none)").then_some(name)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,22 +370,7 @@ impl Config {
                 Channel::Mqtt(c) => validate_mqtt(name, c)?,
             }
         }
-        // A broker disconnects a client when another connects with its id,
-        // on any of its ports, so two such channels would take turns.
-        let mut client_ids = BTreeMap::new();
-        for (name, channel) in &self.outbound.channels {
-            let Channel::Mqtt(c) = channel else { continue };
-            let (true, Some(id)) = (c.enabled, &c.client_id) else {
-                continue;
-            };
-            if let Some(other) = client_ids.insert((c.host.to_ascii_lowercase(), id), name) {
-                return Err(Error::Invalid(format!(
-                    "channels {other} and {name} both connect to {} as client_id {id:?}; \
-                     a broker disconnects one when the other connects",
-                    c.host
-                )));
-            }
-        }
+        check_client_ids(&self.outbound.channels, host_name().as_deref())?;
 
         tracing_subscriber::EnvFilter::try_new(&self.log.filter)
             .map_err(|e| Error::Invalid(format!("log.filter: {e}")))?;
@@ -516,6 +542,38 @@ fn validate_websocket(name: &str, c: &WebSocket) -> Result<(), Error> {
     })
 }
 
+/// Refuses two enabled MQTT channels that would connect to one host with the
+/// same client id, configured or the default for `host_name`. A broker
+/// disconnects a client when another connects with its id, on any of its
+/// ports, so the two would take turns.
+fn check_client_ids(
+    channels: &BTreeMap<String, Channel>,
+    host_name: Option<&str>,
+) -> Result<(), Error> {
+    let mut ids = BTreeMap::new();
+    for (name, channel) in channels {
+        let Channel::Mqtt(c) = channel else { continue };
+        if !c.enabled {
+            continue;
+        }
+        let key = (c.host.to_ascii_lowercase(), c.client_id_on(host_name, name));
+        let default = c.client_id.is_none();
+        if let Some((other, other_default)) = ids.insert(key.clone(), (name, default)) {
+            let which = if default || other_default {
+                ", the host name used without a client_id"
+            } else {
+                ""
+            };
+            return Err(Error::Invalid(format!(
+                "channels {other} and {name} both connect to {} as client_id {:?}{which}; \
+                 a broker disconnects one when the other connects",
+                c.host, key.1
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
     ensure(!c.host.is_empty(), || {
         format!("channel {name}: host must not be empty")
@@ -531,7 +589,7 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
         || format!("channel {name}: topic must be a non-empty publish topic without wildcards"),
     )?;
     ensure(c.client_id.as_ref().is_none_or(|id| !id.is_empty()), || {
-        format!("channel {name}: client_id must not be empty; leave it out for a generated one")
+        format!("channel {name}: client_id must not be empty; leave it out for the host name")
     })?;
     // MQTT strings carry a 16-bit length, which the library truncates
     // silently, and a broker closes the connection on U+0000 in one; the
@@ -966,27 +1024,44 @@ mod tests {
             ..Mqtt::default()
         };
 
-        // Generated client ids never collide. Explicit ones may not on one
-        // host, whatever the port or the case of the host name, unless one
-        // of the channels is disabled.
-        let generated = base("h", 1883, None);
+        // Two channels may not connect to one host with the same client id,
+        // whatever the port or the case of the host name, unless one of them
+        // is disabled. Without a client_id a channel uses the host name, so
+        // two such channels collide; on a host without a name each gets an
+        // id of its own.
+        let ids = |channels: &[(&str, &Mqtt)], host_name| {
+            let channels: BTreeMap<String, Channel> = channels
+                .iter()
+                .map(|(name, c)| (name.to_string(), Channel::Mqtt((*c).clone())))
+                .collect();
+            check_client_ids(&channels, host_name)
+        };
+        let default = base("h", 1883, None);
         let x = base("h", 1883, Some("x"));
-        assert!(check(&[("a", &generated), ("b", &generated)]).is_ok());
-        assert!(check(&[("a", &x), ("b", &generated)]).is_ok());
-        assert!(check(&[("a", &x), ("b", &base("g", 1883, Some("x")))]).is_ok());
-        let err = check(&[("a", &x), ("b", &base("H", 8883, Some("x")))]).unwrap_err();
+        let dev = Some("dev42");
+        assert!(ids(&[("a", &x), ("b", &default)], dev).is_ok());
+        assert!(ids(&[("a", &x), ("b", &base("g", 1883, Some("x")))], dev).is_ok());
+        let err = ids(&[("a", &x), ("b", &base("H", 8883, Some("x")))], dev).unwrap_err();
         assert!(err.to_string().contains("channels a and b"), "{err}");
         let disabled = Mqtt {
             enabled: false,
             ..x.clone()
         };
-        assert!(check(&[("a", &x), ("b", &disabled)]).is_ok());
+        assert!(ids(&[("a", &x), ("b", &disabled)], dev).is_ok());
+        let err = ids(&[("a", &default), ("b", &default)], dev).unwrap_err();
+        assert!(
+            err.to_string().contains("\"dev42\", the host name"),
+            "{err}"
+        );
+        let named = base("h", 1883, Some("dev42"));
+        assert!(ids(&[("a", &named), ("b", &default)], dev).is_err());
+        assert!(ids(&[("a", &default), ("b", &default)], None).is_ok());
         assert!(check(&[("a", &base("h", 1883, Some("")))]).is_err());
 
         // MQTT strings have 16-bit lengths and no U+0000, but the password
         // is binary.
         let field = |f: &dyn Fn(&mut Mqtt)| {
-            let mut c = generated.clone();
+            let mut c = default.clone();
             f(&mut c);
             check(&[("a", &c)])
         };
@@ -999,6 +1074,26 @@ mod tests {
         assert!(field(&|c| c.username = Some("a\0".into())).is_err());
         assert!(field(&|c| c.password = Some("a\0".into())).is_ok());
         assert!(field(&|c| c.password = Some(long.clone())).is_err());
+    }
+
+    #[test]
+    fn client_ids_default_to_the_host_name() {
+        let default = Mqtt::default();
+        assert_eq!(default.client_id_on(Some("dev42"), "a"), "dev42");
+        // A configured id is used as given, the old default too.
+        let saved = Mqtt {
+            client_id: Some("uevtd".into()),
+            ..Mqtt::default()
+        };
+        assert_eq!(saved.client_id_on(Some("dev42"), "a"), "uevtd");
+        // On a host without a name: 21 letters and digits, distinct for
+        // every channel, and the same while the process runs.
+        let a = default.client_id_on(None, "a");
+        assert_eq!(a.len(), 21, "{a}");
+        assert!(a.starts_with("uevtd"), "{a}");
+        assert!(a[5..].bytes().all(|b| b.is_ascii_hexdigit()), "{a}");
+        assert_eq!(default.client_id_on(None, "a"), a);
+        assert_ne!(default.client_id_on(None, "b"), a);
     }
 
     #[test]

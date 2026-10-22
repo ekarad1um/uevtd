@@ -64,13 +64,16 @@ error names the field and its allowed range.
 - At most 8 channels. MQTT `inflight` is at most 1024 (before: 32767), and MQTT
   `max_packet_bytes` at least 256 (before: 1), so that a notice fits.
 - MQTT `client_id` is `null` by default (before: `"uevtd"`). The channel then
-  connects as `uevtd` and 16 hex digits, unique to the channel and the running
-  daemon, and logs the id when it starts. A configuration file saved by an
-  earlier version holds `"client_id": "uevtd"`, since the daemon writes every
-  field; set it to `null`, or to an id of your own.
-- Two enabled MQTT channels to the same host may not share a `client_id`, on
-  any port. MQTT `topic`, `client_id`, `username` and `password` are at most
-  65535 bytes, and only `password` may contain U+0000.
+  connects with the host name, or as `uevtd` and 16 hex digits on a host
+  without a name, and logs the id when it starts. A configured id is used as
+  given: a configuration file saved by an earlier version holds
+  `"client_id": "uevtd"`, since the daemon writes every field, and keeps
+  connecting as `uevtd` until it is set to `null`.
+- Two enabled MQTT channels to the same host may not connect with the same
+  client id, on any port, whether it is configured or the host name: a second
+  channel to one broker needs a `client_id`. MQTT `topic`, `client_id`,
+  `username` and `password` are at most 65535 bytes, and only `password` may
+  contain U+0000.
 - An MQTT message above `max_packet_bytes` stays rejected, but the cursor now
   passes it once its notice is acknowledged, not at once. A channel passes
   messages evicted before delivery the same way, once their notice is
@@ -112,9 +115,10 @@ error names the field and its allowed range.
   records are numbered past anything the unreadable part could hold. A sealed
   segment that cannot be opened is retried by the channels and reported in
   `last_error`.
-- Two MQTT channels on one broker, or two devices with the default
-  configuration, no longer disconnect each other in turn. They all connected as
-  `uevtd`, and a broker drops a client when another connects with its id.
+- Two devices with the default configuration and distinct host names no
+  longer disconnect each other in turn on a broker, and two channels of one
+  daemon can no longer be configured to. They all connected as `uevtd`, and a
+  broker drops a client when another connects with its id.
 - An MQTT topic or client id that MQTT cannot carry broke the channel for good.
   With U+0000 in it, the broker closed every connection. A topic longer than
   65535 bytes was cut short on the wire, so every attempt published the message

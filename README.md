@@ -151,11 +151,15 @@ Notes:
   256) are rejected: a notice is published in their place. Keep it below the
   broker's packet limit, since MQTT 3.1.1 cannot tell an oversized packet from a
   lost connection.
-- MQTT `client_id`: without one, a channel connects as `uevtd` and 16 hex
-  digits, logged when the channel starts. The id stays the same until the
-  daemon restarts and differs for every channel and device, so they never take
-  over each other's session on a broker. Set it when the broker expects a fixed
-  id; two enabled channels to the same host cannot share one.
+- MQTT `client_id`: without one, a channel connects with the host name, so
+  devices that share a broker need host names of their own. The id is logged
+  when the channel starts. A configured `client_id` is used exactly as given,
+  including a `"uevtd"` saved by an earlier version. Two enabled channels to the
+  same host cannot connect with the same id, so a second channel to a broker
+  needs a `client_id`. A host without a name, an empty one or `(none)`, connects
+  as `uevtd` and 16 hex digits instead, new at every start. MQTT 3.1.1 brokers
+  need only accept ids of up to 23 letters and digits; one that refuses the host
+  name says so in `last_error`, and then the channel needs a `client_id`.
 - Reconnects of both channels back off from 1 s to 60 s, and the wait shortens
   again only once the target acknowledges something: a target that accepts
   connections but takes nothing is retried less and less often. `retries`

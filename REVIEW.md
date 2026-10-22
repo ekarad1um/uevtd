@@ -1022,6 +1022,45 @@ nothing more stays unhealthy even once the disk has recovered. The first lookup 
 waiting time reads its segment from the start, up to `segment_bytes`. A real backward clock step was
 tested only by the unit test, since the dev container cannot set its clock.
 
+**Step 8, the host name as MQTT client id (2026-10-21).** Revisits step 5 on your decision: a
+channel without a `client_id` connects with the host name, and a configured id is used exactly as
+given, including a `"uevtd"` saved by an earlier version.
+
+- The host name comes from `gethostname`, read when the channel starts, so a renamed host applies
+  from the channel's next start. `libc`, a dependency on glibc only so far, is one on every target
+  now; it was in the tree already, through tokio.
+- A host without a name, an empty one or Linux's `(none)`, which the kernel reports when nothing has
+  set one, falls back to step 5's generated id.
+- Validation compares the ids the channels will connect with, the host name included. Two enabled
+  MQTT channels to one host without a `client_id` are refused, since they would take turns, and so
+  is a configured id equal to the host name beside a channel without one. The message names the host
+  name. Such a configuration loaded under step 5, whose generated ids kept the channels apart; it is
+  refused at startup now.
+- What step 5 avoided returns as a requirement: devices that share a broker need distinct host
+  names, or a `client_id` each. Devices built from one image share their host name until they are
+  given their own, and on a public broker a host name can collide with another user's id. MQTT 3.1.1
+  obliges brokers to accept 23 letters and digits only, so a strict one may refuse a longer host
+  name, or one with `-` or `.`; the refusal shows in `last_error`.
+
+Verified with unit tests and an end-to-end test. The unit tests cover the id (the host name, a
+configured id as given, the old default, and the fallback's form) and the duplicate rules for a
+given host name and for a host without one. The end-to-end test takes the host name from `uname -n`
+and checks that the test broker sees it, that a second channel without an id and one given the host
+name are refused, that `"uevtd"` is used as given, and that a channel restarted by a configuration
+change keeps its id. Each fix's test fails when the old behaviour is put back. macOS and Linux: 88
+unit and 15 end-to-end tests pass; on Linux 25 of 25 repeated end-to-end runs and 15 of 15 unit runs
+pass.
+
+Against mosquitto 2.0.21 on Linux, where `uname -n` is `dev`:
+
+| Setup | Result |
+|-------|--------|
+| One channel without a `client_id` | The broker saw `dev` |
+| A second channel to the broker without one, by `PATCH` | 400: "channels m and n both connect to 127.0.0.1 as client_id "dev", the host name used without a client_id" |
+| The same with `"client_id": "uevtd"` | Applied; the broker saw `uevtd` |
+| A second daemon on the same host without a `client_id`, for 8 s | 5 takeovers, as for two devices with one host name |
+| A configuration file with two channels to the broker and no `client_id` | Startup refused, exit status 1, with the same message |
+
 ## Appendix: probes
 
 These ran in a temporary crate outside the repository that depended on `uevtd` by path, so the review

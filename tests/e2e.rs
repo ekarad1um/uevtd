@@ -1198,8 +1198,25 @@ async fn mqtt_reconnects_back_off_while_the_broker_takes_nothing() {
     daemon.stop().await;
 }
 
+/// The host name, as `uname` reports it.
+fn host_name() -> String {
+    let out = std::process::Command::new("uname")
+        .arg("-n")
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .trim_end()
+        .to_string()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn mqtt_channels_connect_with_client_ids_of_their_own() {
+async fn mqtt_channels_connect_with_the_host_name_or_their_own_id() {
+    let host_name = host_name();
+    assert!(
+        !host_name.is_empty() && host_name != "(none)",
+        "{host_name:?}"
+    );
     let listener = listen().await;
     let addr = listener.local_addr().unwrap();
     let mut events = broker(listener, None, false);
@@ -1210,32 +1227,39 @@ async fn mqtt_channels_connect_with_client_ids_of_their_own() {
         .channels
         .insert("a".into(), Channel::Mqtt(mqtt(addr, "dev/a")));
     let daemon = env.start(config).await;
-    let a = next_client_id(&mut events).await;
-    assert_eq!(a.len(), 21, "{a}");
-    assert!(a.starts_with("uevtd"), "{a}");
+    // Without a client_id, a channel connects with the host name.
+    assert_eq!(next_client_id(&mut events).await, host_name);
 
-    // A second channel to the same broker gets an id of its own, a channel
-    // restarted by a configuration change keeps its id, and an explicit one
-    // is used as given.
-    let b = json!({
-        "type": "mqtt",
-        "host": addr.ip().to_string(),
-        "port": addr.port(),
-        "topic": "dev/b"
-    });
+    // A second channel to the broker would connect with it as well, and
+    // validation refuses that, whether the id is left out or given.
+    let b = |client_id: Value| {
+        json!({"outbound": {"channels": {"b": {
+            "type": "mqtt",
+            "host": addr.ip().to_string(),
+            "port": addr.port(),
+            "topic": "dev/b",
+            "client_id": client_id,
+        }}}})
+    };
+    for id in [Value::Null, json!(host_name)] {
+        let (status, body) = daemon.patch(b(id)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("channels a and b"), "{error}");
+    }
+
+    // A configured id is used as given, the old default too, and a channel
+    // restarted by a configuration change keeps its id.
     let patches = [
-        json!({"outbound": {"channels": {"b": b}}}),
+        b(json!("uevtd")),
         json!({"outbound": {"channels": {"a": {"topic": "dev/a2"}}}}),
-        json!({"outbound": {"channels": {"b": {"client_id": "device-42"}}}}),
     ];
     let mut ids = Vec::new();
     for patch in patches {
         assert_eq!(daemon.patch(patch).await.0, StatusCode::OK);
         ids.push(next_client_id(&mut events).await);
     }
-    assert_ne!(ids[0], a);
-    assert_eq!(ids[1], a);
-    assert_eq!(ids[2], "device-42");
+    assert_eq!(ids, ["uevtd", host_name.as_str()]);
     daemon.stop().await;
 }
 

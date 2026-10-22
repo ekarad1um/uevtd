@@ -10,6 +10,9 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 crc32fast = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The host name (src/config.rs) and allocator tuning on glibc (src/main.rs);
+# already a dependency of tokio.
+libc = "0.2"
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls"] }
 rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -22,10 +25,6 @@ tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }
 url = "2"
-
-# Allocator tuning on glibc (src/main.rs); already a dependency of tokio.
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 # The API client of the end-to-end tests.

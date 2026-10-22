@@ -522,16 +522,22 @@ With `tls` the connection uses the TLS configuration of §6.5. Username and
 password, client id, keep-alive, QoS and retain are configurable.
 
 A broker disconnects a client when another connects with its client id, so two
-clients sharing one take turns. Without a configured id, a channel connects as
-`uevtd` and 16 hex digits: a SipHash of the channel name and the process start
-time, keyed from the OS's random source once per process. Every session of the
-channel uses the same id while the process runs, ids differ across channels
-and devices, and the form, 21 letters and digits, is one that every MQTT 3.1.1
-broker must accept (up to 23). The host name would not do: devices built from
-one image share it, and on a public broker a predictable id can collide with
-someone else's. Sessions are clean, so nothing depends on the id surviving a
-restart. Validation rejects two enabled channels with the same configured id
-on one host (§7.2).
+clients sharing one take turns. Without a configured id, a channel connects
+with the host name, read when the channel starts: it names the device, stays
+the same across restarts, and is what a broker's access rules and logs can
+refer to. Devices that share a broker therefore need distinct host names; those
+built from one image share theirs until they are given their own. Validation
+refuses two enabled channels that would connect to one host with the same id,
+configured or the host name, so a second channel to a broker needs a
+`client_id` (§7.2). A configured id is used exactly as given. A host without a
+name, an empty one or Linux's `(none)`, which the kernel reports when nothing
+has set one, gets `uevtd` and 16 hex digits instead: a SipHash of the channel
+name and the process start time, keyed from the OS's random source once per
+process, distinct for every channel and device but new at every start.
+Sessions are clean, so nothing on the broker depends on the id. MQTT 3.1.1
+obliges brokers to accept ids of up to 23 letters and digits only; a broker
+that refuses a longer host name, or one with `-` or `.`, refuses the
+connection, which shows in `last_error`.
 
 ### 6.4 Reconciliation
 
@@ -637,8 +643,9 @@ WebSocket URL parses with scheme `ws` or `wss`, no credentials (they belong in
 handshake's own headers alone, `ca_file` only with `wss`, `timeout_ms` at least
 1, `keep_alive_s` in 1..=65535, `inflight` in 1..=1024, `max_frame_bytes` at
 least 256; MQTT host and topic non-empty, topic has no wildcards, `client_id`
-non-empty when set and not shared by two enabled channels to one host (on any
-port, the host compared without case), topic, `client_id` and `username` at
+non-empty when set, no two enabled channels connecting to one host with the
+same client id, configured or the host name (on any port, the host compared
+without case), topic, `client_id` and `username` at
 most 65535 bytes and without U+0000, `password` at most 65535 bytes (MQTT
 strings have 16-bit lengths, which the library would truncate, and only the
 password is binary), `ca_file` only with `tls`, QoS in 0..=2, `keep_alive_s` in
@@ -766,7 +773,7 @@ daemon itself carries on.
 | Cursor file unreadable                    | Channel replays from the oldest retained record                            |
 | Target down for longer than retention     | Evicted messages counted as lost and logged as they are evicted; once the target is back, the channel sends a notice in their place and continues at the oldest available |
 | Broker or receiver drops the session      | Unacknowledged messages sent again (duplicates possible), order preserved |
-| Another client connects with the MQTT client id | The broker drops the older session, so the two take turns; generated ids avoid it, and validation rejects one configured id on two channels to a host (§6.3) |
+| Another client connects with the MQTT client id | The broker drops the older session, so the two take turns; validation refuses one id, the host name included, on two channels to a host, and devices on one broker need distinct host names (§6.3) |
 | Target accepts connections but takes nothing | Reconnects back off to once a minute; the cursor stays; `retries` and `last_error` show it |
 | Receiver stops answering pings            | Session ends after `timeout_ms`; reconnect with backoff                   |
 | TLS verification fails, e.g. a wrong clock | Connection fails, reported in `last_error`, retried with backoff          |
@@ -872,6 +879,7 @@ full:
 | tracing, tracing-subscriber| logging with reloadable filter                           |
 | crc32fast                  | record checksums                                         |
 | thiserror, anyhow          | error types / top-level error context                    |
+| libc                       | the host name, and allocator tuning on glibc; a dependency of tokio already |
 
 No database, no mmap, no custom allocator, no date-time crate. reqwest is a
 development dependency only, as the API client of the end-to-end tests.
