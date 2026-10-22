@@ -284,6 +284,7 @@ async fn get_status(State(state): State<Shared>) -> Json<Value> {
                     "delivered": m.delivered.load(Relaxed),
                     "rejected": m.rejected.load(Relaxed),
                     "retries": m.retries.load(Relaxed),
+                    "restarts": m.restarts.load(Relaxed),
                     "lost": m.lost.records(),
                     "notices": m.notices.load(Relaxed),
                     "last_error": m.last_error.get(),
@@ -425,7 +426,7 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
     e.family(
         "uevtd_storage_corrupt_segments_total",
         "counter",
-        "Segments skipped because of corruption",
+        "Segments whose remainder was skipped as corrupt or unreadable",
     )
     .value(sm.corrupt_segments.load(Relaxed));
     e.family(
@@ -436,7 +437,7 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
     .value(sm.clock_steps.load(Relaxed));
 
     let channels = state.channels.lock().unwrap();
-    let families: [(&str, &str, &str, Sample<'_>); 9] = [
+    let families: [(&str, &str, &str, Sample<'_>); 10] = [
         (
             "uevtd_channel_enabled",
             "gauge",
@@ -472,6 +473,12 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
             "counter",
             "Reconnections after a failed connection or a lost session",
             &|m| m.retries.load(Relaxed),
+        ),
+        (
+            "uevtd_channel_restarts_total",
+            "counter",
+            "Starts after the channel's task ended on its own",
+            &|m| m.restarts.load(Relaxed),
         ),
         (
             "uevtd_channel_lost_total",

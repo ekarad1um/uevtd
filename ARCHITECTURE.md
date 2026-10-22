@@ -190,7 +190,8 @@ a corrupted payload.
    that was ever delivered or returned by a query is never reused.
 5. A sealed segment's committed length is its file length. The active segment
    is validated on open; a torn tail (crash mid-write) is truncated to the last
-   complete, CRC-valid record.
+   complete, CRC-valid record, and what remains is synced before it becomes
+   visible.
 
 ### 5.4 Write path
 
@@ -253,16 +254,36 @@ applies to the next rotation.
 
 On open: list `*.seg`, validate each header against its file name, index
 `(first_seq -> base_ts, len)`. Sealed segments are trusted structurally
-(`len` = file size); every record is still CRC-checked when read. The active
-segment is scanned in full; the first invalid or incomplete record ends it and
-the file is truncated there with a warning. Head sequence and timestamp come
-from the last valid record (or from `base_ts` and `first_seq - 1` for an empty
-active segment). Trailing files that hold no record at all (a crash between
-creating a segment and its first write) are removed so the previous segment
-becomes active again. A segment whose header is unreadable is kept, its records
-are verified on read, and it is never chosen as the start of a time-range scan
-(its `base_ts` is treated as infinite, so scans begin one segment earlier).
-Startup cost is one segment scan (8 MiB), independent of log size.
+(`len` = file size); every record is still CRC-checked when read. A sealed
+segment that cannot be opened does not stop the startup: it is indexed from its
+file size, and readers retry it and report the error (§5.7), so a permission
+mistake can be fixed without losing anything. A segment whose header is
+unreadable is kept, its records are verified on read, and it is never chosen as
+the start of a time-range scan (its `base_ts` is treated as infinite, so scans
+begin one segment earlier).
+
+The active segment is scanned in full; the first invalid or incomplete record
+ends it and the file is truncated there with a warning. The segment is then
+synced before any of its records becomes visible: after a crash of the daemon,
+not of the system, records that were written but not synced are still in the
+page cache, and a power loss after their delivery could take them back. Head
+sequence and timestamp come from the last valid record (or from `base_ts` and
+`first_seq - 1` for an empty active segment). Trailing files that hold no
+record at all (a crash between creating a segment and its first write) are
+removed so the previous segment becomes active again; one that cannot be read
+is kept, since what it holds is unknown. Startup cost is one segment scan
+(8 MiB), independent of log size.
+
+A read error in the active segment, such as a bad sector, ends it like an
+invalid record, except that the records after the failure may have been
+committed and delivered, so their sequence numbers must not be used again.
+Recovery therefore creates the next segment, durably, at the head plus the
+number of records the unreadable rest could hold (its length over the 24-byte
+frame header), and only then cuts the damaged file back to its valid prefix.
+The records in between count as lost for every channel that had not delivered
+them, with a notice in their place; the count is an upper bound. The segment is
+counted in `corrupt_segments`. Opening the active segment still has to succeed,
+since the daemon appends to it.
 
 A corrupt record inside a sealed segment (bit rot) is logged with its offset;
 the reader skips the remainder of that segment and continues with the next,
@@ -501,6 +522,18 @@ WebSocket channel also sends a close frame; the new task sends the
 unacknowledged messages again. Channel identity is the map key, and the key
 names the cursor file, so renaming a channel starts it at the head.
 
+The supervisor also waits on the channel tasks. A channel task ends only when
+it is cancelled, so one that ends on its own, which only a panic should
+cause, is reported: `running` becomes false, `last_error` holds the panic
+message, and the error is logged. The channel is started again from its
+persisted cursor after 1 s, doubling to 60 s each time it ends again without
+progress, the same rule as for reconnects (§6.1). Progress means moving the
+cursor past the highest position reached before: the persisted cursor can
+lag by up to a second, and sending those records again proves nothing. A
+record that makes the channel panic is thus retried once a minute, not in a
+loop, and holds back only that channel. `restarts` counts these starts. A
+new definition for the channel ends the wait at once.
+
 ### 6.5 TLS
 
 Both channels use rustls through one configuration (`src/tls.rs`). By default
@@ -665,7 +698,8 @@ events are `debug`/`trace`.
 demand. Gauges: active connections, storage bytes/segments/head/first seq,
 per-channel cursor, lag and connected state. Counters: messages, bytes,
 truncated, oversized, rejected connections, batches, write errors, evictions,
-corrupt records, per-channel delivered, rejected, retries, lost, notices.
+corrupt records, per-channel delivered, rejected, retries, restarts, lost,
+notices.
 `lost` grows when records are evicted, not when the channel next reads
 (§5.9), and `lag` counts only records still in the log. `/v1/status`
 adds the last error per component with its timestamp and the
@@ -681,6 +715,9 @@ adds the last error per component with its timestamp and the
 | fsync error                               | Unsynced tail discarded and counted; segment sealed; nothing visible lost |
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1) so the service manager restarts it |
+| Channel task panics                       | Reported in `last_error`; started again from its cursor after 1 s, doubling to 60 s while it makes no progress; `restarts` counts it |
+| Read error in the active segment at startup | Records before it kept; the next segment starts past what the rest could hold, which is counted as lost |
+| Sealed segment cannot be opened at startup | Startup continues; readers retry it and report `last_error`         |
 | Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost, a notice in its place; others unaffected |
 | Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error` |
 | Cursor file unreadable                    | Channel replays from the oldest retained record                            |

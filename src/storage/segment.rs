@@ -240,41 +240,47 @@ pub struct Scan {
     pub valid_len: u64,
     pub count: u64,
     pub last: Option<(u64, i64)>,
-    pub error: Option<String>,
+    /// Why the valid prefix ends before `file_len`.
+    pub stopped: Option<Stopped>,
 }
 
-pub fn scan(file: File, file_len: u64, first_seq: u64) -> io::Result<Scan> {
+pub enum Stopped {
+    /// An invalid or incomplete record, such as a torn tail.
+    Corrupt(String),
+    /// A read failed, so what follows is unknown.
+    Unreadable(io::Error),
+}
+
+pub fn scan(file: File, file_len: u64, first_seq: u64) -> Scan {
     let mut cursor = SegmentCursor::new(file, HEADER_LEN as u64);
     let mut scan = Scan {
         valid_len: HEADER_LEN as u64,
         count: 0,
         last: None,
-        error: None,
+        stopped: None,
     };
     let mut expected = first_seq;
     loop {
-        match cursor.next(file_len)? {
-            Next::Record(r) if r.seq == expected => {
+        let stopped = match cursor.next(file_len) {
+            Ok(Next::Record(r)) if r.seq == expected => {
                 scan.last = Some((r.seq, r.ts));
                 scan.count += 1;
                 scan.valid_len = cursor.pos();
                 expected += 1;
+                continue;
             }
-            Next::Record(r) => {
-                scan.error = Some(format!(
-                    "sequence {} where {} was expected",
-                    r.seq, expected
-                ));
-                break;
-            }
-            Next::End => break,
-            Next::Corrupt(c) => {
-                scan.error = Some(c.to_string());
-                break;
-            }
-        }
+            Ok(Next::Record(r)) => Stopped::Corrupt(format!(
+                "sequence {} where {} was expected",
+                r.seq, expected
+            )),
+            Ok(Next::End) => break,
+            Ok(Next::Corrupt(c)) => Stopped::Corrupt(c.to_string()),
+            Err(e) => Stopped::Unreadable(e),
+        };
+        scan.stopped = Some(stopped);
+        break;
     }
-    Ok(scan)
+    scan
 }
 
 #[cfg(test)]
@@ -348,10 +354,20 @@ mod tests {
             .unwrap()
             .write_all(&bytes)
             .unwrap();
-        let scan = scan(File::open(&path).unwrap(), bytes.len() as u64, 10).unwrap();
+        let scan = scan(File::open(&path).unwrap(), bytes.len() as u64, 10);
         assert_eq!(scan.valid_len, full as u64);
         assert_eq!(scan.count, 2);
         assert_eq!(scan.last, Some((11, 2)));
-        assert!(scan.error.is_some());
+        assert!(matches!(scan.stopped, Some(Stopped::Corrupt(_))));
+    }
+
+    #[test]
+    fn scan_stops_at_a_read_error() {
+        // Reading a directory fails as a bad sector would.
+        let dir = tempfile::tempdir().unwrap();
+        let scan = scan(File::open(dir.path()).unwrap(), 4096, 10);
+        assert_eq!(scan.valid_len, HEADER_LEN as u64);
+        assert_eq!((scan.count, scan.last), (0, None));
+        assert!(matches!(scan.stopped, Some(Stopped::Unreadable(_))));
     }
 }

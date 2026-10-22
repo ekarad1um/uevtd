@@ -588,6 +588,12 @@ async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
         }
     }
     assert_eq!(seen, vec![1, 2, 3]);
+    // Once frame 3's acknowledgement is in, the restart sends only what
+    // follows it.
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("t").await["cursor"] == 4
+    })
+    .await;
 
     // Stop right after sending: the final sync commits what the timer has not.
     env.send(&[b"{\"n\":4}\n", b"{\"n\":5}\n"]).await;

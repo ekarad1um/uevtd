@@ -30,6 +30,7 @@ error names the field and its allowed range.
   the channel's topic, never retained; WebSocket sends it as a frame with the
   `seq` to acknowledge. Notices are delivered at least once and in order.
 - `notices` per channel in `/v1/status`, and `uevtd_channel_notices_total`.
+- `restarts` per channel in `/v1/status`, and `uevtd_channel_restarts_total`.
 
 ### Changed
 
@@ -78,6 +79,20 @@ error names the field and its allowed range.
   logged when they are evicted. Before, they were counted only once the
   channel delivered again, so the loss stayed invisible during an outage and
   for good if the target never came back.
+- A channel whose task panicked delivered nothing until the next configuration
+  change, while `/v1/status` still showed it running. The panic is now reported
+  in `last_error` at once, and the channel starts again from its cursor after
+  1 s, doubling to 60 s while it makes no progress.
+- After a crash of the daemon, not of the system, records that had been
+  written but not yet synced became visible at the restart before they were
+  durable, so a power loss soon after could take back records already
+  delivered and reuse their sequence numbers. Recovery now syncs them first.
+- A read error in the newest segment, such as a bad sector, or a segment that
+  could not be opened, prevented startup until someone removed the file. A
+  read error now costs the rest of that segment, counted as lost, and new
+  records are numbered past anything the unreadable part could hold. A sealed
+  segment that cannot be opened is retried by the channels and reported in
+  `last_error`.
 - Two MQTT channels on one broker, or two devices with the default
   configuration, no longer disconnect each other in turn. They all connected as
   `uevtd`, and a broker drops a client when another connects with its id.

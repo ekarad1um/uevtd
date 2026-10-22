@@ -891,6 +891,73 @@ Against mosquitto 2.0.21, over about 12 s each:
 | The same | previous | Both as `uevtd`: 8 takeovers ("Client uevtd already connected, closing old connection"), 4 retries each |
 | `client_id` `dev42` on two channels to one host, ports 18830 and 18831 | new | Refused at startup, naming both channels |
 
+**Step 6, supervision and recovery (2026-10-21).** Fixed M6 and M7.
+
+- M6: the supervisor also waits on its channel tasks. A task ends only when it is cancelled, so one
+  that ends on its own, by a panic, is reported at once: `running` becomes false, `last_error` holds
+  the panic message, and the error is logged. The channel starts again from its persisted cursor
+  after 1 s, doubling to 60 s while it ends again without progress, the M5 rule. Progress means a
+  cursor past the highest one reached before any earlier end. A record that makes the channel panic
+  every time is therefore retried once a minute, and holds back only that channel. A new definition
+  for the channel ends the wait at once. `restarts` counts these starts, in `/v1/status` and as
+  `uevtd_channel_restarts_total`. Panics unwind (the release profile does not abort), so the process
+  supervisor of Q7 never sees them; this is the only place they are handled.
+- M7, visible before durable: recovery syncs the active segment, after cutting back a torn tail,
+  before the head is published. A failed sync still fails the startup.
+- M7, startup blocked by an I/O error:
+  - A read error while scanning the active segment ends it as corruption would. The records after
+    the failure may have been committed and delivered, though, so recovery creates the next segment,
+    durably, at the head plus the number of records the rest could hold (its length over the 24-byte
+    frame header), and only then cuts the damaged file back. No sequence number is reused, and a
+    crash in between is recovered the same way. Channels count the range as lost, with a notice; the
+    count is an upper bound. `corrupt_segments` counts the segment.
+  - A sealed segment that cannot be opened is indexed from its size. Readers retry it and report the
+    error, as for any read error (M9), so a permission mistake can be fixed without loss. One whose
+    size cannot be read is skipped and counted.
+  - Opening and syncing the active segment still have to succeed: the daemon appends to it, and a
+    disk that cannot sync can keep nothing.
+- Found in my own first version and fixed: it measured progress from the cursor the task started
+  at. A restart begins at the persisted cursor, which can lag by up to a second, so a record that
+  panics the channel just after a few unsaved ones would have been sent again every second: each
+  restart re-sent those records, which counted as progress. The supervisor test now covers this
+  case.
+- A race in an end-to-end test, not in the daemon, surfaced in 2 of 25 Linux runs. After the
+  receiver had seen frame 3, the sync-interval test stopped the daemon before the daemon had read
+  its acknowledgement. The daemon then rightly sent frame 3 again after the restart, where the test
+  expected only 4 and 5. With a receiver that answers 300 ms late, the old test fails every time
+  with exactly that sequence. The test now waits for the acknowledgement first.
+- Checked and dismissed while reading recovery: a failed sync whose rollback fails too leaves
+  uncommitted records in a sealed segment, under sequence numbers the next segment reuses. Readers
+  never return them, since they locate every record in the last segment starting at or before it. A
+  test now pins this down.
+
+Verified with unit tests. In the supervisor test, a channel task sends three records without saving
+its cursor and then panics, on its first two starts. The end is reported at once, the task starts
+again after 1 s, not within 2 s after the second end, and at once on a new definition. Further tests
+cover the backoff and message rules on their own, a scan that stops at a read error, an unreadable
+active segment (a directory stands in for it, since reading one fails as a bad sector would), and a
+sealed segment without permissions. Each fix's test fails when the old behaviour is put back. macOS
+and Linux: 81 unit and 14 end-to-end tests pass. With the test race above fixed, 25 of 25 repeated
+end-to-end runs and 15 of 15 unit runs pass on each.
+
+On Linux, against mosquitto 2.0.21, with a build that panics the first three times channel `m`
+delivers a poison record, sent as the third of four messages:
+
+| Time | Channel `m` |
+|------|-------------|
+| 0.0 s | Panicked; `running` false, the panic in `last_error` |
+| 1.1 s | Started again at cursor 1, panicked again |
+| 3.2 s | Started again at cursor 1, panicked again |
+| 7.0 s | Started again at cursor 1; delivered all four, `restarts` 3, lag 0, lost 0 |
+
+Channel `n`, on the same broker, delivered all four at once without a restart, and its subscriber
+received each once. Channel `m`'s subscriber received the first message twice, since publishes
+queued before a panic may still go out: at-least-once, as after any lost session. The sync at
+startup has no unit test, so it was
+traced: with a 5 s sync interval, a daemon killed with SIGKILL after writing three records (head 0,
+nothing synced yet) recovered them at the restart with head 3, and `strace` showed `fdatasync` on the
+segment before either socket was bound.
+
 ## Appendix: probes
 
 These ran in a temporary crate outside the repository that depended on `uevtd` by path, so the review

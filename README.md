@@ -108,6 +108,11 @@ Notes:
   forwarded and queryable only once synced, so a positive interval adds up to
   that much latency and a crash can lose at most the unsynced tail, never a
   record that was already seen.
+- At startup the newest segment is checked and synced before its records are
+  forwarded. A read error in it, such as a bad sector, costs the rest of that
+  segment, counted as lost with a notice in its place, but not the startup; an
+  older segment that cannot be read is retried by the channels, with the error
+  in `last_error`.
 - WebSocket: one long-lived connection (`ws://` or `wss://`); `headers` go with
   the handshake. Every message is a text frame in the shape `/v1/messages`
   returns, `{"seq": 7, "ts": 1760928000123456, "data": {...}}`, or `"text"`
@@ -137,6 +142,10 @@ Notes:
   again only once the target acknowledges something: a target that accepts
   connections but takes nothing is retried less and less often. `retries`
   counts the reconnects.
+- A channel whose task panics shows `running: false` and the panic in
+  `last_error`, and starts again from its cursor after 1 s, then 2 s, up to
+  60 s while it makes no progress; `restarts` counts it. Other channels carry
+  on.
 - TLS (`wss://`, or MQTT `tls`) trusts the platform's certificate store, or with
   `ca_file` only the certificates in that PEM file. The file is read for every
   connection; a missing file shows in `last_error`.

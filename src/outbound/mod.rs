@@ -5,6 +5,7 @@ pub mod mqtt;
 pub mod notice;
 pub mod websocket;
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
@@ -38,6 +39,8 @@ pub struct ChannelMetrics {
     pub delivered: AtomicU64,
     pub rejected: AtomicU64,
     pub retries: AtomicU64,
+    /// Starts after the channel's task ended on its own.
+    pub restarts: AtomicU64,
     /// Records that left the log before the channel read them, counted by
     /// the log when that happens.
     pub lost: Arc<Loss>,
@@ -57,6 +60,7 @@ impl ChannelMetrics {
             delivered: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            restarts: AtomicU64::new(0),
             lost: Arc::default(),
             notices: AtomicU64::new(0),
             last_error: ErrorSlot::default(),
@@ -72,22 +76,88 @@ struct Running {
     token: CancellationToken,
     task: JoinHandle<()>,
     metrics: Arc<ChannelMetrics>,
+    /// The highest cursor before this start. Only progress past it ends the
+    /// backoff: a restart begins at the saved cursor, which may lag behind,
+    /// and sending those records again is no progress.
+    best: u64,
+    /// Times the task ended on its own, without progress, before this start.
+    failures: u32,
 }
 
+/// A channel whose task ended on its own, until it starts again.
+struct Waiting {
+    config: Channel,
+    failures: u32,
+    best: u64,
+    until: tokio::time::Instant,
+}
+
+/// Starts the task of a channel.
+type Spawn =
+    fn(&str, Channel, Feed, CursorStore, Arc<ChannelMetrics>, CancellationToken) -> JoinHandle<()>;
+
 pub async fn run(
-    mut cfg: watch::Receiver<Arc<Config>>,
+    cfg: watch::Receiver<Arc<Config>>,
     storage: Arc<Storage>,
     registry: Arc<Registry>,
     shutdown: CancellationToken,
 ) {
+    supervise(cfg, storage, registry, shutdown, spawn_channel).await;
+}
+
+fn spawn_channel(
+    name: &str,
+    channel: Channel,
+    feed: Feed,
+    cursor: CursorStore,
+    metrics: Arc<ChannelMetrics>,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    let span = tracing::info_span!("channel", name = %name);
+    match channel {
+        Channel::WebSocket(c) => {
+            tokio::spawn(websocket::run(c, feed, cursor, metrics, token).instrument(span))
+        }
+        Channel::Mqtt(c) => tokio::spawn(
+            mqtt::run(c, name.to_string(), feed, cursor, metrics, token).instrument(span),
+        ),
+    }
+}
+
+/// Keeps one task per enabled channel, started and stopped as the
+/// configuration changes. A task that ends on its own, which only a panic
+/// should cause, is started again after a backoff (§6.4).
+async fn supervise(
+    mut cfg: watch::Receiver<Arc<Config>>,
+    storage: Arc<Storage>,
+    registry: Arc<Registry>,
+    shutdown: CancellationToken,
+    spawn: Spawn,
+) {
     let mut running: BTreeMap<String, Running> = BTreeMap::new();
+    let mut waiting: BTreeMap<String, Waiting> = BTreeMap::new();
     let configured: BTreeSet<String> = cfg.borrow().outbound.channels.keys().cloned().collect();
     prune_cursors(&storage, configured).await;
     loop {
         let desired = cfg.borrow_and_update().outbound.channels.clone();
-        reconcile(&desired, &mut running, &storage, &registry).await;
+        reconcile(
+            &desired,
+            &mut running,
+            &mut waiting,
+            &storage,
+            &registry,
+            spawn,
+        )
+        .await;
+        let restart = waiting.values().map(|w| w.until).min();
         tokio::select! {
             changed = cfg.changed() => if changed.is_err() { break },
+            (name, outcome) = exited(&mut running) => {
+                let channel = running.remove(&name).expect("present");
+                waiting.insert(name.clone(), ended(&name, channel, outcome));
+            }
+            () = tokio::time::sleep_until(restart.unwrap_or_else(tokio::time::Instant::now)),
+                if restart.is_some() => {}
             _ = shutdown.cancelled() => break,
         }
     }
@@ -97,24 +167,82 @@ pub async fn run(
     info!("outbound stopped");
 }
 
+/// The first channel whose task has ended, and how it ended; pending while
+/// none has.
+async fn exited(running: &mut BTreeMap<String, Running>) -> (String, Result<(), JoinError>) {
+    if running.is_empty() {
+        return std::future::pending().await;
+    }
+    let tasks = running.values_mut().map(|r| &mut r.task);
+    let (outcome, index, _) = futures_util::future::select_all(tasks).await;
+    let name = running.keys().nth(index).expect("present").clone();
+    (name, outcome)
+}
+
+/// Reports a task that ended on its own, and schedules the next start: 1 s
+/// later, doubling to 60 s while the channel ends again without progress, as
+/// reconnects do (§6.1). A record that makes the channel panic is retried
+/// once a minute, not in a loop.
+fn ended(name: &str, channel: Running, outcome: Result<(), JoinError>) -> Waiting {
+    let how = match outcome {
+        Ok(()) => "ended on its own".to_string(),
+        Err(e) if e.is_panic() => format!("panicked: {}", panic_message(e.into_panic())),
+        Err(e) => format!("failed: {e}"),
+    };
+    let metrics = &channel.metrics;
+    let cursor = metrics.cursor.load(Relaxed);
+    let failures = if cursor > channel.best {
+        1
+    } else {
+        channel.failures + 1
+    };
+    let delay = backoff(failures - 1, RECONNECT_BASE, RECONNECT_MAX);
+    error!(
+        channel = name,
+        delay_s = delay.as_secs(),
+        "channel task {how}; restarting"
+    );
+    metrics.running.store(false, Relaxed);
+    metrics.connected.store(false, Relaxed);
+    metrics.last_error.set(format!("channel task {how}"));
+    Waiting {
+        config: channel.config,
+        failures,
+        best: channel.best.max(cursor),
+        until: tokio::time::Instant::now() + delay,
+    }
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map_or("of unknown type", |m| m)
+            .to_string(),
+    }
+}
+
 async fn reconcile(
     desired: &BTreeMap<String, Channel>,
     running: &mut BTreeMap<String, Running>,
+    waiting: &mut BTreeMap<String, Waiting>,
     storage: &Arc<Storage>,
     registry: &Registry,
+    spawn: Spawn,
 ) {
     let stale: Vec<String> = running
         .iter()
-        .filter(|(name, r)| r.task.is_finished() || desired.get(*name) != Some(&r.config))
+        .filter(|(name, r)| desired.get(*name) != Some(&r.config))
         .map(|(name, _)| name.clone())
         .collect();
     for name in stale {
         let channel = running.remove(&name).expect("present");
-        if channel.task.is_finished() {
-            error!(channel = %name, "channel task ended on its own");
-        }
         stop(&name, channel).await;
     }
+    // A new definition ends the wait, and the channel starts below at once;
+    // so do disabling and removing it, which leave it stopped.
+    waiting.retain(|name, w| desired.get(name) == Some(&w.config));
 
     {
         let mut registry = registry.lock().unwrap();
@@ -132,6 +260,7 @@ async fn reconcile(
         }
     }
 
+    let now = tokio::time::Instant::now();
     for (name, channel) in desired {
         let metrics = {
             let mut registry = registry.lock().unwrap();
@@ -147,29 +276,29 @@ async fn reconcile(
         if !channel.enabled() || running.contains_key(name) {
             continue;
         }
-        let start = initial_cursor(storage, name).await;
-        let feed = Feed::new(storage, name, start, metrics.clone());
-        let cursor = CursorStore::new(storage.clone(), name.clone(), start, metrics.clone());
-        let token = CancellationToken::new();
-        let span = tracing::info_span!("channel", name = %name);
-        let task = match channel.clone() {
-            Channel::WebSocket(c) => tokio::spawn(
-                websocket::run(c, feed, cursor, metrics.clone(), token.clone()).instrument(span),
-            ),
-            Channel::Mqtt(c) => tokio::spawn(
-                mqtt::run(
-                    c,
-                    name.clone(),
-                    feed,
-                    cursor,
-                    metrics.clone(),
-                    token.clone(),
-                )
-                .instrument(span),
-            ),
+        let (failures, best) = match waiting.get(name) {
+            Some(w) if w.until > now => continue,
+            Some(w) => (w.failures, w.best),
+            None => (0, 0),
         };
+        waiting.remove(name);
+        let start_seq = initial_cursor(storage, name).await;
+        let feed = Feed::new(storage, name, start_seq, metrics.clone());
+        let cursor = CursorStore::new(storage.clone(), name.clone(), start_seq, metrics.clone());
+        let token = CancellationToken::new();
+        let task = spawn(
+            name,
+            channel.clone(),
+            feed,
+            cursor,
+            metrics.clone(),
+            token.clone(),
+        );
         metrics.running.store(true, Relaxed);
-        info!(channel = %name, kind = channel.kind(), start_seq = start, "channel started");
+        if failures > 0 {
+            metrics.restarts.fetch_add(1, Relaxed);
+        }
+        info!(channel = %name, kind = channel.kind(), start_seq, "channel started");
         running.insert(
             name.clone(),
             Running {
@@ -177,6 +306,8 @@ async fn reconcile(
                 token,
                 task,
                 metrics,
+                best: best.max(start_seq),
+                failures,
             },
         );
     }
@@ -523,5 +654,146 @@ mod tests {
         assert_eq!(backoff(0, base, max), base);
         assert_eq!(backoff(3, base, max), Duration::from_millis(800));
         assert_eq!(backoff(20, base, max), max);
+    }
+
+    #[tokio::test]
+    async fn an_ended_task_waits_longer_until_the_channel_makes_progress() {
+        let metrics = Arc::new(ChannelMetrics::new("websocket"));
+        let channel = |best, failures| Running {
+            config: Channel::WebSocket(Default::default()),
+            token: CancellationToken::new(),
+            task: tokio::spawn(async {}),
+            metrics: metrics.clone(),
+            best,
+            failures,
+        };
+        let wait = |w: &Waiting| w.until - tokio::time::Instant::now();
+        metrics.cursor.store(5, Relaxed);
+        metrics.running.store(true, Relaxed);
+
+        // Each end without progress past the highest cursor so far doubles
+        // the wait.
+        let w = ended("w", channel(5, 0), Ok(()));
+        assert_eq!((w.failures, w.best), (1, 5));
+        assert!(wait(&w) > Duration::from_millis(900), "{:?}", wait(&w));
+        assert!(!metrics.running.load(Relaxed));
+        let message = || metrics.last_error.get().unwrap().message;
+        assert_eq!(message(), "channel task ended on its own");
+        let w = ended("w", channel(5, 3), Ok(()));
+        assert_eq!(w.failures, 4);
+        assert!(wait(&w) > Duration::from_millis(7900), "{:?}", wait(&w));
+        // Progress resets it and raises the mark.
+        let w = ended("w", channel(4, 3), Ok(()));
+        assert_eq!((w.failures, w.best), (1, 5));
+
+        let panicked = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+        ended("w", channel(5, 0), Err(panicked));
+        assert_eq!(message(), "channel task panicked: boom");
+        let n = 7;
+        let panicked = tokio::spawn(async move { panic!("boom {n}") })
+            .await
+            .unwrap_err();
+        ended("w", channel(5, 0), Err(panicked));
+        assert_eq!(message(), "channel task panicked: boom 7");
+    }
+
+    /// Starts in `a_channel_whose_task_ends_is_started_again`.
+    static STARTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// A channel task that delivers three records without saving its cursor
+    /// and panics, on its first two starts; then it runs until stopped.
+    fn panics_twice(
+        _: &str,
+        _: Channel,
+        feed: Feed,
+        mut cursor: CursorStore,
+        _: Arc<ChannelMetrics>,
+        token: CancellationToken,
+    ) -> JoinHandle<()> {
+        let start = STARTS.fetch_add(1, Relaxed);
+        tokio::spawn(async move {
+            let _feed = feed;
+            if start < 2 {
+                cursor.advance(cursor.current() + 3);
+                panic!("start {start}");
+            }
+            token.cancelled().await;
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_channel_whose_task_ends_is_started_again() {
+        async fn until(what: &str, mut done: impl FnMut() -> bool) -> Instant {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Instant::now()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
+        let websocket = |url: &str| {
+            let mut config = Config::default();
+            let channel = crate::config::WebSocket {
+                url: url.into(),
+                ..Default::default()
+            };
+            let channel = Channel::WebSocket(channel);
+            config.outbound.channels.insert("w".into(), channel);
+            Arc::new(config)
+        };
+        let (cfg, rx) = watch::channel(websocket("ws://h/a"));
+        let registry = Arc::new(Registry::default());
+        let shutdown = CancellationToken::new();
+        let supervisor = tokio::spawn(supervise(
+            rx,
+            storage,
+            registry.clone(),
+            shutdown.clone(),
+            panics_twice,
+        ));
+        until("registered", || registry.lock().unwrap().contains_key("w")).await;
+        let metrics = registry.lock().unwrap()["w"].clone();
+        let error = || metrics.last_error.get().map(|e| e.message);
+
+        // The end is reported at once, and the channel starts again after
+        // the backoff.
+        let first = until("first end", || error().is_some()).await;
+        assert_eq!(error().unwrap(), "channel task panicked: start 0");
+        assert!(!metrics.running.load(Relaxed));
+        let second = until("second start", || metrics.restarts.load(Relaxed) == 1).await;
+        assert!(
+            second - first >= Duration::from_millis(900),
+            "{:?}",
+            second - first
+        );
+        assert_eq!(STARTS.load(Relaxed), 2);
+
+        // It starts at the saved cursor, sends the same three records again,
+        // which is no progress, and ends again: now it waits 2 s. A new
+        // definition starts it at once.
+        until("second end", || error().unwrap().ends_with("start 1")).await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(STARTS.load(Relaxed), 2, "started again within 2 s");
+        let changed = Instant::now();
+        cfg.send_replace(websocket("ws://h/b"));
+        let third = until("third start", || STARTS.load(Relaxed) == 3).await;
+        assert!(
+            third - changed < Duration::from_millis(900),
+            "{:?}",
+            third - changed
+        );
+        until("running", || metrics.running.load(Relaxed)).await;
+        assert_eq!(metrics.restarts.load(Relaxed), 1);
+
+        shutdown.cancel();
+        supervisor.await.unwrap();
+        assert!(!metrics.running.load(Relaxed));
     }
 }
