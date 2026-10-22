@@ -12,7 +12,8 @@ mod segment;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -27,13 +28,18 @@ use crate::metrics::ErrorSlot;
 
 pub use queue::{Depth, QueueReceiver, QueueSender, queue};
 pub use segment::{Corrupt, Record};
-use segment::{FRAME_HEADER_LEN, HEADER_LEN, Header, Next, Peek, SegmentCursor, Stopped};
+use segment::{FRAME_HEADER_LEN, HEADER_LEN, Header, Next, Peek, Rest, SegmentCursor, Stopped};
 
 /// Bytes a segment needs besides the payload of its first record: the
 /// segment header and one frame header.
 pub const SEGMENT_OVERHEAD: u64 = (HEADER_LEN + FRAME_HEADER_LEN) as u64;
 
 const CURSOR_DIR: &str = "cursors";
+const LOCK_FILE: &str = "lock";
+/// A cursor above this was not written by the daemon, which would need
+/// centuries to assign as many sequence numbers; receivers in JavaScript tell
+/// numbers apart up to here.
+const MAX_CURSOR: u64 = 1 << 53;
 const MAX_BATCH: usize = 1024;
 /// Encoded bytes per write batch, frame headers included; a single larger
 /// message is written alone.
@@ -82,6 +88,8 @@ pub struct Metrics {
     pub clock_steps: AtomicU64,
     /// The last write failure, until a batch is committed again.
     pub last_error: ErrorSlot,
+    /// Why eviction cannot bring the log within `max_bytes`, while it cannot.
+    pub evict_error: ErrorSlot,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -97,6 +105,8 @@ struct Segment {
     base_ts: i64,
     /// Committed length including the header; readers never read past it.
     len: u64,
+    /// Counted in `corrupt_segments` already.
+    damaged: bool,
 }
 
 struct Index {
@@ -109,6 +119,8 @@ struct Index {
     /// Channel positions kept for loss accounting, by [`Tail`] id.
     tails: BTreeMap<u64, TailState>,
     next_tail: u64,
+    /// When a failed eviction was last logged, while eviction fails.
+    evict_warned: Option<Instant>,
 }
 
 impl Index {
@@ -125,6 +137,8 @@ impl Index {
 
 pub struct Storage {
     dir: PathBuf,
+    /// Holds the log's lock while the log is open.
+    _lock: File,
     index: Mutex<Index>,
     max_bytes: AtomicU64,
     segment_bytes: AtomicU64,
@@ -138,14 +152,17 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Opens or creates the log (§5.6). The active segment is validated, cut
-    /// back to its last valid record and synced before its records become
-    /// visible; a read error in it costs the rest of that segment, not the
-    /// startup.
+    /// Opens or creates the log (§5.6), after taking its lock. The active
+    /// segment is validated and synced before its records become visible: a
+    /// torn tail is cut off, and after damage of any other kind, a read error
+    /// included, the log continues in a new segment past every sequence
+    /// number the damaged part could hold. Numbering also continues past the
+    /// highest channel cursor.
     pub fn open(dir: &Path, limits: Limits) -> io::Result<Storage> {
         let mut builder = DirBuilder::new();
         builder.recursive(true).mode(DIR_MODE);
         builder.create(dir)?;
+        let lock = lock(dir)?;
         builder.create(dir.join(CURSOR_DIR))?;
         let mut names: Vec<u64> = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -160,19 +177,19 @@ impl Storage {
             bytes: 0,
             tails: BTreeMap::new(),
             next_tail: 0,
+            evict_warned: None,
         };
         // Trailing files that hold no record are removed, so the previous
         // segment becomes the active one again. One that cannot be read
-        // stays, since what it holds is unknown.
+        // stays, since what it holds is unknown, and so does one with an
+        // intact record anywhere in it, whatever its header.
         while let Some(&first_seq) = names.last() {
             let path = dir.join(segment::file_name(first_seq));
             let file = File::open(&path)?;
             let file_len = file.metadata()?.len();
             let junk = file_len < HEADER_LEN as u64
-                || (read_header(&file, first_seq).is_err() && {
-                    let scan = segment::scan(file, file_len, first_seq);
-                    scan.count == 0 && !matches!(scan.stopped, Some(Stopped::Unreadable(_)))
-                });
+                || (read_header(&file, first_seq).is_err()
+                    && holds_nothing(file, file_len, first_seq));
             if !junk {
                 break;
             }
@@ -191,12 +208,22 @@ impl Storage {
         // report the error (§5.7).
         for first_seq in names {
             let path = dir.join(segment::file_name(first_seq));
-            let file_len = match fs::metadata(&path) {
-                Ok(meta) => meta.len(),
-                Err(e) => {
-                    error!(segment = first_seq, error = %e, "cannot stat segment; skipping it");
-                    damaged += 1;
+            let (file_len, unknown) = match fs::metadata(&path) {
+                Ok(meta) => (meta.len(), false),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        segment = first_seq,
+                        "segment removed while the log was opened"
+                    );
                     continue;
+                }
+                // Kept as a full segment of the configured size, so that
+                // readers retry it, as one that cannot be opened, and
+                // eviction removes it in its turn.
+                Err(e) => {
+                    error!(segment = first_seq, error = %e, "cannot stat segment; keeping it as a full segment");
+                    damaged += 1;
+                    (limits.segment_bytes, true)
                 }
             };
             if file_len < HEADER_LEN as u64 {
@@ -224,17 +251,33 @@ impl Storage {
                 Segment {
                     base_ts,
                     len: file_len,
+                    damaged: unknown,
                 },
             );
         }
         if let Some(first_seq) = active {
             damaged += recover_active(dir, first_seq, &mut index)?;
         }
+        // A cursor past the head means that records a channel delivered are
+        // gone, to damage or to a disk that lost what it had synced. Their
+        // receivers have seen those sequence numbers, and one that drops
+        // duplicates would drop the next records given them.
+        let cursor = highest_cursor(&dir.join(CURSOR_DIR));
+        if cursor > index.head_seq + 1 {
+            error!(
+                cursor,
+                head_seq = index.head_seq,
+                "a channel's cursor is past the head of the log, so records it delivered are gone; numbering continues at the cursor"
+            );
+            let known_ts = index.head_ts;
+            start_at(dir, &mut index, cursor, known_ts)?;
+        }
         info!(dir = %dir.display(), segments = index.segments.len(), bytes = index.bytes, head_seq = index.head_seq, "log opened");
 
         let (head, _) = watch::channel(index.head_seq);
         let storage = Storage {
             dir: dir.to_path_buf(),
+            _lock: lock,
             index: Mutex::new(index),
             max_bytes: AtomicU64::new(limits.max_bytes),
             segment_bytes: AtomicU64::new(limits.segment_bytes),
@@ -298,8 +341,11 @@ impl Storage {
                 return Err(format!("log writer busy for {} s", busy / 1000));
             }
         }
-        match self.metrics.last_error.get() {
-            Some(e) => Err(format!("log write failed: {}", e.message)),
+        if let Some(e) = self.metrics.last_error.get() {
+            return Err(format!("log write failed: {}", e.message));
+        }
+        match self.metrics.evict_error.get() {
+            Some(e) => Err(format!("log over its size limit: {}", e.message)),
             None => Ok(()),
         }
     }
@@ -408,7 +454,16 @@ impl Storage {
         let mut page = Page::default();
         let mut bytes = 0usize;
         'read: loop {
-            let batch = reader.read(QUERY_READ_RECORDS, QUERY_READ_BYTES)?;
+            let batch = match reader.read(QUERY_READ_RECORDS, QUERY_READ_BYTES) {
+                Ok(batch) => batch,
+                // The page ends in front of a read error; the next one starts
+                // at the failing position, which reports it.
+                Err(_) if !page.records.is_empty() => {
+                    page.more = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             if batch.records.is_empty() && batch.skipped == 0 {
                 break;
             }
@@ -498,10 +553,14 @@ impl Storage {
     }
 
     /// Removes the oldest segments while the log is over its size limit, and
-    /// counts the records that channels had not read as lost.
+    /// counts the records that channels had not read as lost. The oldest
+    /// records go first, so a segment that cannot be removed stops eviction:
+    /// the log then grows past its limit, and its health fails, until the
+    /// segment can be removed.
     fn evict(&self, index: &mut Index) {
         let max = self.max_bytes.load(Relaxed);
         let mut evicted = false;
+        let mut failed = None;
         while index.bytes > max && index.segments.len() > 1 {
             let (&first_seq, segment) = index.segments.iter().next().expect("non-empty");
             let len = segment.len;
@@ -509,7 +568,7 @@ impl Storage {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    error!(segment = first_seq, error = %e, "eviction failed");
+                    failed = Some((first_seq, e));
                     break;
                 }
             }
@@ -523,6 +582,29 @@ impl Storage {
                 remaining = index.bytes,
                 "evicted segment"
             );
+        }
+        match failed {
+            Some((segment, e)) => {
+                // Eviction runs at every commit; the error is logged at most
+                // once a minute.
+                if index
+                    .evict_warned
+                    .is_none_or(|t| t.elapsed() >= LOSS_WARN_INTERVAL)
+                {
+                    error!(segment, error = %e, bytes = index.bytes, max_bytes = max,
+                        "eviction failed; the log grows past max_bytes until the segment can be removed");
+                    index.evict_warned = Some(Instant::now());
+                }
+                self.metrics
+                    .evict_error
+                    .set(format!("removing segment {segment}: {e}"));
+            }
+            None => {
+                if index.evict_warned.take().is_some() {
+                    info!(bytes = index.bytes, max_bytes = max, "eviction works again");
+                }
+                self.metrics.evict_error.clear();
+            }
         }
         if evicted {
             let first = index.first_seq();
@@ -652,72 +734,264 @@ impl TailState {
 /// Its valid prefix is synced before it becomes visible: after a crash of the
 /// daemon, not of the system, records written but not synced are still in the
 /// page cache, and a power loss could take them back after their delivery.
-/// A read error ends the segment as corruption would, except that the next
-/// segment starts past every sequence number the unreadable rest could hold,
-/// so none is ever reused. That segment is durable before the damaged one is
-/// cut back, so a crash in between is recovered the same way again.
+///
+/// Only a torn tail is cut off: an incomplete last record, as a crash in the
+/// middle of a write leaves it, or zeros, which storage reads where a write
+/// never arrived. Any other end may be damage to committed records, which may
+/// have been delivered: a read error, an invalid record that is there in full,
+/// or intact records after an invalid one. The file is then kept as it is, as
+/// a sealed segment that readers read up to the damage, retrying a read error
+/// as anywhere else, and the log continues in a new segment past every
+/// sequence number the rest of the file could hold, so that none is used
+/// again. Creating that segment is the only change, and it is durable, so a
+/// crash at any point is recovered the same way again.
 fn recover_active(dir: &Path, first_seq: u64, index: &mut Index) -> io::Result<u64> {
     let path = dir.join(segment::file_name(first_seq));
     let file = File::open(&path)?;
     let file_len = file.metadata()?.len();
-    let base_ts = match read_header(&file, first_seq) {
-        Ok(h) => h.base_ts,
+    let header_ts = match read_header(&file, first_seq) {
+        Ok(h) => Some(h.base_ts),
         Err(e) => {
             warn!(segment = first_seq, error = %e, "unreadable segment header; records will be verified on read");
-            i64::MAX
+            None
         }
     };
+    // Without a trustworthy base_ts the segment must never be chosen as the
+    // start of a time-range scan; i64::MAX makes queries start earlier.
+    let base_ts = header_ts.unwrap_or(i64::MAX);
     let scan = segment::scan(file.try_clone()?, file_len, first_seq);
-    index.bytes += scan.valid_len;
+    // With no record, the newest receipt time is the header's, or now: new
+    // records must not be stamped below one before them.
+    let (head_seq, head_ts) = scan.last.unwrap_or_else(|| {
+        let ts = header_ts.unwrap_or_else(crate::now_us);
+        (first_seq.saturating_sub(1), ts)
+    });
+    (index.head_seq, index.head_ts) = (head_seq, head_ts);
+    let mut keep = |len, damaged| {
+        index.bytes += len;
+        index.segments.insert(
+            first_seq,
+            Segment {
+                base_ts,
+                len,
+                damaged,
+            },
+        );
+    };
+    match ending(&file, &scan, file_len, head_seq, head_ts) {
+        Ending::Clean => {
+            keep(scan.valid_len, false);
+            file.sync_data()?;
+            Ok(0)
+        }
+        Ending::Torn(error) => {
+            warn!(segment = first_seq, valid_len = scan.valid_len, file_len, %error,
+                "cutting off the torn tail of the active segment");
+            keep(scan.valid_len, false);
+            // Readers stop at the valid length anyway, and the writer cuts
+            // the file back again before it appends.
+            if let Err(e) = cut_back(&path, scan.valid_len) {
+                warn!(segment = first_seq, error = %e, "could not cut off the torn tail");
+            }
+            file.sync_data()?;
+            Ok(0)
+        }
+        Ending::Damaged {
+            error,
+            next_seq,
+            known_ts,
+        } => {
+            error!(segment = first_seq, offset = scan.valid_len, file_len, %error, next_seq,
+                records_at_most = next_seq - head_seq - 1,
+                "active segment damaged; keeping it as it is and continuing past every record it can hold");
+            keep(file_len, true);
+            if let Err(e) = file.sync_data() {
+                warn!(segment = first_seq, error = %e, "could not sync the damaged segment");
+            }
+            start_at(dir, index, next_seq, known_ts)?;
+            Ok(1)
+        }
+    }
+}
+
+/// How the active segment ends, after its valid prefix.
+enum Ending {
+    /// With its last valid record.
+    Clean,
+    /// With a torn tail.
+    Torn(String),
+    /// With damage that may have hit committed records; the log continues at
+    /// `next_seq`, past every record the rest of the file can hold.
+    Damaged {
+        error: String,
+        next_seq: u64,
+        /// The newest receipt time known.
+        known_ts: i64,
+    },
+}
+
+/// Tells a torn tail from damage, from what follows the valid prefix that
+/// ends with record `head_seq`; see [`recover_active`].
+fn ending(file: &File, scan: &segment::Scan, file_len: u64, head_seq: u64, head_ts: i64) -> Ending {
+    // Every record takes at least a frame header.
+    let past = |from: u64, seq: u64| {
+        let room = (file_len - from) / FRAME_HEADER_LEN as u64;
+        seq.saturating_add(1).saturating_add(room)
+    };
+    let damaged = |error| Ending::Damaged {
+        error,
+        next_seq: past(scan.valid_len, head_seq),
+        known_ts: head_ts,
+    };
+    // Where the invalid record ends by its length; none if the file ends
+    // inside it.
+    let (error, end) = match &scan.stopped {
+        None => return Ending::Clean,
+        Some(Stopped::Unreadable(e)) => return damaged(format!("read failed: {e}")),
+        Some(Stopped::Torn(c)) => (c.to_string(), None),
+        Some(Stopped::Invalid { error, end }) => (error.clone(), Some(*end)),
+    };
+    match segment::search(file, scan.valid_len, file_len, head_seq) {
+        Ok(Rest {
+            last: Some(found), ..
+        }) => Ending::Damaged {
+            error: format!("{error}, and intact records up to {} after it", found.seq),
+            next_seq: past(found.end, found.seq),
+            known_ts: head_ts.max(found.ts),
+        },
+        Ok(rest) if end.is_none_or(|end| torn_into_zeros(scan.valid_len, end, rest.zeros_from)) => {
+            Ending::Torn(error)
+        }
+        Ok(_) => damaged(error),
+        Err(e) => damaged(format!("{error}; reading on failed: {e}")),
+    }
+}
+
+/// Whether a record at `start..end` whose bytes from `zeros_from` on, and
+/// all bytes after it, are zeros was torn: storage reads zeros where a write
+/// never arrived. Such zeros start where the record does, or at a block
+/// boundary inside it, since storage writes whole blocks of at least 512
+/// bytes; zeros only at the end of a record are more likely its payload.
+fn torn_into_zeros(start: u64, end: u64, zeros_from: u64) -> bool {
+    zeros_from == start || zeros_from.next_multiple_of(512) < end
+}
+
+/// Whether a segment file holds no record at all, intact or not, from its
+/// header on; false if part of it cannot be read.
+fn holds_nothing(file: File, file_len: u64, first_seq: u64) -> bool {
+    let Ok(copy) = file.try_clone() else {
+        return false;
+    };
+    let scan = segment::scan(copy, file_len, first_seq);
+    match scan.stopped {
+        _ if scan.count > 0 => false,
+        None => true,
+        Some(Stopped::Unreadable(_)) => false,
+        Some(_) => {
+            let rest = segment::search(
+                &file,
+                HEADER_LEN as u64,
+                file_len,
+                first_seq.saturating_sub(1),
+            );
+            rest.is_ok_and(|rest| rest.last.is_none())
+        }
+    }
+}
+
+/// Continues the log at `first_seq` with a segment that holds no record yet,
+/// created durably, so that no sequence number below it is ever given out
+/// again. `known_ts` is the newest receipt time known before it.
+fn start_at(dir: &Path, index: &mut Index, first_seq: u64, known_ts: i64) -> io::Result<()> {
+    let base_ts = known_ts.max(crate::now_us());
+    create_empty(dir, first_seq, base_ts)?;
+    index.bytes += HEADER_LEN as u64;
     index.segments.insert(
         first_seq,
         Segment {
             base_ts,
-            len: scan.valid_len,
-        },
-    );
-    (index.head_seq, index.head_ts) = scan.last.unwrap_or((first_seq.saturating_sub(1), base_ts));
-    let error = match scan.stopped {
-        None => {
-            file.sync_data()?;
-            return Ok(0);
-        }
-        Some(Stopped::Corrupt(error)) => {
-            warn!(segment = first_seq, valid_len = scan.valid_len, file_len, %error,
-                "truncating active segment after last valid record");
-            cut_back(&path, scan.valid_len)?;
-            file.sync_data()?;
-            return Ok(0);
-        }
-        Some(Stopped::Unreadable(error)) => error,
-    };
-
-    // Every record takes at least a frame header.
-    let unknown = (file_len - scan.valid_len) / FRAME_HEADER_LEN as u64;
-    let next_seq = index.head_seq + 1 + unknown;
-    let known_ts = match scan.last {
-        Some((_, ts)) => ts,
-        None if base_ts != i64::MAX => base_ts,
-        None => i64::MIN,
-    };
-    let base_ts = known_ts.max(crate::now_us());
-    error!(segment = first_seq, offset = scan.valid_len, file_len, %error, records_at_most = unknown, next_seq,
-        "active segment unreadable; keeping the records before the failure and starting a new segment");
-    create_empty(dir, next_seq, base_ts)?;
-    index.bytes += HEADER_LEN as u64;
-    index.segments.insert(
-        next_seq,
-        Segment {
-            base_ts,
             len: HEADER_LEN as u64,
+            damaged: false,
         },
     );
-    index.head_seq = next_seq - 1;
+    index.head_seq = first_seq - 1;
     index.head_ts = base_ts;
-    if let Err(e) = cut_back(&path, scan.valid_len).and_then(|()| file.sync_data()) {
-        warn!(segment = first_seq, error = %e, "could not cut back the unreadable segment");
+    Ok(())
+}
+
+/// The highest position in a cursor file, a temporary one that an interrupted
+/// save left included; 0 without one.
+fn highest_cursor(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut highest = 0;
+    for entry in entries.filter_map(|e| e.ok()) {
+        // A cursor is at most 20 digits and a newline.
+        let mut text = String::new();
+        let read = File::open(entry.path()).and_then(|f| f.take(32).read_to_string(&mut text));
+        let Some(seq) = read.ok().and_then(|_| text.trim().parse::<u64>().ok()) else {
+            continue;
+        };
+        if seq > MAX_CURSOR {
+            warn!(file = %entry.file_name().to_string_lossy(), cursor = seq, "ignoring a cursor no daemon could have written");
+            continue;
+        }
+        highest = highest.max(seq);
     }
-    Ok(1)
+    highest
+}
+
+/// Takes the log's lock, held for as long as the returned file is open, so
+/// that a second instance on the same log stops before it changes anything.
+/// The lock goes with the process, so a crash leaves nothing to clean up. The
+/// file holds the process id, for the message the second instance gives.
+fn lock(dir: &Path) -> io::Result<File> {
+    let path = dir.join(LOCK_FILE);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(FILE_MODE)
+        .open(&path)?;
+    let locked = loop {
+        // SAFETY: flock only takes the descriptor, which `file` keeps open.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            break Err(e);
+        }
+    };
+    match locked {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            let pid = fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            let by = pid.map_or_else(String::new, |pid| format!(", pid {pid}"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("locked by another process{by}; is another uevtd running on this log?"),
+            ));
+        }
+        // A file system that cannot lock; a second instance then goes
+        // unnoticed, as it did before the lock.
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "cannot lock the log; a second instance on it would go unnoticed");
+            return Ok(file);
+        }
+    }
+    // Only for the message above, so a full disk does not stop the startup.
+    if let Err(e) = file
+        .set_len(0)
+        .and_then(|()| writeln!(file, "{}", std::process::id()))
+    {
+        warn!(path = %path.display(), error = %e, "could not write the process id into the lock file");
+    }
+    Ok(file)
 }
 
 fn cut_back(path: &Path, len: u64) -> io::Result<()> {
@@ -956,24 +1230,31 @@ impl Writer {
                 );
             }
         }
+        self.create_segment(self.head_seq + 1, self.head_ts)?;
+        // Only once it exists: until then, no batch may go into the segment
+        // that the failure sealed.
         self.force_new = false;
-        self.create_segment(self.head_seq + 1, self.head_ts)
+        Ok(())
     }
 
     fn create_segment(&mut self, first_seq: u64, base_ts: i64) -> io::Result<()> {
         let path = self.storage.segment_path(first_seq);
         // A file that already starts at this sequence number holds no record
-        // (otherwise the head would be past it), so it is replaced.
+        // (otherwise the head would be past it), so it is replaced. Its index
+        // entry goes only once the file has: while the file is there, the
+        // next batch must not go into the segment before it, since at the
+        // next start the file would hide that batch and give its sequence
+        // numbers out again.
+        match fs::remove_file(&path) {
+            Ok(()) => warn!(segment = first_seq, "replacing an empty segment file"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         {
             let mut index = self.storage.index.lock().unwrap();
             if let Some(stale) = index.segments.remove(&first_seq) {
                 index.bytes -= stale.len;
             }
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => warn!(segment = first_seq, "replacing an empty segment file"),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         let mut file = OpenOptions::new()
             .append(true)
@@ -988,7 +1269,14 @@ impl Writer {
         let len = HEADER_LEN as u64;
         {
             let mut index = self.storage.index.lock().unwrap();
-            index.segments.insert(first_seq, Segment { base_ts, len });
+            index.segments.insert(
+                first_seq,
+                Segment {
+                    base_ts,
+                    len,
+                    damaged: false,
+                },
+            );
             index.bytes += len;
         }
         self.active = Some(Active {
@@ -1271,7 +1559,8 @@ impl Reader {
                     return Ok(Step::Record(record));
                 }
                 Next::Record(_) => {
-                    return Ok(self.skip_segment(&view, Corrupt("sequence mismatch"), may_skip));
+                    let cause = Corrupt::Invalid("sequence mismatch");
+                    return Ok(self.skip_segment(&view, cause, may_skip));
                 }
                 Next::End => match view.next_first_seq {
                     Some(next) if next > self.next_seq => return Ok(self.skip_to(next, may_skip)),
@@ -1302,8 +1591,19 @@ impl Reader {
             return Step::Stop;
         }
         let offset = self.current.as_ref().map(|o| o.cursor.pos()).unwrap_or(0);
-        error!(segment = view.first_seq, offset, error = %cause, "corrupt record; skipping the rest of the segment");
-        self.storage.metrics.corrupt_segments.fetch_add(1, Relaxed);
+        // Counted and logged once per segment, not by every reader that
+        // passes it.
+        let first = {
+            let mut index = self.storage.index.lock().unwrap();
+            let segment = index.segments.get_mut(&view.first_seq);
+            segment.is_some_and(|s| !std::mem::replace(&mut s.damaged, true))
+        };
+        if first {
+            error!(segment = view.first_seq, offset, error = %cause, "corrupt record; skipping the rest of the segment");
+            self.storage.metrics.corrupt_segments.fetch_add(1, Relaxed);
+        } else {
+            debug!(segment = view.first_seq, offset, error = %cause, "corrupt record; skipping the rest of the segment");
+        }
         self.skip_to(view.next_first_seq.unwrap_or(view.head_seq + 1), true)
     }
 
@@ -1392,6 +1692,9 @@ impl Reader {
         Ok(Located::At(view))
     }
 }
+
+#[cfg(test)]
+mod model_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1618,6 +1921,7 @@ mod tests {
         let (storage, mut writer) = open(dir.path(), l);
         assert_eq!(fs::metadata(&path).unwrap().len(), intact as u64);
         assert_eq!(storage.head_seq(), 2);
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 0);
         writer.append(&[msg(5, "c")], true).unwrap();
         let records = storage.reader(1).read(10, 1 << 20).unwrap().records;
         assert_eq!(
@@ -1625,6 +1929,7 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(records[2].payload, b"c");
+        drop((storage, writer));
 
         // Reopen again: nothing to repair, head continues.
         let (storage, _) = open(dir.path(), l);
@@ -1644,8 +1949,22 @@ mod tests {
         batch.records.iter().map(|r| r.seq).collect()
     }
 
+    /// Reads from `reader` until it has caught up: the sequence numbers
+    /// read, and how many it passed over.
+    fn read_to_end(reader: &mut Reader) -> (Vec<u64>, u64) {
+        let (mut got, mut skipped) = (Vec::new(), 0);
+        loop {
+            let batch = reader.read(100, 1 << 30).unwrap();
+            if batch.records.is_empty() && batch.skipped == 0 {
+                return (got, skipped);
+            }
+            skipped += batch.skipped;
+            got.extend(seqs(&batch));
+        }
+    }
+
     #[test]
-    fn an_unreadable_active_segment_ends_without_reusing_sequence_numbers() {
+    fn an_unreadable_active_segment_is_kept_and_numbering_continues_past_it() {
         let dir = tempfile::tempdir().unwrap();
         let l = limits(1 << 20, 64 << 10);
         {
@@ -1666,26 +1985,28 @@ mod tests {
         assert!(next > 5, "{size}");
 
         // The records before the failure stay. The new segment starts past
-        // every record the unreadable part could hold, and readers pass over
-        // them as lost.
+        // every record the unreadable part could hold, and readers retry
+        // that part, as a read error anywhere else.
         {
             let (storage, _) = open(dir.path(), l);
             assert_eq!(storage.head_seq(), next - 1);
             assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
             let mut reader = storage.reader(1);
             assert_eq!(seqs(&reader.read(10, 1 << 20).unwrap()), [1, 2, 3]);
-            assert_eq!(reader.read(10, 1 << 20).unwrap().skipped, next - 4);
+            assert!(reader.read(10, 1 << 20).is_err());
         }
-        // That segment is durable before anything is written to it, so a
-        // restart keeps the head where it was.
+        // Creating that segment was the only change, and it is durable, so a
+        // restart finds the same.
         let (storage, mut writer) = open(dir.path(), l);
         assert_eq!(storage.head_seq(), next - 1);
         writer.append(&[msg(5, "d")], true).unwrap();
-        let batch = storage.reader(next).read(10, 1 << 20).unwrap();
-        assert_eq!(
-            (seqs(&batch), batch.records[0].payload.as_slice()),
-            (vec![next], &b"d"[..])
-        );
+        // Once the damaged part reads again, its records are delivered, and
+        // the numbers it did not use are passed over.
+        fs::remove_dir_all(&unreadable).unwrap();
+        let readable = segment_file(4, 3, &[(4, 4, "x"), (5, 5, "y")]);
+        fs::write(&unreadable, readable).unwrap();
+        let (got, skipped) = read_to_end(&mut storage.reader(1));
+        assert_eq!((got, skipped), (vec![1, 2, 3, 4, 5, next], next - 6));
     }
 
     #[test]
@@ -1789,6 +2110,10 @@ mod tests {
         assert_eq!(seqs.len() as u64 + skipped, 20);
         assert_eq!(*seqs.last().unwrap(), 20);
         assert!(seqs.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
+        // Counted once, however many readers and queries pass it.
+        assert_eq!(read_to_end(&mut storage.reader(1)).1, skipped);
+        storage.query(None, None, 0, 100, 1 << 30).unwrap();
         assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
     }
 
@@ -2425,5 +2750,340 @@ mod tests {
         let after = storage.status();
         assert!(after.segments < before.segments);
         assert!(after.bytes <= 128 << 10);
+    }
+
+    #[test]
+    fn a_read_that_fails_once_costs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(64 << 20, 1 << 20));
+        let payload = "t".repeat(490);
+        for i in 1..=3000 {
+            writer.append(&[msg(i, &payload)], i % 50 == 0).unwrap();
+        }
+        writer.sync().unwrap();
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+        let mut got = seqs(&reader.read(32, 1 << 20).unwrap());
+        // The device fails a read in the middle of the segment, then works
+        // again. The records read before it are returned first.
+        let bad = File::open(dir.path()).unwrap();
+        let good = reader.current.as_mut().unwrap().cursor.replace_file(bad);
+        if let Ok(batch) = reader.read(1000, 1 << 20) {
+            got.extend(seqs(&batch));
+            assert!(reader.read(1000, 1 << 20).is_err());
+        }
+        reader.current.as_mut().unwrap().cursor.replace_file(good);
+        let (rest, skipped) = read_to_end(&mut reader);
+        got.extend(rest);
+        assert_eq!((got, skipped), ((1..=3000).collect(), 0));
+        assert_eq!(lost.records(), 0);
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_query_returns_the_records_before_a_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        for i in 0..200 {
+            let message = Message {
+                ts: i,
+                payload: vec![b'q'; 1000],
+            };
+            writer.append(&[message], false).unwrap();
+        }
+        writer.sync().unwrap();
+        let second = *storage
+            .index
+            .lock()
+            .unwrap()
+            .segments
+            .keys()
+            .nth(1)
+            .unwrap();
+        // A directory in place of the second segment fails every read.
+        let path = storage.segment_path(second);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let page = storage.query(None, None, 0, 1000, 1 << 30).unwrap();
+        assert_eq!((page.records.len() as u64, page.more), (second - 1, true));
+        // The next page starts at the failing position, which reports it.
+        assert!(
+            storage
+                .query(None, None, second - 1, 1000, 1 << 30)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_log_is_open_in_one_place_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = limits(1 << 20, 64 << 10);
+        let (storage, mut writer) = open(dir.path(), l);
+        writer.append(&[msg(1, "a")], true).unwrap();
+        // A batch being written: a second open must not cut it off.
+        let path = storage.segment_path(1);
+        let mut active = OpenOptions::new().append(true).open(&path).unwrap();
+        active.write_all(&[1, 2, 3]).unwrap();
+        let len = fs::metadata(&path).unwrap().len();
+        let err = match Storage::open(dir.path(), l) {
+            Ok(_) => panic!("opened twice"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let pid = format!("pid {}", std::process::id());
+        assert!(err.to_string().contains(&pid), "{err}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
+        drop((storage, writer));
+        let (storage, _) = open(dir.path(), l);
+        assert_eq!(storage.head_seq(), 1);
+    }
+
+    /// (seq, start, end) of every frame in segment file bytes.
+    pub(super) fn frames(bytes: &[u8]) -> Vec<(u64, usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = HEADER_LEN;
+        while pos + FRAME_HEADER_LEN <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let seq = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+            let end = pos + FRAME_HEADER_LEN + len;
+            if end > bytes.len() {
+                break;
+            }
+            out.push((seq, pos, end));
+            pos = end;
+        }
+        out
+    }
+
+    #[test]
+    fn damage_to_committed_records_never_gives_their_numbers_out_again() {
+        // Each case damages the active segment, which holds records 23 to 25,
+        // and gives the sequence number that the next message must get, and
+        // whether the damage counts as such.
+        type Damage = fn(&mut Vec<u8>, &[(u64, usize, usize)]);
+        let cases: [(&str, Damage, u64, bool); 7] = [
+            (
+                "header and first frame zeroed",
+                |b, _| b[..48].fill(0),
+                26,
+                true,
+            ),
+            ("record 23 flipped", |b, f| b[f[0].2 - 1] ^= 1, 26, true),
+            ("last record flipped", |b, f| b[f[2].2 - 1] ^= 1, 28, true),
+            (
+                "length of record 24 flipped",
+                |b, f| b[f[1].1 + 7] ^= 0x40,
+                26,
+                true,
+            ),
+            (
+                "last record torn",
+                |b, f| b.truncate(f[2].2 - 10),
+                25,
+                false,
+            ),
+            ("last record zeros", |b, f| b[f[2].1..].fill(0), 25, false),
+            (
+                "end of the last record zeros",
+                |b, f| b[f[2].2 - 30..].fill(0),
+                28,
+                true,
+            ),
+        ];
+        let payload = "p".repeat(60);
+        for (case, damage, next, counted) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let l = limits(1 << 20, 1000);
+            let path = {
+                let (storage, mut writer) = open(dir.path(), l);
+                for i in 1..=25 {
+                    writer.append(&[msg(i, &payload)], true).unwrap();
+                }
+                storage.segment_path(23)
+            };
+            let mut bytes = fs::read(&path).unwrap();
+            let held = frames(&bytes);
+            assert_eq!(held.iter().map(|f| f.0).collect::<Vec<_>>(), [23, 24, 25]);
+            damage(&mut bytes, &held);
+            fs::write(&path, &bytes).unwrap();
+            for start in 0..2 {
+                let (storage, mut writer) = open(dir.path(), l);
+                assert_eq!(storage.head_seq(), next - 1, "{case}, start {start}");
+                let corrupt = storage.metrics().corrupt_segments.load(Relaxed);
+                assert_eq!(corrupt, u64::from(counted && start == 0), "{case}");
+                assert!(path.exists(), "{case}");
+                if start == 1 {
+                    writer.append(&[msg(99, "new")], true).unwrap();
+                    let page = storage.query(None, None, next - 1, 10, 1 << 20).unwrap();
+                    assert_eq!(seqs_of(&page.records), [next], "{case}");
+                }
+            }
+        }
+    }
+
+    fn seqs_of(records: &[Record]) -> Vec<u64> {
+        records.iter().map(|r| r.seq).collect()
+    }
+
+    #[test]
+    fn a_torn_tail_that_cannot_be_cut_off_does_not_block_startup() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let l = limits(1 << 20, 64 << 10);
+        {
+            let (_storage, mut writer) = open(dir.path(), l);
+            writer.append(&[msg(1, "a"), msg(2, "b")], true).unwrap();
+        }
+        let path = dir.path().join(segment::file_name(1));
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[7; 10]);
+        fs::write(&path, &bytes).unwrap();
+        // Read-only, so that cutting it fails (unless the tests run as root,
+        // which cuts it anyway).
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
+        let (storage, _) = open(dir.path(), l);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(storage.head_seq(), 2);
+        assert_eq!(seqs(&storage.reader(1).read(10, 1 << 20).unwrap()), [1, 2]);
+    }
+
+    #[test]
+    fn zeros_from_a_block_boundary_inside_the_last_record_are_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = limits(1 << 20, 64 << 10);
+        let path = {
+            let (storage, mut writer) = open(dir.path(), l);
+            for i in 1..=3 {
+                writer.append(&[msg(i, &"z".repeat(1000))], true).unwrap();
+            }
+            storage.segment_path(1)
+        };
+        // Record 3 takes bytes 2072 to 3096; the block from 2560 never
+        // arrived.
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 3096);
+        bytes[2560..].fill(0);
+        fs::write(&path, &bytes).unwrap();
+        let (storage, _) = open(dir.path(), l);
+        assert_eq!(storage.head_seq(), 2);
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 2072);
+    }
+
+    #[test]
+    fn numbering_continues_past_the_highest_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = limits(1 << 20, 64 << 10);
+        {
+            let (storage, mut writer) = open(dir.path(), l);
+            writer.append(&[msg(1, "a"), msg(2, "b")], true).unwrap();
+            storage.save_cursor("behind", 2).unwrap();
+            // A channel delivered up to 39, and those records are gone.
+            storage.save_cursor("ahead", 40).unwrap();
+            // Left by an interrupted save, and one no daemon could write.
+            let cursors = dir.path().join(CURSOR_DIR);
+            fs::write(cursors.join(".behind.tmp"), "30\n").unwrap();
+            fs::write(cursors.join("forged"), format!("{}\n", u64::MAX)).unwrap();
+        }
+        let (storage, mut writer) = open(dir.path(), l);
+        assert_eq!(storage.head_seq(), 39);
+        writer.append(&[msg(3, "c")], true).unwrap();
+        // A reader behind passes over the numbers whose records are gone.
+        assert_eq!(read_to_end(&mut storage.reader(2)), (vec![2, 40], 37));
+        drop((storage, writer));
+        let (storage, _) = open(dir.path(), l);
+        assert_eq!(storage.head_seq(), 40);
+    }
+
+    #[test]
+    fn a_failed_eviction_makes_the_log_unhealthy_until_it_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(4000, 1000));
+        let payload = "e".repeat(60);
+        for i in 1..=20 {
+            writer.append(&[msg(i, &payload)], true).unwrap();
+        }
+        // A directory in place of the oldest segment, which removing a file
+        // cannot remove.
+        let oldest = storage.segment_path(storage.status().first_seq);
+        fs::remove_file(&oldest).unwrap();
+        fs::create_dir(&oldest).unwrap();
+        fs::write(oldest.join("x"), b"").unwrap();
+        for i in 21..=200 {
+            writer.append(&[msg(i, &payload)], true).unwrap();
+        }
+        assert!(storage.status().bytes > 8000);
+        let health = storage.health().unwrap_err();
+        let prefix = format!("log over its size limit: removing segment {}: ", 1);
+        assert!(health.starts_with(&prefix), "{health}");
+        // Once the segment can go, eviction catches up.
+        fs::remove_dir_all(&oldest).unwrap();
+        writer.append(&[msg(201, &payload)], true).unwrap();
+        assert_eq!(storage.health(), Ok(()));
+        assert!(storage.status().bytes <= 4000);
+    }
+
+    #[test]
+    fn a_segment_that_cannot_be_replaced_takes_no_batch_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = limits(1 << 20, 64 << 10);
+        let (storage, mut writer) = open(dir.path(), l);
+        writer.append(&[msg(1, "a"), msg(2, "b")], true).unwrap();
+        // As a failed sync of the first batch of segment 3 leaves it: in the
+        // index without a committed record, and sealed. A directory stands in
+        // for a file that cannot be removed.
+        {
+            let mut index = storage.index.lock().unwrap();
+            let len = HEADER_LEN as u64;
+            index.segments.insert(
+                3,
+                Segment {
+                    base_ts: 2,
+                    len,
+                    damaged: false,
+                },
+            );
+            index.bytes += len;
+        }
+        let stale = storage.segment_path(3);
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("x"), b"").unwrap();
+        writer.active = None;
+        writer.force_new = true;
+        // No batch goes into segment 1, where the file would hide it.
+        assert!(writer.append(&[msg(3, "c")], true).is_err());
+        assert!(writer.append(&[msg(4, "d")], true).is_err());
+        assert_eq!(storage.head_seq(), 2);
+        fs::remove_dir_all(&stale).unwrap();
+        writer.append(&[msg(5, "e")], true).unwrap();
+        drop((storage, writer));
+        let (storage, _) = open(dir.path(), l);
+        let records = storage.reader(1).read(10, 1 << 20).unwrap().records;
+        let got: Vec<_> = records
+            .iter()
+            .map(|r| (r.seq, r.payload.as_slice()))
+            .collect();
+        assert_eq!(got, [(1, &b"a"[..]), (2, b"b"), (3, b"e")]);
+    }
+
+    #[test]
+    fn a_segment_that_cannot_be_stat_ed_is_kept_and_evicted_in_its_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // A link to itself: stat fails, as for a damaged inode.
+        let broken = dir.path().join(segment::file_name(1));
+        std::os::unix::fs::symlink(segment::file_name(1), &broken).unwrap();
+        let active = segment_file(3, 2, &[(3, 3, "c")]);
+        fs::write(dir.path().join(segment::file_name(3)), active).unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(200 << 10, 64 << 10));
+        let status = storage.status();
+        assert_eq!((status.segments, status.first_seq), (2, 1));
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
+        // Readers report the error, as for one that cannot be opened.
+        assert!(storage.reader(1).read(10, 1 << 20).is_err());
+        // It counts as a full segment, and is the first to go.
+        write_records(&mut writer, 160);
+        assert!(storage.status().first_seq > 1);
+        assert!(fs::symlink_metadata(&broken).is_err());
     }
 }

@@ -35,8 +35,9 @@ error names the field and its allowed range.
 - `notices` per channel in `/v1/status`, and `uevtd_channel_notices_total`.
 - `restarts` per channel in `/v1/status`, and `uevtd_channel_restarts_total`.
 - `/v1/health` answers 503 with the reason after a failed write or sync, until
-  a batch is committed again, and while one write or sync has taken more than
-  30 s.
+  a batch is committed again, while one write or sync has taken more than
+  30 s, and while eviction cannot remove a segment.
+- A `lock` file in `storage.path`, held by the daemon that has the log open.
 - In `/v1/status`, with the metric in brackets: `storage.first_ts`
   (`uevtd_storage_first_ts_seconds`), the receipt time of the oldest message
   in the log; `uevtd_storage_head_ts_seconds`; `storage.queued` and
@@ -110,11 +111,44 @@ error names the field and its allowed range.
   durable, so a power loss soon after could take back records already
   delivered and reuse their sequence numbers. Recovery now syncs them first.
 - A read error in the newest segment, such as a bad sector, or a segment that
-  could not be opened, prevented startup until someone removed the file. A
-  read error now costs the rest of that segment, counted as lost, and new
-  records are numbered past anything the unreadable part could hold. A sealed
-  segment that cannot be opened is retried by the channels and reported in
-  `last_error`.
+  could not be opened, prevented startup until someone removed the file. The
+  daemon now starts: the segment is kept as it is, channels retry the part
+  that fails and report it in `last_error`, and new records are numbered past
+  anything that part could hold. A sealed segment that cannot be opened, or
+  whose size cannot be read, is retried the same way.
+- One failed read in the middle of a segment, such as a transient I/O error,
+  made the next read decode the bytes left from an earlier one and skip the
+  rest of the segment as corrupt. Channels counted those intact messages as
+  lost and never delivered them, and a query left them out of its answer
+  without an error. A failed read is now retried from the disk.
+- A second daemon started on the same `storage.path` worked on the log before
+  it failed on a socket: it cut off the batch the first one was writing,
+  removed its cursor files and started its channels, and the first one then
+  lost messages it had committed. The log is now locked, and a second daemon
+  stops at once, before it changes anything, with an error that names the
+  process holding the log.
+- Damage to messages already committed in the newest segment, such as a
+  flipped bit or a block that never arrived on the disk, was cut off at
+  startup like an interrupted write, and their sequence numbers were given to
+  new messages, which receivers that drop duplicates then dropped. Only an
+  interrupted write is cut off now; after other damage the segment is kept and
+  numbering continues past every message it could hold. Numbering also
+  continues past the highest channel cursor, so that the numbers of messages a
+  disk lost after they were delivered are not given out again.
+- A segment that could not be removed stopped eviction without a sign: the log
+  grew past `storage.max_bytes` until the disk was full, while `/v1/health`
+  answered 200. Health now fails with the error, which is also
+  `storage.last_error`, and it is logged once a minute, until the segment can
+  be removed.
+- `corrupt_segments` counted a corrupt segment again for every channel, restart
+  and query that read past it; it counts each segment once.
+- A failed sync of a segment's first batch, followed by a failed removal of that
+  segment, could put later messages where a restart did not look, and give
+  their sequence numbers out again.
+- A query that met a read error failed as a whole. It now returns the messages
+  before the error, with `next` set, and the next page reports the error.
+- A corrupt length in a record made every reader that met it allocate up to a
+  segment's size, 256 MiB at most, at once.
 - Two devices with the default configuration and distinct host names no
   longer disconnect each other in turn on a broker, and two channels of one
   daemon can no longer be configured to. They all connected as `uevtd`, and a

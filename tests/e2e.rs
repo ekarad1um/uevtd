@@ -783,6 +783,40 @@ async fn refuses_to_steal_a_live_socket() {
     daemon.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_on_the_same_log_stops_before_it_changes_anything() {
+    let receiver = Receiver::start(listen().await, None);
+    let env = Env::new();
+    let daemon = env.start(env.config(&receiver.url)).await;
+    let log = env.base().storage.path;
+    let cursor = log.join("cursors").join("t");
+    wait_for(Duration::from_secs(10), || async { cursor.exists() }).await;
+    // Other sockets and no channels: it would remove the cursor of `t`, and
+    // run beside the first.
+    let other = Env::new();
+    let mut config = other.base();
+    config.storage.path = log.clone();
+    config::save(&other.config_path, &config).unwrap();
+    let options = Options {
+        config_path: other.config_path.clone(),
+        config,
+        log: None,
+    };
+    let run = daemon::run(options, CancellationToken::new());
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the second daemon stops");
+    let message = format!("{:#}", result.unwrap_err());
+    let pid = format!("pid {}", std::process::id());
+    assert!(
+        message.contains("locked by another process") && message.contains(&pid),
+        "{message}"
+    );
+    assert!(cursor.exists());
+    assert!(!other.inbound.exists() && !other.api.exists());
+    daemon.stop().await;
+}
+
 /// 2 000 messages of about 420 bytes overflow a 256 KiB log; then one more
 /// of about 610 bytes.
 async fn overflow_then_one_large(env: &Env, daemon: &Daemon) {

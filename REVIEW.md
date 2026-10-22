@@ -2,7 +2,8 @@
 
 Reviewed at `d4fe3c1` (2026-10-20). Every source file, the docs and `contrib/` were read against the
 requirements in [TODO.md](TODO.md) and the invariants in [ARCHITECTURE.md](ARCHITECTURE.md). Nothing in
-the repository was changed apart from adding this file.
+the repository was changed apart from adding this file. A second review, at `407be9d` after the fixes
+of §8, is in §9.
 
 How the findings were checked:
 
@@ -1061,11 +1062,534 @@ Against mosquitto 2.0.21 on Linux, where `uname -n` is `dev`:
 | A second daemon on the same host without a `client_id`, for 8 s | 5 takeovers, as for two devices with one host name |
 | A configuration file with two channels to the broker and no `client_id` | Startup refused, exit status 1, with the same message |
 
+**Step 9, the log (2026-10-22).** Fixed H3, H4, M12, L17, L18, L24, L25 and L27 of §9, and the
+32-bit item of L29, which is in the same code.
+
+- H3: a failed read empties the segment reader's buffer, so the retry reads the file. One failed read
+  now costs nothing: the records before it are returned (M9), and the retry goes on from where the
+  read failed. A query that meets a read error returns the records before it with `next` set, and the
+  next page reports the error. Before, the whole query failed (once H3 no longer skipped instead).
+- H4: `Storage::open` first takes an exclusive `flock` on `lock` in `storage.path` and writes its
+  process id there. A second instance fails at once, exit status 1: "opening log at …: locked by
+  another process, pid N; is another uevtd running on this log?". The lock goes with the process. On a
+  file system that cannot lock, the daemon logs a warning and runs without it, as before.
+- M12: the proposed fix numbered past intact records found after the damage and kept the plain cut
+  otherwise. That misses p21's second case, a damaged last record, since nothing follows it. Recovery
+  now tells a torn tail from damage by what a crash can leave:
+  - A torn tail is cut off, as before; its records were never committed. Either the file ends inside a
+    record, or the last record ends in zeros that run to the end of the file. The zeros must start where
+    the record does or at a 512-byte block boundary inside it, as storage reads a write that never
+    arrived.
+  - Damage is any other end: a read error, a record that is there in full but invalid, or intact records
+    after an invalid one. The file is kept as it is, as a sealed segment. The log continues in a new
+    segment past every record the rest could hold: one per frame header after the last intact record.
+    A search finds intact records, frames whose checksum holds and whose sequence number fits the bytes
+    in front of them. They bound the numbering and are never delivered.
+  - A trailing file is removed only if it holds no intact record anywhere.
+  - Numbering also continues past the highest cursor file, a temporary one included, when that is past
+    the recovered head. Damage that looked like a torn tail leaves such a cursor, and so does a disk
+    that lost data after reporting it synced, as SD cards can. Outbound reset the cursor to the head,
+    so new records took numbers the receiver had seen. Cursors above 2^53 are ignored.
+- L24: a damaged segment is no longer cut back. Creating the next segment is the only change recovery
+  makes, so a crash at any point is recovered the same way, and no sync waits on a cut-back. This
+  changes M7's handling of a read error at startup. Readers now retry the unreadable part, as they
+  retry one found later (M9), instead of skipping it at once. A transient error then costs nothing.
+  A persistent one holds the channels until the segment is evicted, which is the case the design
+  note's decision (step 11) bounds.
+- L17: a failed removal sets `evict_error`. `/v1/health` reports it ("log over its size limit:
+  removing segment N: …"), and status shows it as `storage.last_error` when no write error is set. It
+  is logged once a minute and cleared once eviction succeeds.
+- L18: each indexed segment has a flag. The first reader that skips a segment counts and logs it, and
+  later ones log at debug. Recovery marks the damaged segment it counts.
+- L25: `force_new` is cleared only once the new segment exists, and a stale index entry goes only after
+  its file.
+- L27: a sealed segment whose size cannot be read is indexed as a full segment of `segment_bytes` and
+  counted as damaged. Readers retry it as they retry one that cannot be opened, and eviction removes it
+  in its turn. One that disappears between the listing and the stat is left out.
+- L29, 32-bit: lengths are computed in u64, with checked conversions, in `peek`, `fill` and
+  `decode_frame`. A corrupt length near 2^32 wrapped to a frame shorter than its header, and one of
+  2^32 − 24 to a length of 0, which made positioning loop forever.
+
+Found while implementing, and fixed:
+
+- `fill` read whole chunks with `read_exact_at`. When a file was shorter than its committed length, as
+  H4's cut-back left one, a read failed up to 64 KiB early. Up to that many intact records were then
+  skipped as "segment shorter than its committed length". It now returns what the file holds.
+- A corrupt length made every reader of the segment allocate up to the segment's length, 256 MiB at
+  most, before the checksum failed. A frame claiming more than 1 MiB, more than any message, is now
+  checked a chunk at a time and read only if it is intact.
+- The search computes the checksum of every candidate. Payloads crafted to look like headers at every
+  offset made it quadratic: 25 s for a 1 MiB file in a debug build, hours for a large segment. Checking
+  more than four times the bytes searched ends the search, and the result counts as damage.
+- A torn tail that could not be cut off failed the startup. The writer cuts the file back before it
+  appends anyway, so it is a warning now.
+
+Verified with unit tests, end-to-end tests and probes of the release binary:
+
+- Each fix's test fails when its old behaviour is put back: 18 reverts, each applied alone.
+- The log's model tests of §9 joined the suite; those of the framer, the window and the tracker join
+  with their modules in step 11. The recovery test was rewritten for the new rules:
+  - the records before the damage are kept, and numbering goes no further than the rest could hold;
+  - a torn tail or zeros cost no number;
+  - damage never lets a number of a record in the file be given out again. The exception is the last
+    record with its length damaged to run past the end, which looks torn.
+
+  The default seeds are few, 6.7 s on macOS, where every sync is a full flush, and `UEVTD_SEEDS`
+  raises them. On Linux with the log on a tmpfs, 20 000 seeds of each and 1 000 of the writer race
+  passed.
+- The new end-to-end test starts a second daemon on the same log. It stops at the lock, names the
+  holder's process id, binds nothing and leaves the cursor file.
+- macOS and Linux: 110 unit and 16 end-to-end tests pass; on Linux 25 of 25 repeated end-to-end runs
+  and 15 of 15 unit runs pass.
+
+Against the release binary on Linux:
+
+| Probe | Before | After |
+|-------|--------|-------|
+| p15: one EIO injected into a query's second read | 200 without records 131–2 082 | 200 with all 2 191 records; `corrupt_segments` 0 |
+| p18: a second instance without channels | the first one's cursor file deleted | exit 1, "locked by another process, pid …"; the file kept |
+| p18: the same configuration twice | ran until it failed on the socket | exit 1; no connection to the broker |
+| p18: started 60 times during a burst | `lost` 45, 4 notices, `corrupt_segments` 4 | 10 000 delivered, `lost` 0, `corrupt_segments` 0 |
+
+Residual:
+
+- Two kinds of damage to the last record still look like a torn tail, and its number can be given
+  out again unless a cursor is past it:
+  - its length is damaged so that it runs past the end of the file;
+  - its payload ends in zeros across a block boundary.
+- On FAT, a power loss can leave stale data at the end of a file. If that data's first length
+  happens to fit in the file, it counts as damage, and a few numbers are skipped and counted lost.
+- Until step 11's decision, a persistent read error found at startup holds the channels until the
+  segment is evicted.
+- A failed directory sync after creating a segment is still only a warning (step 1). On a file system
+  that persists a new file's data but not its directory entry, a power loss can then take a committed
+  segment. The cursor floor protects what channels delivered from it.
+
+## 9. Second review (2026-10-22)
+
+Reviewed at `407be9d`, after steps 1–8, for defects that the fixes introduced or left, with the
+emphasis on boundaries. How it was checked:
+
+- Every source file was read again. Three further reviews took storage, outbound, and configuration,
+  API and inbound in turn, with the sources of the locked dependencies (rumqttc 0.25.1,
+  tokio-tungstenite 0.30.0, tokio 1.54.0, axum 0.8.9, hyper 1.12.0, serde_json 1.0.154). Each finding
+  below was then reproduced by a test or a probe, or, where marked "code", traced through the code.
+- Randomized model tests for the pure state machines and the log, in a scratch copy of the tree. They
+  found nothing; their coverage is listed under "Verified correct".
+- Fault injection against the release binary on the Linux container: delays and EIO injected with
+  strace, a second instance, a throttled link, a low descriptor limit.
+- Clippy's cast, unwrap and indexing lints, to list every narrowing cast and slice for inspection.
+
+| ID  | Sev    | Area      | Finding | Evidence |
+|-----|--------|-----------|---------|----------|
+| H3  | High   | Storage   | After a failed read the segment reader keeps stale bytes, and its retry skips the rest of the segment as corrupt: one transient EIO costs a channel up to a segment of intact records, counted as lost, and a query returns 200 without them | p15–p17 |
+| H4  | High   | Storage   | A second instance on the same log truncates the running one's active segment, deletes its cursor files and starts channels before it fails on the socket | p18 |
+| M10 | Medium | API       | API connections are unlimited; idle ones use up the file descriptors, and the writer then drops every message | p19 |
+| M11 | Medium | Config    | A JSON array is read as a configuration: `PUT []`, `PATCH []` or `PATCH {"outbound": []}` removes every channel and its cursor | p20 |
+| M12 | Medium | Storage   | Recovery cuts back damaged committed records in the active segment as a torn tail, or deletes the file, and reuses their sequence numbers | p21 |
+| M13 | Medium | WebSocket | On a slow link a session that keeps acknowledging ends with "no pong"; a frame that takes longer than `keep_alive_s` + `timeout_ms` to send is never delivered | p22 |
+| M14 | Medium | MQTT      | Connecting and every flush have rumqttc's fixed 5 s budget, so a broker behind a slow or high-latency link is never reached | p23 |
+| L13 | Low    | API       | "One query at a time" does not hold: an abandoned query keeps reading after its slot is given away, and responses are written after it is released | p14 |
+| L14 | Low    | Config    | A saved configuration can become invalid when the host name changes, and the daemon then refuses to start (step 8) | p24 |
+| L15 | Low    | Config    | A dangling symlink at the configuration path is replaced by a file of defaults | p24 |
+| L16 | Low    | Config    | Socket paths that can never be bound pass validation; the next start fails for good | p24 |
+| L17 | Low    | Storage   | Eviction stops at a segment it cannot remove, and the log grows past `max_bytes` unreported | p25 |
+| L18 | Low    | Storage   | `corrupt_segments` counts every pass over a corrupt segment, not segments | p26 |
+| L19 | Low    | API       | The receipt-time lookup forgets its position when a channel catches up, then rescans the active segment from its start | code |
+| L20 | Low    | Outbound  | Any error reading a cursor, not only an unparsable one, replays the whole log and overwrites the file | code |
+| L21 | Low    | MQTT      | A channel cannot be stopped while it reads its TLS configuration; a `ca_file` that blocks hangs reconciliation and shutdown | code |
+| L22 | Low    | MQTT      | The memory bound ignores the topic, which rumqttc copies into every publish in flight | code |
+| L23 | Low    | Inbound   | Connections opened before a limit change keep the old `max_message_bytes` for their lifetime | code |
+| L24 | Low    | Storage   | Recovery after a read error is not repeatable after a crash, and a failed cut-back skips the sync | code |
+| L25 | Low    | Storage   | Two failures in a row can reopen a sealed segment and later reuse sequence numbers | code |
+| L26 | Low    | Runtime   | Blocking work on runtime threads: SIGHUP's reload, and the index lock held across file deletions | code |
+| L27 | Low    | Storage   | A sealed segment that cannot be stat'ed at startup is left out of the index and never evicted | code |
+| L28 | Low    | Config    | A save that fails after its rename leaves the new configuration on disk but not applied | code |
+| L29 | Low    | Misc      | Smaller items, listed below | code |
+
+### H3. A failed read leaves stale bytes that the retry decodes
+
+Where: [src/storage/segment.rs:219-234](src/storage/segment.rs#L219) (`SegmentCursor::fill`),
+[src/storage/mod.rs:1268](src/storage/mod.rs#L1268), [src/outbound/mod.rs:488-493](src/outbound/mod.rs#L488).
+
+`fill` moves `buf_pos` to the new position and resizes the buffer before it reads. When the read fails
+with anything but end of file, the buffer keeps what it held, or what the failed read left in it, now
+labelled with the new position. The reader keeps its cursor across the error, as M9's fix intends, so
+the next `fill` at that position finds the bytes "already buffered" and decodes them without reading.
+They usually begin with the first frame of the previous chunk. Its CRC is valid but its sequence number
+is lower, so `Reader::next` reports "sequence mismatch" and `skip_segment` passes the rest of the
+segment, or everything up to the head in the active segment. A persistent error ends the same way one
+retry later, because a buffer that held nothing decodes as a corrupt frame.
+
+Neither half of M9 holds: the records before a failure are delivered, but the failing position is
+never retried, and a persistent error does not stall. The channel counts intact records as lost, sends
+a `lost` notice in their place and passes them for good. `last_error` never shows the I/O error, and
+`corrupt_segments` grows. A query that meets the error mid-page returns 200 without those records.
+
+Evidence:
+- p16: a segment cursor whose read fails once at record 126 returns record 1 on the retry.
+- p17: a channel's reader, after one transient failure, returns 95 records, then skips 1 912 intact
+  ones, counted in `lost`.
+- p15: the release binary, with one EIO injected by strace into a query's second read, answered 200
+  with records 131–2 082 missing and logged "corrupt record; skipping the rest of the segment … sequence
+  mismatch". The same query without the fault returned all of them.
+
+Fix: clear the buffer before `fill` returns any error, so the retry reads the file. p16 becomes the
+regression test.
+
+### H4. A second instance damages the running one before it fails
+
+Where: [src/daemon.rs:56](src/daemon.rs#L56), [src/storage/mod.rs:145-250](src/storage/mod.rs#L145)
+(`Storage::open`), [src/outbound/mod.rs:151](src/outbound/mod.rs#L151).
+
+`Storage::open` runs before either socket is bound, and nothing locks `storage.path`. A second instance
+may come from someone starting the daemon by hand, from a second init mechanism, or from a supervisor
+that does not wait for the first. It recovers the log as if it owned it:
+- it scans and syncs the active segment;
+- it cuts the segment back at an incomplete record, which is the first instance's batch being written;
+- it removes trailing files and evicts by its own limit;
+- its supervisor removes the cursor files of channels it does not have and starts the ones it has.
+
+All of this happens while its inbound bind is being tried. Only when the bind fails does it exit with
+status 1.
+
+A cut-back under the first instance leaves that instance's committed length past the end of the file.
+Its readers then skip the rest of the segment as corrupt ("segment shorter than its committed length"),
+and its later appends land at offsets its index does not expect. A deleted cursor file is written again
+only when its channel next advances. After an unclean stop, that channel starts at the head and skips
+its backlog without counting it. §4's "a second instance fails fast" holds for the socket only.
+
+Evidence (p18):
+- A second instance without channels deleted the first one's cursor file and exited 1.
+- Started 60 times during a burst into the first instance, it cost that instance's MQTT channel 45
+  committed records (`lost` 45, 4 notices, `corrupt_segments` 4).
+- The same burst without it: 10 000 delivered, `lost` 0.
+
+Fix: take an exclusive `flock` on a lock file in `storage.path` before `Storage::open` does anything
+else, and exit with a message that says another instance holds the log. The lock goes with the process,
+so a crash leaves nothing to clean up.
+
+### M10. Unlimited API connections use up the file descriptors
+
+Where: [src/api.rs:192-201](src/api.rs#L192).
+
+axum 0.8.9 builds hyper's connections without a timer, so neither a header-read nor an idle timeout
+applies, and nothing limits their number. A local client that leaks connections, or opens one per poll
+without closing it, uses up the process's descriptors (the soft limit is typically 1024). The writer
+then cannot open or create a segment, and every batch is dropped (`dropped`, `write_errors`, "Too many
+open files"). Cursor saves, segment opens by readers and inbound accepts fail the same way. Inbound has
+`max_connections`; the API has nothing like it.
+
+Evidence (p19): with the daemon at its limit of 128 descriptors, held by idle API connections, a
+producer that had connected before them sent 300 messages. All 300 were dropped, with `last_error`
+"opening the active segment: Too many open files (os error 24)".
+
+Fix: accept at most a few API connections at once (16 is plenty for a local control socket), close
+idle ones after a timeout, and raise the soft descriptor limit to the hard one at startup.
+
+### M11. A JSON array is read as a configuration
+
+Where: [src/config.rs:22-30](src/config.rs#L22) and every `#[serde(default)]` struct;
+[src/config.rs:651-655](src/config.rs#L651) (`parse`: the file and SIGHUP),
+[src/config.rs:743-748](src/config.rs#L743) (`PATCH`), [src/api.rs:278](src/api.rs#L278) (`PUT`).
+
+serde reads a struct from a sequence too, taking missing elements from its defaults, and
+`deny_unknown_fields` does not apply to sequences. So `[]` reads as `Config::default()`, and
+`{"outbound": []}` as an `outbound` without channels. RFC 7386 makes a non-object patch replace the
+whole document, which should then fail validation; here it passes.
+
+`PATCH []` is also an empty JSON Patch (RFC 6902), which tools that patch by diff send. It:
+- removes every channel and deletes its cursor file, so a channel added back starts at the head and
+  skips its backlog uncounted;
+- moves both sockets to their default paths;
+- resets the storage limits, evicting at once if they were larger;
+- switches to the default `storage.path` at the next restart.
+
+Evidence (p20): `parse("[]")` gives the defaults. `PATCH []` and `PATCH {"outbound": []}` return 200
+without channels and save that to the file. `{"outbound": {"channels": []}}` is refused, since serde
+does not read a map from a sequence.
+
+Fix: before reading a document, check its shape: the root, each section, `channels` and each channel
+must be JSON objects.
+
+### M12. Recovery reuses the sequence numbers of damaged committed records
+
+Where: [src/storage/mod.rs:167-185](src/storage/mod.rs#L167) (trailing files without records),
+[src/storage/mod.rs:685-691](src/storage/mod.rs#L685) (`recover_active`, an invalid record).
+
+At startup the first invalid record in the active segment ends it. The file is cut back there, and
+numbering resumes after the last valid record. That is right for a torn tail, which holds only records
+that were never committed. Damage to committed records, from bit rot or a flash page torn by a power
+loss elsewhere, is treated the same way. The records after the damage go with it, though they may have
+been delivered, and their sequence numbers are given to new messages. A trailing file whose header and
+first frame are both invalid is deleted outright, whatever it holds.
+
+Receivers that deduplicate by `seq`, as §6.2 asks, then drop the new messages as duplicates, and
+channel cursors past the new head are reset to it. The read-error path already guards against exactly
+this, by skipping the numbers that the unreadable rest could hold. This is L3 at recovery instead of at
+read, and with reuse.
+
+Evidence (p21), with records 23–25 committed in the active segment:
+- Zeroing the segment's first 48 bytes made recovery delete the file, and the next message became
+  seq 23.
+- Flipping one payload byte of record 25 cut it back, and the next message became seq 25 again.
+
+Fix: when CRC-valid frames follow the damage, number past them. Scan the rest of the file for such
+frames only to learn the highest sequence number in it, never to deliver them, and start the next
+segment above that number, as the read-error path does. Keep the plain cut for a tail without a valid
+frame, which is what a crash leaves. Delete a trailing file only when no valid frame is in it at all.
+
+### M13. Slow links end healthy WebSocket sessions as "no pong"
+
+Where: [src/outbound/websocket.rs:146](src/outbound/websocket.rs#L146),
+[src/outbound/websocket.rs:156-161](src/outbound/websocket.rs#L156).
+
+The pong deadline starts when the ping enters the writer's queue. The ping sits behind up to a window
+of frames there (two after a reconnect), and behind whatever the socket's send buffer holds. Only a
+pong meets the deadline; acknowledgements do not count. Whenever the frames ahead of a ping take longer
+than `timeout_ms` to send, a healthy session ends as "no pong". The acknowledgements reset the backoff,
+so the channel reconnects after 1 s and sends every unanswered frame again. With the defaults (a 1 MiB
+window, `timeout_ms` 10 000) this happens below about 100 KiB/s while a backlog drains.
+
+A single frame that takes longer than `keep_alive_s` + `timeout_ms` to send is never acknowledged in
+any session, and the channel stops there. An example is a 64 KiB binary payload, escaped to 384 KiB of
+JSON, over 8 KiB/s. §10 attributes the error to a receiver that stopped answering pings.
+
+Evidence (p22): over a link passing 32 KiB/s towards a receiver that acknowledges every frame, with
+`keep_alive_s` 1 and `timeout_ms` 2 000, five sessions ended with "no pong within 2000 ms" in 20 s.
+152 of 190 records were sent more than once.
+
+Fix: count any message from the receiver as a sign of life, and start the deadline when the writer has
+written the ping.
+
+### M14. MQTT has a fixed 5 s network budget
+
+Where: [src/outbound/mqtt.rs:115-145](src/outbound/mqtt.rs#L115).
+
+The channel never sets rumqttc's `NetworkOptions`, so `connection_timeout` stays at its default of
+5 s. rumqttc applies it to the whole connection (DNS, TCP, TLS and CONNECT/CONNACK) and to the flush of
+every request:
+- A broker behind a high-latency link is never reached ("Network timeout"). That covers several round
+  trips of a second or more, or a resolver that waits 5 s on a dead first nameserver.
+- A flush that cannot complete in 5 s, such as a large publish over a slow uplink, ends the session
+  ("Flush timeout"). The entry is published first in the next session, so the channel can stall
+  behind it.
+
+Nothing in the configuration changes this, while WebSocket has `timeout_ms`. rumqttc's default also
+leaves Nagle's algorithm on.
+
+Evidence (p23): a broker that answers CONNECT after 6 s was never connected in 20 s, with 3 attempts
+and `last_error` "Network timeout". The flush half needs a link slower than loopback's socket buffers
+allow; it follows from the same timeout.
+
+Fix: give MQTT channels a `timeout_ms` (default 10 000, as for WebSocket), pass it to
+`NetworkOptions::set_connection_timeout` (whole seconds, rounded up), and set `set_tcp_nodelay(true)`.
+
+### Low
+
+- **L13. One query at a time does not hold** ([src/api.rs:331-347](src/api.rs#L331)).
+  - **Abandoned queries:** the slot belongs to the request handler. When a client disconnects
+    mid-query, hyper drops the handler and the slot with it, while the read goes on in the blocking
+    pool, so the next query starts beside it.
+  - **Slow readers:** a response, up to six times a 1 MiB page as JSON, is written after the slot is
+    released, so slow readers hold one each.
+  - **Evidence (p14):** with every read delayed by 1 s, four queries abandoned after 0.5 s each left
+    four threads reading at once.
+  - **Fix:** an owned permit, moved into the blocking task and then into the response body.
+- **L14. A saved configuration can become invalid when the host name changes**
+  ([src/config.rs:373](src/config.rs#L373), from step 8).
+  - **Mechanism:** the duplicate check reads the host name at every validation, startup included.
+    Two channels to one broker without a `client_id`, saved while the host had no name, become
+    invalid once it has one. So does a configured id that a new host name happens to equal.
+  - **Effect:** the daemon then refuses to start, and the supervisor restarts it in a loop. Until
+    the restart, every unrelated `PATCH` is refused.
+  - **Evidence (p24):** the same two channels pass with no host name and fail with `dev`.
+  - **Fix:** refuse such a duplicate when the configuration is changed (`PUT`, `PATCH`, SIGHUP). At
+    startup, only log it and report it in the channels' `last_error`.
+- **L15. A dangling symlink at the configuration path is replaced by defaults**
+  ([src/config.rs:637-646](src/config.rs#L637)).
+  - **Mechanism:** a missing target reads as a missing file. Defaults are written, and the rename
+    replaces the link with a regular file.
+  - **Effect:** with the configuration on a data partition that mounts late, the device runs
+    without channels from then on.
+  - **Evidence:** p24.
+  - **Fix:** write defaults only when nothing at all is at the path (`symlink_metadata`), and refuse
+    a dangling link.
+- **L16. Socket paths that can never be bound pass validation**
+  ([src/config.rs:306-314](src/config.rs#L306)).
+  - **Mechanism:** paths longer than `sun_path` allows (107 bytes on Linux), or containing U+0000,
+    are accepted.
+  - **Effect:** a live rebind fails into `last_error`, and the next start fails for good. For
+    `api.path`, no API is left to repair it.
+  - **Evidence:** p24, with a 120-byte path and one with U+0000.
+  - **Fix:** validate both, and U+0000 in `storage.path`.
+- **L17. Eviction stops at a segment it cannot remove**
+  ([src/storage/mod.rs:505-515](src/storage/mod.rs#L505)).
+  - **Mechanism:** any error but NotFound ends the loop, so one undeletable oldest segment (EPERM,
+    EIO) keeps every later one.
+  - **Effect:** the log grows until the disk is full, with an error line per commit and nothing in
+    `last_error` or `/v1/health`.
+  - **Evidence (p25):** 34 488 bytes in 37 segments against a `max_bytes` of 4 000, with health OK.
+  - **Fix:** set the log's `last_error`, and fail health while the log is over its limit by more
+    than a segment.
+- **L18. `corrupt_segments` counts passes, not segments**
+  ([src/storage/mod.rs:1306](src/storage/mod.rs#L1306)).
+  - **Mechanism:** every reader that skips a corrupt segment counts it again and logs an error:
+    each channel, each restart and each query. An alert on the counter fires on every query that
+    passes an old corrupt segment.
+  - **Evidence (p26):** one corrupt segment, read by three readers and two queries, counted 5.
+  - **Fix:** mark the segment in the index, and count and log it once.
+- **L19. The receipt-time lookup forgets its position when a channel catches up**
+  ([src/api.rs:173](src/api.rs#L173)).
+  - **Mechanism:** the lookups of channels with nothing waiting are dropped. A channel that keeps
+    up, lagging at some ticks and not at others, rescans its active segment from the start at every
+    change.
+  - **Cost:** up to `segment_bytes` each time; at 256 MiB that does not fit a 128 MiB device's page
+    cache.
+  - **Docs:** §9's "costs about as much as reading what it delivered" holds only while a channel
+    stays behind.
+  - **Fix:** keep a lookup for every configured channel, and only omit its time while nothing waits.
+- **L20. Any error reading a cursor replays the whole log**
+  ([src/outbound/mod.rs:385-388](src/outbound/mod.rs#L385)).
+  - **Mechanism:** L11 chose a replay for a cursor that cannot be parsed. EACCES, EIO or EMFILE
+    take the same path, and the intact file is overwritten with the oldest position.
+  - **Fix:** replay only on a parse error; on an I/O error, keep the file and retry the start later.
+- **L21. An MQTT channel cannot be stopped while it reads its TLS configuration**
+  ([src/outbound/mqtt.rs:53](src/outbound/mqtt.rs#L53)).
+  - **Mechanism:** `connect` is not raced with cancellation, unlike WebSocket's. A `ca_file` that
+    blocks (a FIFO, a hung network mount) keeps the task in `connect`.
+  - **Effect:** `reconcile` waits for the task forever, no other channel change applies, and
+    shutdown hangs until a second signal.
+  - **Fix:** race `connect` with the token, as WebSocket does.
+- **L22. The MQTT memory bound ignores the topic**
+  ([src/config.rs:598-607](src/config.rs#L598)).
+  - **Mechanism:** rumqttc copies the topic into every publish and keeps it until the
+    acknowledgement.
+  - **Effect:** a 65 535-byte topic with `inflight` 1 024 holds 64 MiB per channel, against §11.1's
+    "about 2 MiB".
+  - **Fix:** cap topics at a size real ones never reach, such as 1 KiB.
+- **L23. Open connections keep the old message limit**
+  ([src/inbound.rs:74](src/inbound.rs#L74)).
+  - **Mechanism:** a producer connected before `max_message_bytes` is lowered keeps the old limit
+    for its lifetime.
+  - **Effect:** the 16 MiB bound of §7.2 and §11.1 can be exceeded. Each of the producer's
+    messages can also exceed the new `segment_bytes`, and with a small `max_bytes` one of them
+    evicts the rest: M2 again.
+  - **Docs:** §5.5's "only to a message accepted just before the limits were lowered" understates
+    it.
+  - **Fix:** apply the new limit to open connections between messages.
+- **L24. Recovery after a read error is not repeatable**
+  ([src/storage/mod.rs:657-658](src/storage/mod.rs#L657),
+  [src/storage/mod.rs:717](src/storage/mod.rs#L717)).
+  - **Crash case:** after a crash between creating the next segment and cutting back the damaged
+    one, the new segment is last at the next start. The damaged one is indexed as sealed at its full
+    length, and channels retry its unreadable rest every second. The comment says such a crash "is
+    recovered the same way again".
+  - **Sync case:** when the cut-back fails, `and_then` also skips the sync, and the valid prefix
+    becomes visible unsynced.
+  - **Fix:** sync regardless of the cut-back, and at startup scan the segment before an empty last
+    one as well.
+- **L25. Two failures in a row can reuse sequence numbers**
+  ([src/storage/mod.rs:959-977](src/storage/mod.rs#L959)).
+  - **Mechanism:** `open_active` clears `force_new` before the new segment exists, and
+    `create_segment` drops the old index entry before removing its file.
+  - **Effect:** suppose a sync fails on a segment's first batch and removing that segment's file
+    then fails too. The following batch reopens the segment sealed before it and appends there. At
+    restart the stale file is the last one, becomes active, and its numbers are given out again.
+  - **Fix:** clear `force_new` only once the new segment exists, and drop the index entry only after
+    its file is gone.
+- **L26. Blocking work on runtime threads** ([src/daemon.rs:252](src/daemon.rs#L252),
+  [src/storage/mod.rs:502-533](src/storage/mod.rs#L502), [src/api.rs:156](src/api.rs#L156)).
+  - **SIGHUP:** the reload reads the file and waits for the configuration lock, which a save holds
+    across its fsyncs, on a worker thread.
+  - **Index lock:** `status()` takes the index lock on workers (the receipt-time task, status and
+    metrics), while eviction holds that lock across file deletions.
+  - **Effect:** with one or two cores, a stalled disk or a large eviction stops every worker,
+    `/v1/health` included, though §9 says health answers even then.
+  - **Fix:** run the reload on the blocking pool, and delete evicted files after releasing the lock.
+- **L27. A sealed segment that cannot be stat'ed at startup is left out**
+  ([src/storage/mod.rs:194-200](src/storage/mod.rs#L194)).
+  - **Mechanism:** unlike one that cannot be opened (§5.6), it is not indexed.
+  - **Effect:** its records read as a gap, and the file is never evicted, outside `max_bytes`.
+  - **Fix:** keep it in the index, so that readers retry it and eviction removes it.
+- **L28. A configuration save that fails after its rename**
+  ([src/config.rs:679-680](src/config.rs#L679)).
+  - **Mechanism:** if opening or syncing the directory fails, the request fails with 500 and the
+    configuration is not applied, but the file already holds it.
+  - **Effect:** it applies at the next SIGHUP or restart, and the next `PATCH` overwrites it with
+    one based on the old configuration.
+  - **Fix:** after the rename, treat a failed directory sync as a warning, as `storage::sync_dir`
+    does.
+- **L29. Smaller items.**
+  - `rejected` counts again when a channel restarts before a rejection is answered: the oversized
+    record is read again, and a refusal can come again
+    ([src/outbound/websocket.rs:189-199](src/outbound/websocket.rs#L189),
+    [src/outbound/mqtt.rs:175-185](src/outbound/mqtt.rs#L175)).
+  - A failed chmod on rebind is recorded as applied, so republishing does not retry it. A rebind
+    error stays in `last_error` after the path is changed back
+    ([src/inbound.rs:185-193](src/inbound.rs#L185), [src/api.rs:130-136](src/api.rs#L130)).
+  - A single `PUT` that swaps `inbound.path` and `api.path` can never apply live: each new socket
+    finds the other's live listener.
+  - On a 32-bit target, `FRAME_HEADER_LEN + len` overflows `usize` for a corrupted length near 2^32
+    ([src/storage/segment.rs:97](src/storage/segment.rs#L97),
+    [src/storage/segment.rs:174](src/storage/segment.rs#L174)). A debug build panics; a release
+    build reads it as corruption, which is right. Checked arithmetic removes the difference.
+
+### Design note: a persistent read error
+
+M9 chose to stay at a failing position. H3 currently turns that into a skip after one retry. Once H3 is
+fixed, a persistent EIO in a sealed segment will hold a channel until the segment is evicted: days at
+low traffic, with only `last_error` and `lag` showing it. A worn sector on SD cards and eMMC is the
+likeliest lasting fault of this kind. Recommended: retry for a bounded time, about ten minutes, then
+skip the rest of the segment with a `lost` notice and an error log, as for corruption.
+
+### Verified correct
+
+None of these found a defect:
+- **Framer:** 20 000 random streams, cut into random chunks, matched a reference. That covers lines
+  at `max` and `max + 1` with and without `\r`, splits between `\r` and `\n`, oversized lines followed
+  by valid ones, and the buffer's capacity bound.
+- **WebSocket window:** 20 000 random sequences of records, notices, acknowledgements and refusals
+  matched a model of the cursor, the bytes held and the answers.
+- **MQTT tracker:** 20 000 runs against a simulation of rumqttc 0.25.1's packet ids: QoS 0, 1 and 2,
+  with PUBREC freeing an id before PUBCOMP, and reconnects that publish again. Every completion matched
+  the publish the broker answered, the cursor never passed an unanswered publish, and no packet id
+  collided.
+- **The log:**
+  - A tailing reader racing eviction and limit changes (1 500 runs), and the writer thread beside a
+    reader and limit changes (400 runs of 3 000 records with heavy eviction). Every record was
+    delivered once, in order, or inside a gap, and `lost` equalled the gaps.
+  - Recovery after torn tails, flipped bytes and garbage in the active segment (5 000 runs). The valid
+    prefix was kept, numbering continued after it, and the log reopened to the same state. That
+    numbering is M12's point when the damage hits committed records.
+  - Queries against a filter of the retained records, including `limit`, the page bound and `more`
+    (5 000 runs).
+  - Receipt-time lookups from any mark (5 000 runs).
+  - A stale tail left by a failed truncation, after a restart, was never returned by readers starting
+    anywhere, by queries or by lookups.
+- **rumqttc 0.25.1:**
+  - A request is written and flushed before its `Outgoing::Publish` event, so QoS 0 completes once its
+    bytes reach the socket.
+  - The request channel holds `inflight` publishes, so `try_publish` never fails on capacity.
+  - `MqttOptions::new` and `set_keep_alive` accept every validated value.
+- **End-to-end suite:** 10 of 10 runs passed at 16 test threads, beside seven busy loops on seven
+  cores.
+
+### Proposed fixes
+
+Three steps, in order of risk; each fix gets a regression test that fails without it.
+
+- **Step 9, the log:** H3, H4, M12, L17, L18, L24, L25 and L27. The model tests of this review join
+  the suite. Done; see §8, step 9.
+- **Step 10, the API and configuration:** M10, M11, L13, L14, L15, L16, L19, L26 and L28.
+- **Step 11, the channels:** M13, M14, L20, L21, L22, L23 and L29, and the decision on the design note.
+
 ## Appendix: probes
 
 These ran in a temporary crate outside the repository that depended on `uevtd` by path, so the review
 changed nothing in the repo. The crate is not kept; each probe can become a regression test when its
-fix lands.
+fix lands. p14–p27, of the second review (§9), ran as tests in a scratch copy of `407be9d` and as
+scripts against its release binary on the Linux container; none of them is in the repository.
 
 | Probe | Checks | Outcome |
 |-------|--------|---------|
@@ -1082,3 +1606,17 @@ fix lands.
 | p11 | HTTP 503 while the log overflows, then 200 | `lost=0` during the outage, 3 072 after recovery (M8) |
 | p12 | a sealed segment made unreadable while the channel delivers | 59 records before it dropped silently, channel stalled until the mode was restored (M9) |
 | p13 | `contrib/config.example.json` through `config::load` | loads and validates; not a bug (§6) |
+| p14 | every read delayed 1 s by strace; four queries, each abandoned after 0.5 s | four threads reading at once (L13) |
+| p15 | release binary, one EIO injected into a query's second read | 200 with records 131–2 082 missing, "sequence mismatch" logged (H3) |
+| p16 | a segment cursor whose read fails once at record 126 | the retry returns record 1 (H3) |
+| p17 | a channel's reader after one transient read failure | 1 912 intact records skipped and counted lost (H3) |
+| p18 | a second instance on the same log, once without channels and 60 times during a burst | the first one's cursor file deleted; 45 committed records lost to its channel, 0 in the control run (H4) |
+| p19 | idle API connections at a limit of 128 descriptors, producer already connected | 300 of 300 messages dropped, "Too many open files" (M10) |
+| p20 | `[]`, `PATCH []`, `PATCH {"outbound": []}` | read as defaults; every channel removed and saved (M11) |
+| p21 | committed records 23–25 in the active segment, damaged before a restart | the file deleted or cut back; seq 23, or 25, given out again (M12) |
+| p22 | WebSocket over a link passing 32 KiB/s, receiver acknowledging every frame | 5 sessions ended as "no pong" in 20 s; 152 of 190 records sent again (M13) |
+| p23 | an MQTT broker that answers CONNECT after 6 s | never connected: "Network timeout" (M14) |
+| p24 | a dangling symlink as the configuration path; 120-byte and U+0000 socket paths; two default MQTT channels with and without a host name | link replaced by defaults; both paths validate; valid only without a host name (L15, L16, L14) |
+| p25 | the oldest segment made undeletable, `max_bytes` 4 000 | 34 488 bytes in 37 segments, health OK (L17) |
+| p26 | one corrupt segment read by three readers and two queries | `corrupt_segments` 5 (L18) |
+| p27 | model tests: Framer, WebSocket window, MQTT tracker, reader and eviction, recovery, queries, lookups, stale tail, writer race; end-to-end suite under CPU load | no defect found (§9, "Verified correct") |

@@ -144,6 +144,7 @@ after lowering it no new connection is admitted until enough open ones close.
 
 ```
 <storage.path>/
+  lock                          locked by the daemon that has the log open; holds its process id
   00000000000000000001.seg      segment files, named by the first sequence number they hold
   00000000000000016384.seg
   ...
@@ -204,9 +205,10 @@ a corrupted payload.
    record, nor one that a crash could still take back, so a sequence number
    that was ever delivered or returned by a query is never reused.
 5. A sealed segment's committed length is its file length. The active segment
-   is validated on open; a torn tail (crash mid-write) is truncated to the last
-   complete, CRC-valid record, and what remains is synced before it becomes
-   visible.
+   is validated on open and synced before it becomes visible. A torn tail
+   (crash mid-write) is truncated to the last complete, CRC-valid record; after
+   damage of any other kind the segment is kept as it is, and numbering
+   continues past every record it could hold (§5.6).
 
 ### 5.4 Write path
 
@@ -271,54 +273,94 @@ loses that way is counted and logged at once (§5.9).
 Lowering `max_bytes` at runtime evicts immediately; changing `segment_bytes`
 applies to the next rotation.
 
+The oldest records go first, so a segment that cannot be removed stops
+eviction: the log grows past `max_bytes`, `/v1/health` fails with the error,
+which is also the log's `last_error`, and the error is logged once a minute,
+until the segment can be removed. Eviction then catches up at the next commit.
+
 ### 5.6 Recovery
+
+**Lock.** Before anything else the daemon takes an exclusive `flock` on `lock`
+in `storage.path` and writes its process id there. A second instance on the
+same log stops at once with an error that names that process id, before it
+reads, cuts or removes anything, binds a socket or starts a channel. The lock
+goes with the process, so a crash leaves nothing to clean up. On a file system
+that cannot lock, the daemon logs a warning and runs without it.
 
 On open: list `*.seg`, validate each header against its file name, index
 `(first_seq -> base_ts, len)`. Sealed segments are trusted structurally
 (`len` = file size); every record is still CRC-checked when read. A sealed
 segment that cannot be opened does not stop the startup: it is indexed from its
 file size, and readers retry it and report the error (§5.7), so a permission
-mistake can be fixed without losing anything. A segment whose header is
-unreadable is kept, its records are verified on read, and it is never chosen as
-the start of a time-range scan (its `base_ts` is treated as infinite, so scans
-begin one segment earlier).
+mistake can be fixed without losing anything. One whose size cannot be read is
+indexed as a full segment of `segment_bytes`, retried the same way, and removed
+by eviction in its turn; it counts in `corrupt_segments`. A segment whose header
+is unreadable is kept, its records are verified on read, and it is never chosen
+as the start of a time-range scan (its `base_ts` is treated as infinite, so
+scans begin one segment earlier).
 
-The active segment is scanned in full; the first invalid or incomplete record
-ends it and the file is truncated there with a warning. The segment is then
-synced before any of its records becomes visible: after a crash of the daemon,
-not of the system, records that were written but not synced are still in the
-page cache, and a power loss after their delivery could take them back. Head
-sequence and timestamp come from the last valid record (or from `base_ts` and
-`first_seq - 1` for an empty active segment). Trailing files that hold no
-record at all (a crash between creating a segment and its first write) are
-removed so the previous segment becomes active again; one that cannot be read
-is kept, since what it holds is unknown. Startup cost is one segment scan
-(8 MiB), independent of log size.
+The active segment is scanned in full, and synced before any of its records
+becomes visible: after a crash of the daemon, not of the system, records that
+were written but not synced are still in the page cache, and a power loss after
+their delivery could take them back. Head sequence and timestamp come from the
+last valid record (or from `base_ts` and `first_seq - 1` for an empty active
+segment). What ends the valid records decides what happens to the rest:
 
-A read error in the active segment, such as a bad sector, ends it like an
-invalid record, except that the records after the failure may have been
-committed and delivered, so their sequence numbers must not be used again.
-Recovery therefore creates the next segment, durably, at the head plus the
-number of records the unreadable rest could hold (its length over the 24-byte
-frame header), and only then cuts the damaged file back to its valid prefix.
-The records in between count as lost for every channel that had not delivered
-them, with a notice in their place; the count is an upper bound. The segment is
-counted in `corrupt_segments`. Opening the active segment still has to succeed,
-since the daemon appends to it.
+- **A torn tail** is cut off with a warning, and numbering continues after the
+  last valid record. It is what a crash in the middle of a write leaves: the
+  file ends inside a record, or the last record ends in zeros that run on to
+  the end of the file and start where the record does or at a 512-byte block
+  boundary inside it, as storage reads a write that never arrived. Such records
+  were never committed, so no one has seen their numbers. A tail that cannot be
+  cut off is cut back by the writer before it appends.
+- **Damage** is any other end: a read error, a record that is there in full but
+  invalid, or intact records after an invalid one. It may have hit committed
+  records, which channels may have delivered and whose numbers receivers have
+  seen. The file is kept as it is, as a sealed segment, and the log continues in
+  a new segment, created durably, past every sequence number the rest of the
+  file could hold: one per 24-byte frame header after the last intact record
+  found. A search finds those records, frames whose checksum holds and whose
+  number fits the bytes before them; they only bound the numbering. Readers read
+  the segment up to the damage as any other: they retry a read error (§5.7) and
+  skip the rest of the segment from a corrupt record. What they pass over counts
+  as lost, with a notice in its place, and the count is an upper bound. The
+  segment counts in `corrupt_segments`. Creating the new segment is the only
+  change, so a crash at any point is recovered the same way again.
 
-A corrupt record inside a sealed segment (bit rot) is logged with its offset;
-the reader skips the remainder of that segment and continues with the next,
-counting the skipped records as lost. There is no attempt to resynchronise
-inside a segment: record boundaries are only known from the chain of lengths,
-and guessing would risk delivering garbage.
+Trailing files that hold no record at all, intact or not (a crash between
+creating a segment and its first write), are removed so the previous segment
+becomes active again; one that cannot be read is kept, since what it holds is
+unknown. Opening the active segment still has to succeed, since the daemon
+appends to it. Startup cost is one segment scan (8 MiB), independent of log
+size, and after damage one more read of the rest of that segment.
+
+**Numbering never goes back below a cursor.** If the highest cursor file, one
+left by an interrupted save included, is past the recovered head, records a
+channel delivered are gone, to damage that looked like a torn tail or to a disk
+that lost data after reporting it synced. The log then continues at that
+cursor, in a new segment, with an error logged, and channels behind it count
+the records in between as lost. A cursor above 2^53, which no daemon reaches,
+is ignored.
+
+A corrupt record inside a sealed segment (bit rot) is logged with its offset,
+once per segment and process; the reader skips the remainder of that segment
+and continues with the next, counting the skipped records as lost. Nothing is
+ever delivered from a resynchronisation inside a segment: record boundaries are
+only known from the chain of lengths, and guessing would risk delivering
+garbage.
 
 ### 5.7 Read path
 
 `Reader` is a tailing cursor: `next_seq` plus an open file handle and buffered
 position inside the segment that contains it. Reads use `pread` of 64 KiB
 chunks bounded by the committed length and decode as many complete records as
-fit the requested batch. Creating a reader at an arbitrary sequence costs one
-scan from the start of that segment; subsequent reads are O(bytes returned).
+fit the requested batch. A failed read leaves nothing in the buffer, so its
+retry reads the file again, and a file shorter than its committed length still
+yields every record it holds. A frame longer than 1 MiB, more than any message,
+has its checksum computed a chunk at a time before it is read whole, so a
+corrupt length never costs an allocation as large as the segment. Creating a
+reader at an arbitrary sequence costs one scan from the start of that segment;
+subsequent reads are O(bytes returned).
 Where records are missing, because they were evicted or the rest of a
 segment is corrupt, a read returns the gap on its own, as the number of
 records it passed over, and never together with records. The records of a
@@ -338,7 +380,10 @@ or when the page holds `limit` records or 1 MiB of payload (a larger first
 record is still returned). Results are in sequence order. Because timestamps
 never decrease, the first record left out tells whether the page is the last:
 `next` is the page's last sequence number when more records follow and `null`
-otherwise, and the caller paginates with `after=<next>`.
+otherwise, and the caller paginates with `after=<next>`. A read error ends the
+page in front of it, with `next` set; the next page starts at the failing
+position and fails with the error, so a query never passes records it could
+not read.
 
 ### 5.8 Cursors
 
@@ -349,8 +394,9 @@ always when it stops. Writing it at creation is what lets a backlog that
 accumulates before the first successful delivery survive a restart. On restart a channel resumes from its cursor; up to one second of
 already-delivered messages may be delivered again (at-least-once). A cursor
 that points below the eviction horizon jumps forward, and the gap is logged
-and counted as lost. A cursor past the head, which only a hand-repaired log
-can produce, is reset to the head so that new records are not skipped. A cursor
+and counted as lost. At startup no cursor is past the head, since numbering
+continues past the highest one (§5.6); one written past it by hand later is
+reset to the head so that new records are not skipped. A cursor
 file that cannot be parsed restarts the channel at the oldest retained record:
 the position is unknown, and at-least-once means replaying rather than
 skipping. Cursor files of channels that are no longer configured are removed at
@@ -749,10 +795,11 @@ a channel that delivers therefore costs about as much as reading what it
 delivered, and a channel that waits costs nothing after the first lookup.
 
 **Health.** `/v1/health` fails with 503 from a failed write or sync until a
-batch is committed again, and while one batch or sync has taken more than 30 s,
-as on a stalled disk. It reads no state that the writer holds while it works,
-so it answers even then. It is for a supervisor or an operator to act on; the
-daemon itself carries on.
+batch is committed again, while one batch or sync has taken more than 30 s,
+as on a stalled disk, and while a segment that eviction must remove cannot be
+removed (§5.5). It reads no state that the writer holds while it works, so it
+answers even then. It is for a supervisor or an operator to act on; the daemon
+itself carries on.
 
 ## 10. Failure modes
 
@@ -766,8 +813,10 @@ daemon itself carries on.
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1); the process supervisor, which a deployment must provide (README), starts it again |
 | Channel task panics                       | Reported in `last_error`; started again from its cursor after 1 s, doubling to 60 s while it makes no progress; `restarts` counts it |
-| Read error in the active segment at startup | Records before it kept; the next segment starts past what the rest could hold, which is counted as lost |
-| Sealed segment cannot be opened at startup | Startup continues; readers retry it and report `last_error`         |
+| Read error or damage in the active segment at startup | The segment is kept as it is, and numbering continues past every record the rest could hold; readers retry a read error and skip from a corrupt record, and what they pass over counts as lost |
+| A channel's cursor past the head at startup, as after a disk lost synced data | Numbering continues at the cursor; channels behind it count the records in between as lost |
+| Sealed segment cannot be opened or its size read at startup | Startup continues; readers retry it and report `last_error`         |
+| A segment cannot be removed by eviction   | Eviction stops there and the log grows past `max_bytes`; health fails and the error is logged once a minute until it can be removed |
 | Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost, a notice in its place; others unaffected |
 | Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error` |
 | Cursor file unreadable                    | Channel replays from the oldest retained record                            |
@@ -777,6 +826,7 @@ daemon itself carries on.
 | Target accepts connections but takes nothing | Reconnects back off to once a minute; the cursor stays; `retries` and `last_error` show it |
 | Receiver stops answering pings            | Session ends after `timeout_ms`; reconnect with backoff                   |
 | TLS verification fails, e.g. a wrong clock | Connection fails, reported in `last_error`, retried with backoff          |
+| Another instance on the same log          | Startup fails at the log's lock, naming the holder's process id, before anything is changed |
 | Another instance already listening        | Startup fails; the socket file is not stolen                              |
 | Config file invalid at startup            | Startup fails with the validation error                                   |
 | Config file missing at startup            | Defaults are used and written to the path                                 |
@@ -812,7 +862,7 @@ Every buffer that holds messages has a byte bound:
 | Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when producers outrun the disk |
 | Write batch | 1 MiB of encoded records, or one record | 1 MiB |
 | Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc; WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
-| Each log reader, and the API's receipt-time lookup | a 64 KiB read buffer, or one record if larger | 64 KiB |
+| Each log reader, and the API's receipt-time lookup | a 64 KiB read buffer, or one record if larger; a frame claiming more than 1 MiB is checked a chunk at a time, so a corrupt length costs no more | 64 KiB |
 | A query | one at a time: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
 | An API request | a 256 KiB body | small |
 

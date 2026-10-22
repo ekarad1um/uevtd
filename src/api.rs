@@ -423,7 +423,7 @@ async fn get_status(State(state): State<Shared>) -> Json<Value> {
             "evictions": sm.evictions.load(Relaxed),
             "corrupt_segments": sm.corrupt_segments.load(Relaxed),
             "clock_steps": sm.clock_steps.load(Relaxed),
-            "last_error": sm.last_error.get(),
+            "last_error": sm.last_error.get().or_else(|| sm.evict_error.get()),
         },
         "channels": channels,
     }))

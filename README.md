@@ -24,7 +24,8 @@ Two things are left to the system that runs it:
 
 - A process supervisor that starts it again when it exits with a non-zero
   status. The daemon exits with 1 when it cannot start, for example because a
-  socket path is in use or the log cannot be opened, and when its log writer
+  socket path is in use, the log cannot be opened or another daemon has it
+  open (the error names that process), and when its log writer
   thread panics; a channel that panics is restarted inside the daemon. A clean
   stop exits with 0, a second signal with 130 and a usage error with 2.
 - Write access for the daemon's user to the directory of the configuration
@@ -206,7 +207,7 @@ Served over `api.path`; use `curl --unix-socket`.
 | GET    | `/v1/messages` | Time-ordered range query, see below. |
 | GET    | `/v1/status`   | JSON status: uptime, `restart_required`, inbound and storage counters; per channel the cursor, `lag`, the counts `delivered`, `rejected`, `retries`, `lost` and `notices`, and the last error. See below. |
 | GET    | `/v1/metrics`  | The same values in Prometheus text format. |
-| GET    | `/v1/health`   | `200 ok` while the log takes writes; `503` with the reason after a failed write or sync until a batch is committed again, and while one write or sync takes more than 30 s. |
+| GET    | `/v1/health`   | `200 ok` while the log takes writes; `503` with the reason after a failed write or sync until a batch is committed again, while one write or sync takes more than 30 s, and while eviction cannot remove a segment, so that the log grows past `storage.max_bytes`. |
 
 Errors are `{"error": "<message>"}` with status 400, 404, 405, 413, 500 or 503.
 Request bodies are limited to 256 KiB.
@@ -225,7 +226,10 @@ counters they show:
   syncs` is the mean sync time, and `records / syncs` the number of messages a
   sync commits.
 - `storage.dropped` and `storage.last_error`: messages lost to a failed write or
-  sync, and the last failure, kept until a batch is committed again.
+  sync, and the last failure, kept until a batch is committed again; otherwise
+  why eviction cannot remove a segment, while it cannot.
+- `storage.corrupt_segments`: segments found damaged since the daemon started,
+  each counted once.
 - `storage.clock_steps`: messages received while the clock was behind the
   newest message in the log, whose time was raised to it. Messages from two
   connections arriving slightly out of order are raised too, but not counted.
@@ -273,13 +277,17 @@ curl --unix-socket /run/uevtd/api.sock 'http://uevtd/v1/messages?from=1760928000
 
 ```
 /var/lib/uevtd/
+  lock                        locked by the daemon that has the log open
   00000000000000000001.seg    append-only segments named by first sequence number
   00000000000000016384.seg
   cursors/ingest              next sequence number each channel will deliver
 ```
 
-Every record carries a CRC-32; a torn write at the end of the active segment
-is truncated on start, and corruption elsewhere is skipped and counted. Files
+Every record carries a CRC-32. A torn write at the end of the active segment
+is truncated on start; after other damage there the segment is kept and
+numbering continues past what it could hold, so that no sequence number a
+receiver may have seen is given out again. Corruption elsewhere is skipped and
+counted. Files
 are created with mode 0640 and directories with 0750. Files
 can be inspected offline: a segment is a 24-byte header followed by
 `crc32 | len | seq | ts | payload` frames (little-endian; see
@@ -294,5 +302,7 @@ cargo clippy --all-targets
 
 The end-to-end tests start the daemon in-process with temporary sockets, a
 scripted WebSocket receiver and a minimal MQTT broker, both also over TLS with
-the test certificates in `tests/data`. A real broker such as `mosquitto` works
+the test certificates in `tests/data`. The log's randomized tests run a few
+seeds by default; `UEVTD_SEEDS=10000` runs more, quickly with `TMPDIR` on a
+tmpfs, since every commit syncs. A real broker such as `mosquitto` works
 too: configure a channel and watch `/v1/status`.
