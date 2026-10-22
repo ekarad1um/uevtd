@@ -230,14 +230,20 @@ impl Channel {
     fn answer(&mut self, text: &str) {
         match serde_json::from_str::<Reply>(text) {
             Ok(Reply::Ack { ack }) => {
-                let (records, notices) = self.window.ack(ack);
-                self.metrics.delivered.fetch_add(records, Relaxed);
-                self.metrics.notices.fetch_add(notices, Relaxed);
+                let now = crate::now_us();
+                for answered in self.window.ack(ack) {
+                    match answered {
+                        Answered::Record { ts } => self.metrics.delivered_at(ts, now),
+                        Answered::Notice => {
+                            self.metrics.notices.fetch_add(1, Relaxed);
+                        }
+                    }
+                }
             }
             Ok(Reply::Nack { nack, reason }) => {
                 let reason = excerpt(&reason);
                 match self.window.nack(nack) {
-                    Some(Answered::Record) => {
+                    Some(Answered::Record { .. }) => {
                         warn!(seq = nack, reason, "refused by the receiver");
                         self.metrics.rejected.fetch_add(1, Relaxed);
                         self.metrics
@@ -459,7 +465,7 @@ struct Entry {
 /// What an answered frame carried.
 #[derive(Debug, PartialEq, Eq)]
 enum Answered {
-    Record,
+    Record { ts: i64 },
     Notice,
 }
 
@@ -513,19 +519,17 @@ impl Window {
         body
     }
 
-    /// The receiver processed every frame up to `seq`; returns how many
-    /// records and notices that answered.
-    fn ack(&mut self, seq: u64) -> (u64, u64) {
-        let (mut records, mut notices) = (0, 0);
-        for entry in self.entries.iter_mut().take_while(|e| e.seq <= seq) {
-            match answer(entry, &mut self.bytes) {
-                Some(Answered::Record) => records += 1,
-                Some(Answered::Notice) => notices += 1,
-                None => {}
-            }
-        }
+    /// The receiver processed every frame up to `seq`; returns the frames
+    /// that answered, in order.
+    fn ack(&mut self, seq: u64) -> Vec<Answered> {
+        let answered = self
+            .entries
+            .iter_mut()
+            .take_while(|e| e.seq <= seq)
+            .filter_map(|entry| answer(entry, &mut self.bytes))
+            .collect();
         self.advance();
-        (records, notices)
+        answered
     }
 
     /// The receiver will never accept the frame for `seq`.
@@ -557,7 +561,7 @@ fn answer(entry: &mut Entry, bytes: &mut usize) -> Option<Answered> {
     let body = entry.body.take()?;
     *bytes -= body.len();
     Some(match body {
-        Body::Record(_) => Answered::Record,
+        Body::Record(record) => Answered::Record { ts: record.ts },
         Body::Notice(_) => Answered::Notice,
     })
 }
@@ -566,10 +570,11 @@ fn answer(entry: &mut Entry, bytes: &mut usize) -> Option<Answered> {
 mod tests {
     use super::*;
 
+    /// Received at `seq` microseconds.
     fn rec(seq: u64, payload: &[u8]) -> Record {
         Record {
             seq,
-            ts: 0,
+            ts: seq as i64,
             payload: payload.to_vec(),
         }
     }
@@ -600,16 +605,16 @@ mod tests {
         assert_eq!((w.outstanding(), w.bytes()), (4, notice_len + 9));
 
         // A refusal answers one frame; the cursor waits for the prefix.
-        assert_eq!(w.nack(5), Some(Answered::Record));
+        assert_eq!(w.nack(5), Some(Answered::Record { ts: 5 }));
         assert_eq!(w.nack(5), None);
         assert_eq!(w.cursor(), 1);
         assert_eq!(seqs(&w), vec![3, 4, 6]);
         // An acknowledgement answers everything up to it.
-        assert_eq!(w.ack(4), (1, 1));
+        assert_eq!(w.ack(4), vec![Answered::Notice, Answered::Record { ts: 4 }]);
         assert_eq!((w.cursor(), w.outstanding()), (6, 1));
-        assert_eq!(w.ack(4), (0, 0));
+        assert_eq!(w.ack(4), vec![]);
         // One past what was sent answers what was sent, and no more.
-        assert_eq!(w.ack(u64::MAX), (1, 0));
+        assert_eq!(w.ack(u64::MAX), vec![Answered::Record { ts: 6 }]);
         assert_eq!((w.cursor(), w.outstanding(), w.bytes()), (7, 0, 0));
         assert_eq!(w.nack(9), None);
     }

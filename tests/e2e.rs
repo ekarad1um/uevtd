@@ -485,6 +485,121 @@ async fn forwards_queries_reconfigures_and_resumes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn status_shows_what_waits_and_errors_are_json() {
+    let mut receiver = Receiver::start(listen().await, None);
+    receiver.set(SILENT);
+    let env = Env::new();
+    let mut config = env.config(&receiver.url);
+    let mut off = websocket(&receiver.url, "off");
+    if let Channel::WebSocket(c) = &mut off {
+        c.enabled = false;
+    }
+    config.outbound.channels.insert("off".into(), off);
+    let daemon = env.start(config).await;
+    receiver.connected().await;
+
+    // Two frames go unanswered: they wait, and so does the oldest of them.
+    env.send(&[b"{\"n\":1}\n", b"{\"n\":2}\n"]).await;
+    receiver.frame().await;
+    receiver.frame().await;
+    let (_, page) = daemon.get("/v1/messages").await;
+    let first_ts = page["messages"][0]["ts"].as_i64().unwrap();
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("t").await["waiting_ts"] == first_ts
+    })
+    .await;
+    let (_, status) = daemon.get("/v1/status").await;
+    let storage = &status["storage"];
+    assert_eq!(storage["first_ts"], first_ts);
+    assert_eq!(
+        (&storage["queued"], &storage["queued_bytes"]),
+        (&json!(0), &json!(0))
+    );
+    assert_eq!(
+        (&storage["dropped"], &storage["last_error"]),
+        (&json!(0), &Value::Null)
+    );
+    assert!(storage["syncs"].as_u64().unwrap() >= 1, "{storage}");
+    let channel = &status["channels"]["t"];
+    assert_eq!(
+        (&channel["lag"], &channel["delivered"]),
+        (&json!(2), &json!(0))
+    );
+    // A channel disabled since it was added has no position yet.
+    let off = &status["channels"]["off"];
+    assert_eq!((&off["cursor"], &off["lag"]), (&Value::Null, &json!(0)));
+    let metrics = daemon
+        .client
+        .get("http://uevtd/v1/metrics")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let seconds = format!("{}.{:06}", first_ts / 1_000_000, first_ts % 1_000_000);
+    for sample in [
+        format!("uevtd_storage_first_ts_seconds {seconds}"),
+        format!("uevtd_channel_waiting_ts_seconds{{channel=\"t\",kind=\"websocket\"}} {seconds}"),
+        "uevtd_storage_queued_messages 0".to_string(),
+        "uevtd_channel_lag{channel=\"off\",kind=\"websocket\"} 0".to_string(),
+    ] {
+        assert!(metrics.contains(&sample), "{sample} in {metrics}");
+    }
+    assert!(
+        !metrics.contains("uevtd_channel_cursor{channel=\"off\""),
+        "{metrics}"
+    );
+
+    // One acknowledgement answers all three; nothing waits any more, and
+    // each delivery took at least the time it waited.
+    receiver.set(ACK);
+    env.send(&[b"{\"n\":3}\n"]).await;
+    receiver.frame().await;
+    wait_for(Duration::from_secs(5), || async {
+        daemon.channel("t").await["delivered"] == 3
+    })
+    .await;
+    let channel = daemon.channel("t").await;
+    assert_eq!(
+        (&channel["lag"], &channel["waiting_ts"]),
+        (&json!(0), &Value::Null)
+    );
+    assert!(channel["delivery_us"].as_u64().unwrap() > 0, "{channel}");
+
+    // Errors are JSON, whatever their cause.
+    let (status, body) = daemon.get("/v1/health").await;
+    assert_eq!((status, body), (StatusCode::OK, Value::Null), "plain ok");
+    let response = daemon
+        .client
+        .delete("http://uevtd/v1/config")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allow = response.headers()["allow"].to_str().unwrap().to_string();
+    assert!(allow.contains("PATCH"), "{allow}");
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["error"], "method not allowed");
+    let response = daemon
+        .client
+        .put("http://uevtd/v1/config")
+        .body(vec![b' '; 300 << 10])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("limit"), "{body}");
+    let (status, body) = daemon.get("/v1/nothing").await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::NOT_FOUND, &json!("not found"))
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resends_after_a_lost_session_and_counts_refusals() {
     let mut receiver = Receiver::start(listen().await, None);
     let env = Env::new();

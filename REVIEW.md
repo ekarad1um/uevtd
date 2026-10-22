@@ -953,10 +953,74 @@ delivers a poison record, sent as the third of four messages:
 Channel `n`, on the same broker, delivered all four at once without a restart, and its subscriber
 received each once. Channel `m`'s subscriber received the first message twice, since publishes
 queued before a panic may still go out: at-least-once, as after any lost session. The sync at
-startup has no unit test, so it was
-traced: with a 5 s sync interval, a daemon killed with SIGKILL after writing three records (head 0,
-nothing synced yet) recovered them at the restart with head 3, and `strace` showed `fdatasync` on the
-segment before either socket was bound.
+startup has no unit test, so it was traced: with a 5 s sync interval, a daemon killed with SIGKILL
+after writing three records (head 0, nothing synced yet) recovered them at the restart with head 3,
+and `strace` showed `fdatasync` on the segment before either socket was bound.
+
+**Step 7, observability and documentation (2026-10-21).** Fixed L8 and the §5 mismatches,
+implemented D6, and documented H1, D3 and D9.
+
+- Health: `/v1/health` answers 503 with the reason from a failed write or sync until a batch is
+  committed again, and while one batch or sync has taken more than 30 s, as on a stalled disk. It
+  reads only atomics and the error slot, never the index lock that a stalled writer can hold, so it
+  answers even then. Status shows the failure as `storage.last_error`.
+- Write failures (L8): records lost to a failed write or sync are counted in `dropped`, from the
+  batch at hand or from the unsynced records a seal discards, never both. `write_errors` also counts
+  failures to open or create the active segment, which were neither counted nor kept.
+- Counters (L8): `uevtd_storage_batches_total` still counts batches written, now under that name;
+  its help said committed. `bytes_written` counts committed bytes, as its help now says.
+- Clock steps (L8): a message is clamped when its time is below the previous record's, but it counts
+  as a clock step, and a large one is logged, only while the clock itself is behind that time.
+  Messages that two connections stamped and queued in the opposite order are clamped without being
+  counted.
+- Disabled channels (L8): one disabled since startup showed `cursor` 0 and the whole log as `lag`.
+  It shows the position in its cursor file, or `cursor: null` and `lag` 0 without one.
+- API errors (L8): 405 had an empty body and 413 plain text; both are JSON now. The review also
+  named malformed queries, which was wrong: any query string parses into the parameter map, and
+  every parameter was already checked with a JSON error.
+- D6, performance: the writer queue's messages and bytes (`queued`, `queued_bytes`), syncs and the
+  time spent in them (`syncs`, `sync_us`; the mean sync time and the records per sync come from
+  pairs), and per channel the time from receipt to acknowledgement summed over deliveries
+  (`delivery_us`, whose mean is over `delivered`).
+- D6, time: `storage.first_ts` and `head_ts`, the receipt times of the oldest and newest records,
+  and per channel `waiting_ts`, the receipt time of the oldest record waiting for delivery. A
+  record's time is known only to the log: a channel that has delivered everything when its
+  connection drops holds nothing that would tell. A task in the API therefore looks these times up
+  once a second, reading the segment from where the previous lookup for that channel stopped, so
+  that no request waits for the disk; the values can be a second old. In metrics they are seconds
+  since the epoch, for `time() - x` in alerts.
+- Docs: `contrib/uevtd.service` is gone, and the README states what the system must provide: a
+  supervisor that starts the daemon again after a non-zero exit, with the exit statuses, and write
+  access to the configuration's directory, `storage.path` and the socket directories (H1). README
+  and ARCHITECTURE §4 state the producer contract, compact JSON one message to a line (D9), and
+  where the guarantees start, at commit, with what can be lost before (D3).
+- §5: of the nine mismatches, steps 2 to 6 had already fixed six (the eviction bounds, the
+  once-a-second cursor save, §6.4 against §11, the validation list, loss at eviction, the MQTT
+  backoff). This step fixes the other three: compact JSON (§4); the write-failure paragraph, which
+  claimed a truncation to the committed length when the truncation itself had failed (§5.4); and the
+  service manager in §10 and the README.
+
+Verified with unit tests and an end-to-end test. The unit tests cover the counts and the health
+after a failed write and after the commit that clears it, a batch that takes too long, clamping with
+and without a clock behind the log, timestamp lookups across segments and from a mark, the queue
+depth, delivery times in both channels, and a disabled channel's cursor. The end-to-end test reads
+status and metrics while a receiver leaves two frames unanswered, and checks the 405, 413 and 404
+bodies. Each fix's test fails when the old behaviour is put back. macOS and Linux: 88 unit and 15
+end-to-end tests pass; on Linux 25 of 25 repeated end-to-end runs and 15 of 15 unit runs pass.
+
+On Linux, with release builds of this step and of step 6:
+
+| Check | Step 6 | Step 7 |
+|-------|--------|--------|
+| Log on `/dev/shm` (a 64 MiB tmpfs) filled up, then 4 messages, then space freed and 2 more | Health 200 throughout; `write_errors` 4, no count of the lost messages | Health 503, "No space left on device", until the next commit; `dropped` 4; `last_error` cleared by the commit; queries return 1 to 5, since a failed write takes no sequence number |
+| 16 connections sending 5 000 messages each at once; the clock does not move | `clock_steps` 12 115, and 12 116 in a second run | 0 and 0 |
+| Every `fdatasync` delayed 40 s by `strace` | Not run | Health 200 until the batch had taken 30 s, then 503 "log writer busy for 32 s", and 200 once the sync returned; status answered throughout |
+| MQTT broker down for 3 s after 3 messages, then started | Not run | `lag` 3 and `waiting_ts` the first message's receipt time, in status and metrics; delivered 4.0 s after the broker came up, a mean delivery time of 6.9 s; 5.6 MiB resident |
+
+Residual: after a failure, health stays 503 until a batch is committed, so a daemon that receives
+nothing more stays unhealthy even once the disk has recovered. The first lookup of a channel's
+waiting time reads its segment from the start, up to `segment_bytes`. A real backward clock step was
+tested only by the unit test, since the dev container cannot set its clock.
 
 ## Appendix: probes
 

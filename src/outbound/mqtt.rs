@@ -237,12 +237,13 @@ fn publish(client: &AsyncClient, cfg: &config::Mqtt, qos: QoS, entry: &Entry) {
 
 /// Counts a completed publish.
 fn tally(metrics: &ChannelMetrics, completed: Option<Completed>) {
-    let counter = match completed {
-        Some(Completed::Record) => &metrics.delivered,
-        Some(Completed::Notice) => &metrics.notices,
-        None => return,
-    };
-    counter.fetch_add(1, Relaxed);
+    match completed {
+        Some(Completed::Record { ts }) => metrics.delivered_at(ts, crate::now_us()),
+        Some(Completed::Notice) => {
+            metrics.notices.fetch_add(1, Relaxed);
+        }
+        None => {}
+    }
 }
 
 /// One publish: a record, or a notice in place of the records up to `seq`
@@ -250,6 +251,8 @@ fn tally(metrics: &ChannelMetrics, completed: Option<Completed>) {
 struct Entry {
     /// The last sequence number the publish accounts for.
     seq: u64,
+    /// The record's receipt time; 0 for a notice.
+    ts: i64,
     payload: Vec<u8>,
     notice: bool,
     pkid: Option<u16>,
@@ -259,7 +262,7 @@ struct Entry {
 /// What a completed publish carried.
 #[derive(Debug, PartialEq, Eq)]
 enum Completed {
-    Record,
+    Record { ts: i64 },
     Notice,
 }
 
@@ -297,18 +300,19 @@ impl Tracker {
 
     /// Adds the publish of a record; returns it for publishing.
     fn push(&mut self, record: Record) -> &Entry {
-        self.enqueue(record.seq, record.payload, false)
+        self.enqueue(record.seq, record.ts, record.payload, false)
     }
 
     /// Adds the publish of a notice that stands for the records up to `seq`.
     fn push_notice(&mut self, seq: u64, payload: Vec<u8>) -> &Entry {
-        self.enqueue(seq, payload, true)
+        self.enqueue(seq, 0, payload, true)
     }
 
-    fn enqueue(&mut self, seq: u64, payload: Vec<u8>, notice: bool) -> &Entry {
+    fn enqueue(&mut self, seq: u64, ts: i64, payload: Vec<u8>, notice: bool) -> &Entry {
         self.bytes += payload.len();
         self.entries.push_back(Entry {
             seq,
+            ts,
             payload,
             notice,
             pkid: None,
@@ -377,7 +381,7 @@ fn complete(entry: &mut Entry) -> (usize, Completed) {
     let completed = if entry.notice {
         Completed::Notice
     } else {
-        Completed::Record
+        Completed::Record { ts: entry.ts }
     };
     (released, completed)
 }
@@ -394,7 +398,7 @@ mod tests {
         }
     }
 
-    const RECORD: Option<Completed> = Some(Completed::Record);
+    const RECORD: Option<Completed> = Some(Completed::Record { ts: 0 });
     const NOTICE: Option<Completed> = Some(Completed::Notice);
 
     #[test]
@@ -425,6 +429,24 @@ mod tests {
         assert_eq!(t.acked(2), RECORD);
         assert_eq!(t.cursor(), 12);
         assert_eq!(t.outstanding(), 0);
+    }
+
+    #[test]
+    fn a_completed_record_carries_its_receipt_time() {
+        let mut t = Tracker::new(1);
+        for (seq, ts) in [(1, 42), (2, 43)] {
+            t.push(Record {
+                seq,
+                ts,
+                payload: vec![1],
+            });
+        }
+        t.push_notice(3, b"rejected 3".to_vec());
+        assert_eq!(t.sent(0), Some(Completed::Record { ts: 42 }));
+        t.sent(5);
+        t.sent(6);
+        assert_eq!(t.acked(5), Some(Completed::Record { ts: 43 }));
+        assert_eq!(t.acked(6), NOTICE);
     }
 
     #[test]

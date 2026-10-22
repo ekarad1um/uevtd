@@ -84,11 +84,13 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
         config: store.clone(),
         boot,
         storage: storage.clone(),
+        queue: tx.depth(),
         inbound: inbound_metrics.clone(),
         channels: registry.clone(),
         started: Instant::now(),
         last_error: Default::default(),
         queries: Semaphore::new(api::CONCURRENT_QUERIES),
+        times: Default::default(),
     });
 
     let tokens = Tokens::default();

@@ -102,9 +102,20 @@ is bounded to one second, and a socket that does not answer counts as live.
 
 **Framing.** One message per line, terminated by `\n` (an optional trailing
 `\r` is stripped; empty lines are ignored). Newline framing was chosen because
-it is what every producer can emit from any language and what the JSON payloads
-already satisfy (serialised JSON never contains a raw newline). The payload is
-stored verbatim; no parsing is attempted.
+it is what every producer can emit from any language and what JSON payloads
+satisfy when serialised compactly: compact JSON never contains a raw newline,
+since newlines inside strings are escaped. Producers must therefore send
+compact JSON, one message to a line; pretty-printed JSON is split at its line
+breaks into fragments that are stored and forwarded as separate messages. The
+payload is stored verbatim; no parsing is attempted.
+
+**Where the guarantees start.** Producers get no acknowledgement; none of
+them needs one. The daemon is responsible for a message once it is committed to
+the log (§5.4), and from then on delivers it at least once or counts it as
+lost. Before that it can be lost without the producer learning of it: by a
+crash while the message waits in the writer queue or for its sync, by a stop
+before the daemon has read it from the socket, and by a failed write, which is
+counted in `dropped` (§5.4).
 
 Edge cases, all handled by the sans-IO `Framer` so they are unit-testable:
 
@@ -177,9 +188,13 @@ a corrupted payload.
 1. `seq` is assigned by the single writer and increases by exactly one per
    record over the lifetime of the log, across segments and restarts.
 2. `ts` is non-decreasing in `seq` order. The writer clamps each receipt time to
-   `max(now, previous ts)`, so a backwards clock step never produces an
-   out-of-order timestamp (it is logged when the step exceeds one second). This
-   is what makes time-range queries a contiguous scan.
+   `max(receipt time, previous ts)`, so a backwards clock step never produces an
+   out-of-order timestamp. This is what makes time-range queries a contiguous
+   scan. Connections stamp messages before they queue them, so messages from
+   two connections can reach the writer slightly out of order and are clamped
+   as well. Only a clock that is behind the previous `ts` when the writer
+   clamps counts as stepped back: `clock_steps` counts those messages, and a
+   step of more than one second is logged.
 3. For consecutive segments `S_i`, `S_{i+1}`: every record in `S_i` has
    `ts <= S_{i+1}.base_ts` and every record in `S_{i+1}` has `ts >= S_{i+1}.base_ts`.
    A query from time `t` therefore starts at the last segment whose
@@ -223,14 +238,20 @@ its own fsync, which is the durability one wants for rare events. A dedicated
 thread with synchronous I/O is simpler and faster than `spawn_blocking` per
 batch and keeps file-system latency entirely off the async runtime.
 
-**Write failure.** On a write error the batch is dropped and counted, the
-error is logged, and the active file is truncated back to its length before
-the batch so a partial write can never be followed by valid data. If that
-truncation fails, or a sync fails (the kernel may then have discarded the
+**Write failure.** A batch that cannot be written, because the active segment
+cannot be opened or created or the write fails, is dropped: its records are
+counted in `dropped`, the error in `write_errors`, and the active file is
+truncated back to its length before the batch so a partial write can never be
+followed by valid data. If a sync fails (the kernel may then have discarded the
 dirty pages), everything written since the last successful sync is discarded
-and counted, the file is truncated to its committed length, and the segment is
-sealed so the next batch starts a new one. Nothing visible is ever lost; the
-cost is bounded by one sync interval of unsynced records.
+and counted in `dropped`, the file is truncated to its committed length, and
+the segment is sealed so the next batch starts a new one. If a truncation fails,
+the segment is sealed with the bytes past its committed length still in it.
+They are never read: the next segment starts at the same sequence number, and
+readers find every record in the last segment that starts at or before it
+(§5.7). Nothing visible is ever lost; the cost is bounded by one sync interval
+of unsynced records. The failure is the log's `last_error`, and makes
+`/v1/health` fail, until a batch is committed again (§9).
 
 ### 5.5 Eviction and capacity
 
@@ -671,11 +692,12 @@ operator sees exactly what will be in effect after the cause is fixed.
 | PUT    | `/v1/config`    | replace configuration; returns the applied document               |
 | PATCH  | `/v1/config`    | merge-patch configuration; returns the applied document           |
 | GET    | `/v1/messages`  | `from`, `to` (µs, `to` exclusive), `after` (seq), `limit` (≤10 000); pages hold at most 1 MiB of payload |
-| GET    | `/v1/status`    | JSON: uptime, storage, inbound, per-channel cursor/lag/errors      |
-| GET    | `/v1/metrics`   | Prometheus text exposition of the same counters                   |
-| GET    | `/v1/health`    | 200 when the daemon is running                                    |
+| GET    | `/v1/status`    | JSON: uptime, storage, inbound, per-channel state and errors (§9) |
+| GET    | `/v1/metrics`   | Prometheus text exposition of the same values                     |
+| GET    | `/v1/health`    | 200 while the log takes writes, 503 otherwise (§9)                |
 
-Errors are `{"error": "..."}` with 400 (validation), 404, or 500. In
+Errors are `{"error": "..."}` with 400 (validation), 404, 405, 413 (a body
+over the limit), 500, or 503 (health). In
 `/v1/messages` responses a payload that is valid JSON is embedded verbatim as
 `data`; any other payload is returned as a string in `text`, so the two cases
 cannot be confused and the response is always valid JSON. Request bodies are
@@ -695,15 +717,35 @@ reconnects and rejections are logged at the appropriate level; per-message
 events are `debug`/`trace`.
 
 **Metrics** are plain atomic counters owned by each component, rendered on
-demand. Gauges: active connections, storage bytes/segments/head/first seq,
-per-channel cursor, lag and connected state. Counters: messages, bytes,
-truncated, oversized, rejected connections, batches, write errors, evictions,
-corrupt records, per-channel delivered, rejected, retries, restarts, lost,
-notices.
-`lost` grows when records are evicted, not when the channel next reads
-(§5.9), and `lag` counts only records still in the log. `/v1/status`
-adds the last error per component with its timestamp and the
-`restart_required` list.
+demand. Gauges: active connections; storage bytes and segments, the first and
+head sequence numbers and receipt times, and the messages and payload bytes in
+the writer queue; per channel the cursor, lag, the receipt time of the oldest
+waiting record, and connected state. Counters: messages, bytes, truncated,
+oversized, rejected connections; batches written, records and bytes committed,
+syncs and the time spent in them, write errors, dropped records, evictions,
+corrupt segments, clock steps; per channel delivered and the time from receipt
+to acknowledgement summed over them, rejected, retries, restarts, lost,
+notices. Means come from pairs: sync time over syncs, records over syncs (what
+a sync commits), delivery time over deliveries. `lost` grows when records are
+evicted, not when the channel next reads (§5.9), and `lag` counts only records
+still in the log. `/v1/status` adds the last error per component with its
+timestamp and the `restart_required` list. Times are microseconds since the
+Unix epoch in `/v1/status` and seconds in `/v1/metrics`.
+
+Two receipt times come from the log itself: that of the oldest retained record,
+and for each channel that of the oldest record waiting for it, at its cursor or,
+if it lost the records before, at the oldest retained one. A task in the API
+looks them up once a second, so that a request never waits for the disk, and
+the values can be a second old. A lookup reads the record's segment, from its
+start or from where the previous lookup for the channel stopped in it. Following
+a channel that delivers therefore costs about as much as reading what it
+delivered, and a channel that waits costs nothing after the first lookup.
+
+**Health.** `/v1/health` fails with 503 from a failed write or sync until a
+batch is committed again, and while one batch or sync has taken more than 30 s,
+as on a stalled disk. It reads no state that the writer holds while it works,
+so it answers even then. It is for a supervisor or an operator to act on; the
+daemon itself carries on.
 
 ## 10. Failure modes
 
@@ -711,10 +753,11 @@ adds the last error per component with its timestamp and the
 |-------------------------------------------|---------------------------------------------------------------------------|
 | Crash during a batch write                | Torn tail truncated on next start; those messages are lost (never acked)  |
 | Crash between delivery and cursor save    | Up to ~1 s of messages redelivered                                        |
-| Disk full / write error                   | Batch dropped and counted; file rolled back to its previous length        |
-| fsync error                               | Unsynced tail discarded and counted; segment sealed; nothing visible lost |
+| Disk full / write error                   | Batch dropped, counted in `dropped`; file rolled back to its previous length; health fails until a batch is committed |
+| fsync error                               | Unsynced tail discarded, counted in `dropped`; segment sealed; nothing visible lost; health fails until a batch is committed |
+| A write or sync hangs (stalled disk)      | Producers block once the writer queue is full; health fails after 30 s    |
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
-| Log writer thread panics                  | Daemon stops with an error (exit code 1) so the service manager restarts it |
+| Log writer thread panics                  | Daemon stops with an error (exit code 1); the process supervisor, which a deployment must provide (README), starts it again |
 | Channel task panics                       | Reported in `last_error`; started again from its cursor after 1 s, doubling to 60 s while it makes no progress; `restarts` counts it |
 | Read error in the active segment at startup | Records before it kept; the next segment starts past what the rest could hold, which is counted as lost |
 | Sealed segment cannot be opened at startup | Startup continues; readers retry it and report `last_error`         |
@@ -731,13 +774,14 @@ adds the last error per component with its timestamp and the
 | Config file invalid at startup            | Startup fails with the validation error                                   |
 | Config file missing at startup            | Defaults are used and written to the path                                 |
 | Producer floods beyond disk bandwidth     | Writer queue fills, producers block on the socket; nothing dropped        |
-| Backwards clock step                      | Timestamps clamp to the previous value; logged if > 1 s                   |
+| Backwards clock step                      | Timestamps clamp to the previous value and are counted in `clock_steps`; logged if > 1 s |
 
 ## 11. Concurrency and lifecycle
 
 Tokio multi-thread runtime. Tasks: inbound acceptor + one task per connection;
 one supervisor + one task per channel (+ one event-loop task per MQTT
-channel, one frame writer per WebSocket session); API server; config applier.
+channel, one frame writer per WebSocket session); API server and its
+receipt-time lookup (§9); config applier.
 One OS thread: the log writer. Blocking file reads for channels and queries,
 and reading a CA file, run on `spawn_blocking`, with the reader handed in and
 out so cancellation never loses it.
@@ -761,7 +805,7 @@ Every buffer that holds messages has a byte bound:
 | Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when producers outrun the disk |
 | Write batch | 1 MiB of encoded records, or one record | 1 MiB |
 | Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc; WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
-| Each log reader | a 64 KiB read buffer, or one record if larger | 64 KiB |
+| Each log reader, and the API's receipt-time lookup | a 64 KiB read buffer, or one record if larger | 64 KiB |
 | A query | one at a time: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
 | An API request | a 256 KiB body | small |
 

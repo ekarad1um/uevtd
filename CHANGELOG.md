@@ -10,6 +10,9 @@ error names the field and its allowed range.
 - The HTTP channel. A configuration file with a `"type": "http"` channel no
   longer loads ("unknown variant `http`"); replace it with a `websocket`
   channel, whose receiver must implement the protocol in the README.
+- `contrib/uevtd.service`. systemd is not a supported target. Whatever starts
+  the daemon must start it again after a non-zero exit, and give it write
+  access to the directory of its configuration file; see the README.
 
 ### Added
 
@@ -31,6 +34,22 @@ error names the field and its allowed range.
   `seq` to acknowledge. Notices are delivered at least once and in order.
 - `notices` per channel in `/v1/status`, and `uevtd_channel_notices_total`.
 - `restarts` per channel in `/v1/status`, and `uevtd_channel_restarts_total`.
+- `/v1/health` answers 503 with the reason after a failed write or sync, until
+  a batch is committed again, and while one write or sync has taken more than
+  30 s.
+- In `/v1/status`, with the metric in brackets: `storage.first_ts`
+  (`uevtd_storage_first_ts_seconds`), the receipt time of the oldest message
+  in the log; `uevtd_storage_head_ts_seconds`; `storage.queued` and
+  `queued_bytes` (`uevtd_storage_queued_messages`,
+  `uevtd_storage_queued_bytes`), what waits for the writer; `storage.syncs`
+  and `sync_us` (`uevtd_storage_syncs_total`,
+  `uevtd_storage_sync_seconds_total`); `storage.dropped`
+  (`uevtd_storage_dropped_total`), messages lost to a failed write or sync,
+  and `storage.last_error`; per channel `waiting_ts`
+  (`uevtd_channel_waiting_ts_seconds`), the receipt time of the oldest message
+  waiting for delivery, and `delivery_us`
+  (`uevtd_channel_delivery_seconds_total`), the time from receipt to
+  acknowledgement summed over deliveries.
 
 ### Changed
 
@@ -114,3 +133,16 @@ error names the field and its allowed range.
   unexpectedly".
 - Stale cursor files are removed at startup; query-string secrets are redacted in
   logs; a `SIGHUP` during startup no longer kills the daemon.
+- `clock_steps` counted messages from two connections that reached the writer
+  slightly out of order, as if the clock had stepped back. It now counts only
+  messages received while the clock was behind the newest message in the log,
+  and only those log a warning. Both kinds are still clamped.
+- `write_errors` missed failures to open or create a segment, and the messages
+  lost to a failed write or sync were only logged; they are counted in
+  `dropped` now. `uevtd_storage_batches_total` counts batches written,
+  committed or not, as before, but its help text called them committed.
+- A channel that had been disabled since startup showed `cursor` 0 and every
+  message in the log as `lag`. It now shows the position in its cursor file, or
+  `cursor: null` and `lag` 0 without one.
+- 405 and 413 responses had a plain-text or empty body; they are JSON like every
+  other error.

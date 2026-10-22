@@ -34,9 +34,12 @@ pub struct ChannelMetrics {
     pub enabled: AtomicBool,
     pub running: AtomicBool,
     pub connected: AtomicBool,
-    /// Next sequence number to deliver.
+    /// Next sequence number to deliver; 0 for a channel that has not run
+    /// and has no cursor file.
     pub cursor: AtomicU64,
     pub delivered: AtomicU64,
+    /// Microseconds from receipt to acknowledgement, summed over `delivered`.
+    pub delivery_us: AtomicU64,
     pub rejected: AtomicU64,
     pub retries: AtomicU64,
     /// Starts after the channel's task ended on its own.
@@ -58,6 +61,7 @@ impl ChannelMetrics {
             connected: AtomicBool::new(false),
             cursor: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+            delivery_us: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
@@ -65,6 +69,13 @@ impl ChannelMetrics {
             notices: AtomicU64::new(0),
             last_error: ErrorSlot::default(),
         }
+    }
+
+    /// Counts the delivery, completed at `now`, of a record received at `ts`.
+    pub fn delivered_at(&self, ts: i64, now: i64) {
+        self.delivered.fetch_add(1, Relaxed);
+        let waited = u64::try_from(now.saturating_sub(ts)).unwrap_or(0);
+        self.delivery_us.fetch_add(waited, Relaxed);
     }
 }
 
@@ -273,7 +284,16 @@ async fn reconcile(
             entry.clone()
         };
         metrics.enabled.store(channel.enabled(), Relaxed);
-        if !channel.enabled() || running.contains_key(name) {
+        if !channel.enabled() {
+            // Shows where a channel disabled since startup will resume.
+            if metrics.cursor.load(Relaxed) == 0 {
+                if let Some(seq) = saved_cursor(storage, name).await {
+                    metrics.cursor.store(seq, Relaxed);
+                }
+            }
+            continue;
+        }
+        if running.contains_key(name) {
             continue;
         }
         let (failures, best) = match waiting.get(name) {
@@ -332,6 +352,15 @@ async fn prune_cursors(storage: &Arc<Storage>, keep: BTreeSet<String>) {
         Ok(Err(e)) => warn!(error = %e, "could not prune cursor files"),
         Err(e) => error!(error = %e, "cursor prune task failed"),
     }
+}
+
+/// The persisted cursor of a channel that does not run, if it has one.
+async fn saved_cursor(storage: &Arc<Storage>, name: &str) -> Option<u64> {
+    let (storage, name) = (storage.clone(), name.to_string());
+    tokio::task::spawn_blocking(move || storage.load_cursor(&name))
+        .await
+        .ok()?
+        .ok()?
 }
 
 /// The persisted cursor, or the current head for a channel without one. A
@@ -645,6 +674,60 @@ mod tests {
         drop(feed);
         write(300);
         assert_eq!(metrics.lost.records(), first - 1);
+    }
+
+    #[test]
+    fn delivery_time_is_summed_and_never_negative() {
+        let metrics = ChannelMetrics::new("mqtt");
+        metrics.delivered_at(1_000, 3_500);
+        // A clock that stepped back since the record arrived.
+        metrics.delivered_at(5_000, 4_000);
+        let delivered = metrics.delivered.load(Relaxed);
+        assert_eq!((delivered, metrics.delivery_us.load(Relaxed)), (2, 2_500));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_channel_shows_where_it_will_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
+        storage.save_cursor("saved", 7).unwrap();
+        let mut config = Config::default();
+        for name in ["saved", "new"] {
+            let channel = crate::config::WebSocket {
+                enabled: false,
+                ..Default::default()
+            };
+            let channel = Channel::WebSocket(channel);
+            config.outbound.channels.insert(name.into(), channel);
+        }
+        let (_cfg, rx) = watch::channel(Arc::new(config));
+        let registry = Arc::new(Registry::default());
+        let shutdown = CancellationToken::new();
+        let never: Spawn = |_, _, _, _, _, _| unreachable!("a disabled channel is never started");
+        let supervisor = tokio::spawn(supervise(
+            rx,
+            storage,
+            registry.clone(),
+            shutdown.clone(),
+            never,
+        ));
+        let cursors = || {
+            let registry = registry.lock().unwrap();
+            let cursor = |name: &str| registry.get(name).map(|m| m.cursor.load(Relaxed));
+            (cursor("saved"), cursor("new"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cursors() != (Some(7), Some(0)) {
+            assert!(Instant::now() < deadline, "{:?}", cursors());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+        supervisor.await.unwrap();
     }
 
     #[test]

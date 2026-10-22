@@ -17,8 +17,19 @@ cargo build --release
 
 If the configuration file does not exist it is created with defaults. The
 daemon stops cleanly on `SIGTERM`/`SIGINT` (a second signal exits at once) and
-re-reads its configuration file on `SIGHUP`. A systemd unit is in [contrib/uevtd.service](contrib/uevtd.service)
-and a full example configuration in [contrib/config.example.json](contrib/config.example.json).
+re-reads its configuration file on `SIGHUP`. A full example configuration is in
+[contrib/config.example.json](contrib/config.example.json).
+
+Two things are left to the system that runs it:
+
+- A process supervisor that starts it again when it exits with a non-zero
+  status. The daemon exits with 1 when it cannot start, for example because a
+  socket path is in use or the log cannot be opened, and when its log writer
+  thread panics; a channel that panics is restarted inside the daemon. A clean
+  stop exits with 0, a second signal with 130 and a usage error with 2.
+- Write access for the daemon's user to the directory of the configuration
+  file, where the API saves it through a temporary file and a missing file is
+  created, as well as to `storage.path` and the directories of both sockets.
 
 Logs go to stderr; the filter (`log.filter`) uses `tracing` directives such as
 `info` or `info,uevtd::storage=debug` and can be changed at runtime.
@@ -34,7 +45,14 @@ printf '{"event":"boot","uptime":3}\n' | socat - UNIX-CONNECT:/run/uevtd/in.sock
 Rules: a trailing `\r` is stripped, empty lines are ignored, a line longer than
 `inbound.max_message_bytes` is discarded and logged, and a final line without
 `\n` when the peer closes is discarded and logged as truncated. Payloads are
-stored and forwarded verbatim; they are not parsed.
+stored and forwarded verbatim; they are not parsed. JSON must therefore be sent
+compact, one message to a line: pretty-printed JSON would be stored and
+forwarded as one message per line.
+
+The guarantees start once a message is committed to the log, and producers get
+no acknowledgement. Until then a message can be lost: by a crash while it waits
+for the writer or for its sync, by a stop before the daemon has read it from the
+socket, or by a failed write, which is counted in `dropped`.
 
 ## Configuration
 
@@ -182,12 +200,35 @@ Served over `api.path`; use `curl --unix-socket`.
 | PUT    | `/v1/config`   | Replace the configuration. Validated, persisted, applied. Returns the applied document. |
 | PATCH  | `/v1/config`   | [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) merge patch of the configuration. |
 | GET    | `/v1/messages` | Time-ordered range query, see below. |
-| GET    | `/v1/status`   | JSON status: uptime, `restart_required`, inbound and storage counters; per channel the cursor, `lag`, the counts `delivered`, `rejected`, `retries`, `lost` and `notices`, and the last error. |
-| GET    | `/v1/metrics`  | The same counters in Prometheus text format. |
-| GET    | `/v1/health`   | `200 ok`. |
+| GET    | `/v1/status`   | JSON status: uptime, `restart_required`, inbound and storage counters; per channel the cursor, `lag`, the counts `delivered`, `rejected`, `retries`, `lost` and `notices`, and the last error. See below. |
+| GET    | `/v1/metrics`  | The same values in Prometheus text format. |
+| GET    | `/v1/health`   | `200 ok` while the log takes writes; `503` with the reason after a failed write or sync until a batch is committed again, and while one write or sync takes more than 30 s. |
 
-Errors are `{"error": "<message>"}` with status 400, 404 or 500. Request bodies
-are limited to 256 KiB.
+Errors are `{"error": "<message>"}` with status 400, 404, 405, 413, 500 or 503.
+Request bodies are limited to 256 KiB.
+
+### Status and metrics
+
+`/v1/status` and `/v1/metrics` report the same values, times in microseconds
+since the Unix epoch in the status and in seconds in the metrics. Besides the
+counters they show:
+
+- `storage.first_ts` and `head_ts`: when the oldest and the newest message in
+  the log were received, the range a query can reach.
+- `storage.queued` and `queued_bytes`: messages waiting for the writer.
+  Producers wait once 8 192 messages or 8 MiB do.
+- `storage.syncs` and `sync_us`: syncs and the time spent in them. `sync_us /
+  syncs` is the mean sync time, and `records / syncs` the number of messages a
+  sync commits.
+- `storage.dropped` and `storage.last_error`: messages lost to a failed write or
+  sync, and the last failure, kept until a batch is committed again.
+- `storage.clock_steps`: messages received while the clock was behind the
+  newest message in the log, whose time was raised to it. Messages from two
+  connections arriving slightly out of order are raised too, but not counted.
+- Per channel, `lag` and `waiting_ts`: messages in the log waiting for
+  delivery, and when the oldest of them was received; `delivery_us /
+  delivered` is the mean time from receipt to acknowledgement. A channel that
+  has been disabled since it was added has no `cursor` yet, and `lag` 0.
 
 ### `GET /v1/messages`
 

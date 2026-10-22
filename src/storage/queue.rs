@@ -3,6 +3,7 @@
 //! more than a fixed amount of memory while the writer is busy.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 
@@ -19,14 +20,28 @@ pub struct Closed;
 pub fn queue(depth: usize, bytes: u32) -> (QueueSender, QueueReceiver) {
     let (tx, rx) = mpsc::channel(depth);
     let budget = Arc::new(Semaphore::new(bytes as usize));
+    let queued = Arc::new(Depth::default());
     (
         QueueSender {
             tx,
             budget: budget.clone(),
             bytes,
+            queued: queued.clone(),
         },
-        QueueReceiver { rx, budget, bytes },
+        QueueReceiver {
+            rx,
+            budget,
+            bytes,
+            queued,
+        },
     )
+}
+
+/// Messages queued and not yet written, and their payload bytes.
+#[derive(Default)]
+pub struct Depth {
+    pub messages: AtomicU64,
+    pub bytes: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -34,6 +49,7 @@ pub struct QueueSender {
     tx: mpsc::Sender<Message>,
     budget: Arc<Semaphore>,
     bytes: u32,
+    queued: Arc<Depth>,
 }
 
 impl QueueSender {
@@ -48,13 +64,23 @@ impl QueueSender {
             .await
             .map_err(|_| Closed)?;
         let slot = self.tx.reserve().await.map_err(|_| Closed)?;
-        Ok(QueuePermit { slot, bytes, len })
+        Ok(QueuePermit {
+            slot,
+            bytes,
+            len,
+            queued: &self.queued,
+        })
     }
 
     /// Waits until the message fits, then queues it.
     pub async fn send(&self, message: Message) -> Result<(), Closed> {
         self.reserve(message.payload.len()).await?.send(message);
         Ok(())
+    }
+
+    /// What waits for the writer; it does not keep the queue open.
+    pub fn depth(&self) -> Arc<Depth> {
+        self.queued.clone()
     }
 }
 
@@ -63,6 +89,7 @@ pub struct QueuePermit<'a> {
     slot: mpsc::Permit<'a, Message>,
     bytes: SemaphorePermit<'a>,
     len: usize,
+    queued: &'a Depth,
 }
 
 impl QueuePermit<'_> {
@@ -73,6 +100,8 @@ impl QueuePermit<'_> {
             self.len,
             "message length differs from the reservation"
         );
+        self.queued.messages.fetch_add(1, Relaxed);
+        self.queued.bytes.fetch_add(self.len as u64, Relaxed);
         self.slot.send(message);
         // The writer returns the budget once the message is written.
         self.bytes.forget();
@@ -83,6 +112,7 @@ pub struct QueueReceiver {
     rx: mpsc::Receiver<Message>,
     budget: Arc<Semaphore>,
     bytes: u32,
+    queued: Arc<Depth>,
 }
 
 impl QueueReceiver {
@@ -107,6 +137,11 @@ impl QueueReceiver {
             .map(|m| cost(m.payload.len(), self.bytes) as usize)
             .sum();
         self.budget.add_permits(total);
+        let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
+        self.queued
+            .messages
+            .fetch_sub(messages.len() as u64, Relaxed);
+        self.queued.bytes.fetch_sub(bytes as u64, Relaxed);
     }
 }
 
@@ -174,6 +209,23 @@ mod tests {
         rx.release(std::slice::from_ref(&first));
         waiting.await.unwrap().unwrap();
         assert_eq!(rx.recv().await.unwrap().payload.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn depth_counts_messages_until_the_writer_releases_them() {
+        let (tx, mut rx) = queue(16, 100);
+        let depth = tx.depth();
+        let reserved = tx.reserve(7).await.unwrap();
+        let level = || (depth.messages.load(Relaxed), depth.bytes.load(Relaxed));
+        assert_eq!(level(), (0, 0), "a reservation is not a message yet");
+        reserved.send(msg(7));
+        tx.send(msg(3)).await.unwrap();
+        assert_eq!(level(), (2, 10));
+        let first = rx.recv().await.unwrap();
+        assert_eq!(level(), (2, 10), "a message being written still waits");
+        let second = rx.recv().await.unwrap();
+        rx.release(&[first, second]);
+        assert_eq!(level(), (0, 0));
     }
 
     #[tokio::test]

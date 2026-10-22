@@ -23,7 +23,9 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-pub use queue::{QueueReceiver, QueueSender, queue};
+use crate::metrics::ErrorSlot;
+
+pub use queue::{Depth, QueueReceiver, QueueSender, queue};
 pub use segment::{Corrupt, Record};
 use segment::{FRAME_HEADER_LEN, HEADER_LEN, Header, Next, Peek, SegmentCursor, Stopped};
 
@@ -45,6 +47,8 @@ const DIR_MODE: u32 = 0o750;
 /// A channel that stays behind loses records with every eviction; its
 /// warning repeats at most this often, with the running total.
 const LOSS_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// A write or sync that takes longer makes the log unhealthy.
+pub const STALLED: Duration = Duration::from_secs(30);
 
 /// A message as handed to the writer: receipt time and verbatim payload.
 #[derive(Clone, Debug)]
@@ -63,13 +67,21 @@ pub struct Limits {
 
 #[derive(Default)]
 pub struct Metrics {
+    /// Batches written, committed or not.
     pub batches: AtomicU64,
     pub records: AtomicU64,
     pub bytes: AtomicU64,
+    /// Failed writes, syncs and segment creations.
     pub write_errors: AtomicU64,
+    /// Records lost to a failed write or sync.
+    pub dropped: AtomicU64,
+    pub syncs: AtomicU64,
+    pub sync_us: AtomicU64,
     pub evictions: AtomicU64,
     pub corrupt_segments: AtomicU64,
     pub clock_steps: AtomicU64,
+    /// The last write failure, until a batch is committed again.
+    pub last_error: ErrorSlot,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -119,6 +131,10 @@ pub struct Storage {
     sync_interval_us: AtomicU64,
     head: watch::Sender<u64>,
     metrics: Metrics,
+    opened: Instant,
+    /// Milliseconds after `opened`, plus one, at which the writer began its
+    /// current batch or sync; zero while it waits.
+    busy_since: AtomicU64,
 }
 
 impl Storage {
@@ -225,6 +241,8 @@ impl Storage {
             sync_interval_us: AtomicU64::new(micros(limits.sync_interval)),
             head,
             metrics: Metrics::default(),
+            opened: Instant::now(),
+            busy_since: AtomicU64::new(0),
         };
         storage.metrics.corrupt_segments.fetch_add(damaged, Relaxed);
         storage.evict(&mut storage.index.lock().unwrap());
@@ -266,6 +284,75 @@ impl Storage {
             head_seq: index.head_seq,
             head_ts: index.head_ts,
         }
+    }
+
+    /// Whether the log takes writes: not after a failed write or sync until a
+    /// batch is committed again, nor while one batch or sync has taken longer
+    /// than [`STALLED`]. It never waits for the writer, so it answers even
+    /// then.
+    pub fn health(&self) -> Result<(), String> {
+        let since = self.busy_since.load(Relaxed);
+        if since > 0 {
+            let busy = (self.opened.elapsed().as_millis() as u64 + 1).saturating_sub(since);
+            if busy > STALLED.as_millis() as u64 {
+                return Err(format!("log writer busy for {} s", busy / 1000));
+            }
+        }
+        match self.metrics.last_error.get() {
+            Some(e) => Err(format!("log write failed: {}", e.message)),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the writer busy until the guard is dropped.
+    fn busy(&self) -> Busy<'_> {
+        let now = self.opened.elapsed().as_millis() as u64 + 1;
+        self.busy_since.store(now, Relaxed);
+        Busy(self)
+    }
+
+    /// The receipt time of record `seq`, if it is committed and retained.
+    /// Unlike a [`Reader`], it counts and logs nothing. It reads the record's
+    /// segment from the start, or from `mark` if a lookup of an earlier
+    /// record in the same segment left it there, and leaves `mark` at `seq`.
+    pub fn timestamp(&self, seq: u64, mark: &mut Mark) -> io::Result<Option<i64>> {
+        let (segment, bound) = {
+            let index = self.index.lock().unwrap();
+            if seq == 0 || seq > index.head_seq {
+                return Ok(None);
+            }
+            match index.segments.range(..=seq).next_back() {
+                Some((&first_seq, s)) => (first_seq, s.len),
+                None => return Ok(None),
+            }
+        };
+        let file = match File::open(self.segment_path(segment)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let start = if mark.segment == segment && mark.seq <= seq {
+            mark.pos
+        } else {
+            HEADER_LEN as u64
+        };
+        let mut cursor = SegmentCursor::new(file, start);
+        loop {
+            match cursor.peek(bound)? {
+                Peek::Frame { seq: s, len } if s < seq => cursor.skip(len),
+                Peek::Frame { seq: s, .. } if s == seq => break,
+                _ => return Ok(None),
+            }
+        }
+        *mark = Mark {
+            segment,
+            pos: cursor.pos(),
+            seq,
+        };
+        Ok(match cursor.next(bound)? {
+            Next::Record(record) => Some(record.ts),
+            Next::End | Next::Corrupt(_) => None,
+        })
     }
 
     pub fn reader(self: &Arc<Self>, next_seq: u64) -> Reader {
@@ -444,6 +531,23 @@ impl Storage {
             }
         }
     }
+}
+
+struct Busy<'a>(&'a Storage);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.busy_since.store(0, Relaxed);
+    }
+}
+
+/// Where [`Storage::timestamp`] found a record, so that a later lookup in
+/// the same segment can read on from there.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Mark {
+    segment: u64,
+    pos: u64,
+    seq: u64,
 }
 
 /// What a channel lost before delivery: the records that left the log
@@ -729,15 +833,25 @@ impl Writer {
             self.active = None;
         }
         if self.active.is_none() {
-            self.open_active(need)?;
+            if let Err(e) = self.open_active(need) {
+                self.failed(format!("opening the active segment: {e}"), batch.len());
+                return Err(e);
+            }
         }
 
         let (mut seq, mut ts) = (self.head_seq, self.head_ts);
+        let mut now = None;
         self.buf.clear();
         for message in batch {
             seq += 1;
             if message.ts < ts {
-                self.note_clock_step(ts - message.ts);
+                // Connections stamp their messages before they queue them, so
+                // messages from two of them can arrive slightly out of order.
+                // Only a clock behind the log's last timestamp has stepped back.
+                let now = *now.get_or_insert_with(crate::now_us);
+                if now < ts {
+                    self.note_clock_step(ts - now);
+                }
             } else {
                 ts = message.ts;
             }
@@ -746,7 +860,7 @@ impl Writer {
 
         let active = self.active.as_mut().expect("active segment");
         if let Err(e) = active.file.write_all(&self.buf) {
-            self.storage.metrics.write_errors.fetch_add(1, Relaxed);
+            self.failed(format!("write: {e}"), batch.len());
             self.rollback();
             return Err(e);
         }
@@ -769,12 +883,19 @@ impl Writer {
             self.unsynced = false;
             return Ok(());
         };
-        if let Err(e) = active.file.sync_data() {
-            self.storage.metrics.write_errors.fetch_add(1, Relaxed);
+        let started = Instant::now();
+        let synced = active.file.sync_data();
+        let metrics = &self.storage.metrics;
+        metrics.syncs.fetch_add(1, Relaxed);
+        metrics
+            .sync_us
+            .fetch_add(micros(started.elapsed()), Relaxed);
+        if let Err(e) = synced {
             error!(error = %e, "sync failed; sealing segment");
             if let Err(e) = active.file.set_len(active.committed) {
                 error!(error = %e, "could not truncate the unsynced tail");
             }
+            self.failed(format!("sync: {e}"), 0);
             self.seal();
             return Err(e);
         }
@@ -785,6 +906,7 @@ impl Writer {
             return Ok(());
         }
         active.committed = active.len;
+        metrics.last_error.clear();
         {
             let mut index = self.storage.index.lock().unwrap();
             if let Some(segment) = index.segments.get_mut(&active.first_seq) {
@@ -880,6 +1002,15 @@ impl Writer {
         Ok(())
     }
 
+    /// Counts a failure that loses `records` of the batch at hand, and keeps
+    /// it as the log's error until a batch is committed again.
+    fn failed(&self, error: String, records: usize) {
+        let metrics = &self.storage.metrics;
+        metrics.write_errors.fetch_add(1, Relaxed);
+        metrics.dropped.fetch_add(records as u64, Relaxed);
+        metrics.last_error.set(error);
+    }
+
     fn rollback(&mut self) {
         let Some(active) = self.active.as_mut() else {
             return;
@@ -902,6 +1033,7 @@ impl Writer {
         };
         if discarded > 0 {
             error!(records = discarded, "unsynced records discarded");
+            self.storage.metrics.dropped.fetch_add(discarded, Relaxed);
         }
         self.active = None;
         self.unsynced = false;
@@ -950,6 +1082,7 @@ pub fn run_writer(storage: Arc<Storage>, mut rx: QueueReceiver, rt: tokio::runti
             // takes effect without waiting for the next message.
             let wait = storage.sync_interval().saturating_sub(writer.since_sync());
             if wait.is_zero() {
+                let _busy = storage.busy();
                 if let Err(e) = writer.sync() {
                     error!(error = %e, "periodic sync failed");
                 }
@@ -992,12 +1125,15 @@ pub fn run_writer(storage: Arc<Storage>, mut rx: QueueReceiver, rt: tokio::runti
         }
         let interval = storage.sync_interval();
         let sync = interval.is_zero() || writer.since_sync() >= interval;
+        let busy = storage.busy();
         if let Err(e) = writer.append(&batch, sync) {
             error!(error = %e, records = batch.len(), "write failed; batch dropped");
         }
+        drop(busy);
         rx.release(&batch);
         batch.clear();
     }
+    let _busy = storage.busy();
     if let Err(e) = writer.sync() {
         error!(error = %e, "final sync failed");
     }
@@ -1328,7 +1464,88 @@ mod tests {
             records.iter().map(|r| r.ts).collect::<Vec<_>>(),
             vec![100, 100, 120]
         );
+        // Messages out of order are clamped too, but only a clock behind the
+        // log's last timestamp counts as stepped back.
+        assert_eq!(storage.metrics().clock_steps.load(Relaxed), 0);
+        let ahead = crate::now_us() + 60_000_000;
+        writer
+            .append(&[msg(ahead, "d"), msg(crate::now_us(), "e")], true)
+            .unwrap();
+        let records = storage.reader(4).read(10, 1 << 20).unwrap().records;
+        assert_eq!(
+            records.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![ahead, ahead]
+        );
         assert_eq!(storage.metrics().clock_steps.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failed_write_is_counted_and_reported_until_a_batch_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        assert_eq!(storage.health(), Ok(()));
+        // A directory where the first segment goes: creating it fails.
+        let blocker = dir.path().join(segment::file_name(1));
+        fs::create_dir(&blocker).unwrap();
+        assert!(writer.append(&[msg(1, "a"), msg(2, "b")], true).is_err());
+        let metrics = storage.metrics();
+        let counts = || {
+            (
+                metrics.write_errors.load(Relaxed),
+                metrics.dropped.load(Relaxed),
+                metrics.syncs.load(Relaxed),
+            )
+        };
+        assert_eq!(counts(), (1, 2, 0));
+        let health = storage.health().unwrap_err();
+        assert!(
+            health.starts_with("log write failed: opening the active segment: "),
+            "{health}"
+        );
+
+        fs::remove_dir(&blocker).unwrap();
+        writer.append(&[msg(3, "c")], true).unwrap();
+        assert_eq!(storage.health(), Ok(()));
+        assert_eq!(counts(), (1, 2, 1));
+        assert_eq!(storage.head_seq(), 1, "the lost batch took no numbers");
+    }
+
+    #[test]
+    fn a_batch_or_sync_that_takes_too_long_makes_the_log_unhealthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path(), limits(1 << 20, 64 << 10)).unwrap();
+        storage.opened = Instant::now() - Duration::from_secs(60);
+        let busy = storage.busy();
+        assert_eq!(storage.health(), Ok(()));
+        drop(busy);
+        // As if the writer had begun when the log was opened.
+        storage.busy_since.store(1, Relaxed);
+        assert_eq!(storage.health(), Err("log writer busy for 60 s".into()));
+        storage.busy_since.store(0, Relaxed);
+        assert_eq!(storage.health(), Ok(()));
+    }
+
+    #[test]
+    fn timestamps_are_found_by_sequence_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(128 << 10, 64 << 10));
+        let payload = "x".repeat(1000);
+        for ts in 1..=150 {
+            writer.append(&[msg(ts * 10, &payload)], true).unwrap();
+        }
+        // 63 records a segment; the first segment is evicted.
+        let first = storage.status().first_seq;
+        assert_eq!(first, 64);
+        let mut mark = Mark::default();
+        // A lookup after an earlier one in the same segment reads on from
+        // its mark; any other reads from the start of the segment.
+        for seq in [first, first + 3, first + 1, 140, 150, first + 2] {
+            let ts = storage.timestamp(seq, &mut mark).unwrap();
+            assert_eq!(ts, Some(seq as i64 * 10), "{seq}");
+        }
+        assert_eq!(storage.timestamp(first - 1, &mut mark).unwrap(), None);
+        assert_eq!(storage.timestamp(151, &mut mark).unwrap(), None);
+        assert_eq!(storage.timestamp(0, &mut mark).unwrap(), None);
     }
 
     #[test]
