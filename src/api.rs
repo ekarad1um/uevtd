@@ -193,7 +193,7 @@ async fn keep_times(state: Shared) {
 }
 
 /// Bounds on the API's connections, which would otherwise use up the file
-/// descriptors that the log and the producers need.
+/// descriptors that the log and inbound's connection need.
 #[derive(Clone, Copy)]
 struct Serve {
     /// Open at once; more wait to be accepted, holding no descriptor.
@@ -655,9 +655,8 @@ async fn get_status(State(state): State<Shared>) -> Json<Value> {
         "restart_required": config.restart_required(&state.boot),
         "api": { "last_error": state.last_error.get() },
         "inbound": {
+            "connected": inbound.connected.load(Relaxed),
             "connections": inbound.connections.load(Relaxed),
-            "active": inbound.active.load(Relaxed),
-            "rejected": inbound.rejected.load(Relaxed),
             "messages": inbound.messages.load(Relaxed),
             "bytes": inbound.bytes.load(Relaxed),
             "truncated": inbound.truncated.load(Relaxed),
@@ -782,23 +781,17 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
     let mut e = Exposition::default();
     let inbound = &state.inbound;
     e.family(
+        "uevtd_inbound_connected",
+        "gauge",
+        "A connection to the producer is up",
+    )
+    .value(u8::from(inbound.connected.load(Relaxed)));
+    e.family(
         "uevtd_inbound_connections_total",
         "counter",
-        "Accepted connections",
+        "Connections made to the producer",
     )
     .value(inbound.connections.load(Relaxed));
-    e.family(
-        "uevtd_inbound_connections_active",
-        "gauge",
-        "Open connections",
-    )
-    .value(inbound.active.load(Relaxed));
-    e.family(
-        "uevtd_inbound_connections_rejected_total",
-        "counter",
-        "Connections closed because of the limit",
-    )
-    .value(inbound.rejected.load(Relaxed));
     e.family(
         "uevtd_inbound_messages_total",
         "counter",
@@ -814,7 +807,7 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
     e.family(
         "uevtd_inbound_truncated_total",
         "counter",
-        "Messages discarded because the peer closed mid-line",
+        "Messages discarded because the connection closed mid-line",
     )
     .value(inbound.truncated.load(Relaxed));
     e.family(

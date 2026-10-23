@@ -1,6 +1,6 @@
-//! The queue between connection tasks and the log writer, bounded by message
-//! count and by payload bytes, so that a burst of large messages cannot hold
-//! more than a fixed amount of memory while the writer is busy.
+//! The queue between inbound and the log writer, bounded by message count
+//! and by payload bytes, so that a burst of large messages cannot hold more
+//! than a fixed amount of memory while the writer is busy.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

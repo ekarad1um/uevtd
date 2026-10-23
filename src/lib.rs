@@ -1,8 +1,9 @@
 //! uevtd: a message forwarding daemon.
 //!
-//! Messages arrive newline-delimited on a Unix domain socket, are appended to a
-//! bounded on-disk log, and are forwarded by independent channel tasks that each
-//! keep a durable cursor into that log. See `ARCHITECTURE.md` for the design.
+//! Messages are read newline-delimited from a producer's Unix domain socket,
+//! are appended to a bounded on-disk log, and are forwarded by independent
+//! channel tasks that each keep a durable cursor into that log. See
+//! `ARCHITECTURE.md` for the design.
 
 pub mod api;
 pub mod config;

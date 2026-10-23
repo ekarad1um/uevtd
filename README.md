@@ -1,10 +1,11 @@
 # uevtd
 
-A message forwarding daemon. Producers write newline-delimited messages
-(typically JSON) to a Unix domain socket; `uevtd` appends them to a bounded,
-crash-safe log on disk and forwards them, in order and at least once, to the
-configured WebSocket receivers and MQTT topics. A second Unix socket serves an
-HTTP API for configuration, time-range queries over the log, status and metrics.
+A message forwarding daemon. `uevtd` connects to the Unix domain socket that a
+producer listens on and reads newline-delimited messages (typically JSON) from
+it; it appends them to a bounded, crash-safe log on disk and forwards them, in
+order and at least once, to the configured WebSocket receivers and MQTT topics.
+A second Unix socket, the daemon's own, serves an HTTP API for configuration,
+time-range queries over the log, status and metrics.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and its trade-offs.
 
@@ -26,40 +27,53 @@ configuration file on `SIGHUP`. A full example configuration is in
 Two things are left to the system that runs it:
 
 - A process supervisor that starts it again when it exits with a non-zero
-  status. The daemon exits with 1 when it cannot start, for example because a
-  socket path is in use, the log cannot be opened or another daemon has it
-  open (the error names that process), and when its log writer
+  status. The daemon exits with 1 when it cannot start, for example because
+  the API socket's path is in use, the log cannot be opened or another daemon
+  has it open (the error names that process), and when its log writer
   thread panics; a channel that panics is restarted inside the daemon. A clean
   stop exits with 0, a second signal with 130 and a usage error with 2.
 - Write access for the daemon's user to the directory of the configuration
   file, or of the file it links to, where the API saves it through a temporary
   file and a missing file is created, as well as to `storage.path` and the
-  directories of both sockets.
+  directory of the API socket; and write permission on the producer's socket,
+  which connecting to it needs.
 
 At startup the daemon raises its soft limit on open files to the hard limit.
 
 Logs go to stderr; the filter (`log.filter`) uses `tracing` directives such as
 `info` or `info,uevtd::storage=debug` and can be changed at runtime.
 
-## Sending messages
+## Reading messages
 
-One message per line, terminated by `\n`:
+The producer creates a stream socket at `inbound.path`, listens on it, and
+writes one message per line, terminated by `\n`. The daemon connects to it and
+reads; it never writes to the socket, and creates, changes or removes nothing
+at the path. It holds one connection at a time and connects again when that one
+ends: at once if anything arrived on it, otherwise after 100 ms, doubling to
+1 s, which is also how it waits for a producer that is not there yet.
+`/v1/status` shows `inbound.connected`, and in `inbound.last_error` why it is
+not. When the daemon stops or moves to another path, the producer's writes to
+the connection fail with `EPIPE`, or raise `SIGPIPE` where the producer does
+not ignore it, and the daemon's next connection is a new one. To try it without
+a producer, let `socat` be one:
 
 ```sh
-printf '{"event":"boot","uptime":3}\n' | socat - UNIX-CONNECT:/run/uevtd/in.sock
+printf '{"event":"boot","uptime":3}\n' | socat -u - UNIX-LISTEN:/run/uevtd/in.sock
 ```
 
 Rules: a trailing `\r` is stripped, empty lines are ignored, a line longer than
 `inbound.max_message_bytes` is discarded and logged, and a final line without
-`\n` when the peer closes is discarded and logged as truncated. Payloads are
+`\n` when the connection ends is discarded and logged as truncated. Payloads are
 stored and forwarded verbatim; they are not parsed. JSON must therefore be sent
 compact, one message to a line: pretty-printed JSON would be stored and
 forwarded as one message per line.
 
-The guarantees start once a message is committed to the log, and producers get
-no acknowledgement. Until then a message can be lost: by a crash while it waits
-for the writer or for its sync, by a stop before the daemon has read it from the
-socket, or by a failed write, which is counted in `dropped`.
+The guarantees start once a message is committed to the log, and the producer
+gets no acknowledgement. Until then a message can be lost: by a crash while it
+waits for the writer or for its sync, by a stop or a change of `inbound.path`
+before the daemon has read it from the socket, or by a failed write, which is
+counted in `dropped`. While the daemon is not connected, what becomes of the
+producer's messages is up to the producer.
 
 ## Configuration
 
@@ -67,7 +81,7 @@ JSON, every field optional, unknown fields rejected. The defaults:
 
 ```json
 {
-  "inbound": { "path": "/run/uevtd/in.sock", "mode": "0660", "max_message_bytes": 65536, "max_connections": 64 },
+  "inbound": { "path": "/run/uevtd/in.sock", "max_message_bytes": 65536 },
   "storage": { "path": "/var/lib/uevtd", "max_bytes": 268435456, "segment_bytes": 8388608, "sync_interval_ms": 0 },
   "outbound": { "channels": {} },
   "api": { "path": "/run/uevtd/api.sock", "mode": "0660" },
@@ -119,11 +133,10 @@ delivery cursor, so renaming a channel starts it afresh at the current head.
 Notes:
 
 - Memory is bounded by sizes and counts, not by traffic: a backlog waits on disk.
-  `inbound.max_message_bytes` is at most 262144 and `max_connections` at most
-  256, and their product at most 16 MiB, because each connection may hold one
-  message. There are at most 8 channels, and a channel's `inflight` is at most 1024.
-  Within these limits the daemon stays below about 60 MiB resident; see
-  ARCHITECTURE.md §11.1 for the budget and measurements.
+  `inbound.max_message_bytes` is at most 262144. There are at most 8 channels,
+  and a channel's `inflight` is at most 1024. Within these limits the daemon
+  stays below about 50 MiB resident; see ARCHITECTURE.md §11.1 for the budget
+  and measurements.
 - `storage.max_bytes` bounds the log; the oldest whole segment is evicted when
   it is exceeded, so retained data stays within one `segment_bytes` of the limit.
   `segment_bytes` is between 64 KiB and 256 MiB and at least
@@ -208,7 +221,8 @@ Notes:
   too large to send; it stays in the log, and `/v1/messages` returns it by `seq`
   or `ts`. Notices are delivered at least once and in order: the cursor passes
   the messages a notice stands for once it is acknowledged. MQTT never retains
-  them, and producers should not send messages with a top-level `notice` key.
+  them, and the producer should not send messages with a top-level `notice`
+  key.
 - Messages evicted before a channel delivered them are counted in its `lost`
   and logged when they are evicted, also while the target is down. `lag`
   counts only messages still in the log.
@@ -218,11 +232,11 @@ Notes:
   it is, and the channel waits, with the error in `last_error`, until it can
   read it.
 - All fields apply live except `storage.path` and `log.format`, which are
-  reported in `/v1/status` under `restart_required`. A lower
-  `inbound.max_message_bytes` holds connected producers to it at once, the
-  message in progress included; a higher one applies to new connections. A
-  change cannot move one socket onto the other's path, a swap included; that
-  takes two changes.
+  reported in `/v1/status` under `restart_required`. A change of
+  `inbound.max_message_bytes` applies to the connection at once, the message
+  in progress included, and one of `inbound.path` closes the connection and
+  connects to the new path. A change cannot move one socket onto the other's
+  path, a swap included; that takes two changes.
 
 ## HTTP API
 
@@ -234,7 +248,7 @@ Served over `api.path`; use `curl --unix-socket`.
 | PUT    | `/v1/config`   | Replace the configuration. Validated, persisted, applied. Returns the applied document. |
 | PATCH  | `/v1/config`   | [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) merge patch of the configuration. |
 | GET    | `/v1/messages` | Time-ordered range query, see below. |
-| GET    | `/v1/status`   | JSON status: uptime, `restart_required`, inbound and storage counters; per channel the cursor, `lag`, the counts `delivered`, `rejected`, `retries`, `lost` and `notices`, and the last error. See below. |
+| GET    | `/v1/status`   | JSON status: uptime, `restart_required`, whether inbound is connected, inbound and storage counters; per channel the cursor, `lag`, the counts `delivered`, `rejected`, `retries`, `lost` and `notices`, and the last error. See below. |
 | GET    | `/v1/metrics`  | The same values in Prometheus text format. |
 | GET    | `/v1/health`   | `200 ok` while the log takes writes; `503` with the reason after a failed write or sync until a batch is committed again, while one write or sync takes more than 30 s, and while eviction cannot remove a segment, so that the log grows past `storage.max_bytes`. |
 
@@ -254,10 +268,13 @@ cut off. A query holds the one query slot until its response is written.
 since the Unix epoch in the status and in seconds in the metrics. Besides the
 counters they show:
 
+- `inbound.connected` and `connections`: whether inbound is connected to the
+  producer, and the connections made to it; `inbound.last_error` says why the
+  last one failed or ended, until the next is made.
 - `storage.first_ts` and `head_ts`: when the oldest and the newest message in
   the log were received, the range a query can reach.
 - `storage.queued` and `queued_bytes`: messages waiting for the writer.
-  Producers wait once 8 192 messages or 8 MiB do.
+  The producer's writes wait once 8 192 messages or 8 MiB do.
 - `storage.syncs` and `sync_us`: syncs and the time spent in them. `sync_us /
   syncs` is the mean sync time, and `records / syncs` the number of messages a
   sync commits.
@@ -267,8 +284,7 @@ counters they show:
 - `storage.corrupt_segments`: segments found damaged since the daemon started,
   each counted once.
 - `storage.clock_steps`: messages received while the clock was behind the
-  newest message in the log, whose time was raised to it. Messages from two
-  connections arriving slightly out of order are raised too, but not counted.
+  newest message in the log, whose time was raised to it.
 - Per channel, `lag` and `waiting_ts`: messages in the log waiting for
   delivery, and when the oldest of them was received; `delivery_us /
   delivered` is the mean time from receipt to acknowledgement. A channel that
@@ -339,9 +355,9 @@ cargo test            # unit tests and end-to-end tests (no external services)
 cargo clippy --all-targets
 ```
 
-The end-to-end tests start the daemon in-process with temporary sockets, a
-scripted WebSocket receiver and a minimal MQTT broker, both also over TLS with
-the test certificates in `tests/data`. The log's randomized tests run a few
-seeds by default; `UEVTD_SEEDS=10000` runs more, quickly with `TMPDIR` on a
-tmpfs, since every commit syncs. A real broker such as `mosquitto` works
-too: configure a channel and watch `/v1/status`.
+The end-to-end tests start the daemon in-process with a test producer on a
+temporary socket, a scripted WebSocket receiver and a minimal MQTT broker, both
+also over TLS with the test certificates in `tests/data`. The log's randomized
+tests run a few seeds by default; `UEVTD_SEEDS=10000` runs more, quickly with
+`TMPDIR` on a tmpfs, since every commit syncs. A real broker such as `mosquitto`
+works too: configure a channel and watch `/v1/status`.

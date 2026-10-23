@@ -34,19 +34,16 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Inbound {
+    /// The producer's socket, which it listens on and inbound connects to.
     pub path: PathBuf,
-    pub mode: Mode,
     pub max_message_bytes: usize,
-    pub max_connections: usize,
 }
 
 impl Default for Inbound {
     fn default() -> Self {
         Self {
             path: "/run/uevtd/in.sock".into(),
-            mode: Mode(0o660),
             max_message_bytes: 64 << 10,
-            max_connections: 64,
         }
     }
 }
@@ -317,22 +314,11 @@ impl Config {
         ensure(inbound.path != self.api.path, || {
             "inbound.path and api.path must differ".into()
         })?;
-        // Every buffer that holds messages is sized from these two, so their
-        // bounds are what keeps memory bounded (ARCHITECTURE.md §11.1).
+        // Every buffer that holds messages is sized from this one, so its
+        // bound is what keeps memory bounded (ARCHITECTURE.md §11.1).
         ensure((1..=256 << 10).contains(&inbound.max_message_bytes), || {
             "inbound.max_message_bytes must be between 1 and 262144".into()
         })?;
-        ensure((1..=256).contains(&inbound.max_connections), || {
-            "inbound.max_connections must be between 1 and 256".into()
-        })?;
-        ensure(
-            inbound.max_connections * inbound.max_message_bytes <= 16 << 20,
-            || {
-                "inbound.max_connections times inbound.max_message_bytes must be at most 16777216, \
-                 since each connection may hold one partial message"
-                    .into()
-            },
-        )?;
 
         let storage = &self.storage;
         ensure(!storage.path.as_os_str().is_empty(), || {
@@ -386,8 +372,10 @@ impl Config {
 
     /// Refuses what this configuration cannot change in `current`, the one in
     /// effect:
-    /// - A socket moved onto the path of the other one: its listener is live
-    ///   there, so binding fails, and in a swap neither move ever applies.
+    /// - A socket moved onto the path of the other one. Inbound and the API
+    ///   apply a change each on its own, so inbound could connect to the
+    ///   API's socket, and the API's bind could replace the producer's
+    ///   socket while the producer is down, as it replaces a stale one.
     /// - A client id that two channels would share, unless they share it in
     ///   `current` already. The host name is read now, so a host renamed
     ///   since `current` was applied can make channels share one; a change
@@ -399,7 +387,7 @@ impl Config {
                 .into()
         })?;
         ensure(self.api.path != current.inbound.path, || {
-            "api.path is the inbound socket in effect; move that one first, in a change of its own"
+            "api.path is the producer's socket in effect; move inbound.path first, in a change of its own"
                 .into()
         })?;
         check_client_ids(
@@ -518,8 +506,8 @@ pub fn redacted_url(url: &str) -> String {
 const SOCKET_PATH_ROOM: usize =
     std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
 
-/// A path that a socket can be bound at, so that neither a rebind nor the
-/// next start can fail on the path itself.
+/// A path that a socket address holds, so that neither binding the API's
+/// socket nor connecting to the producer's can fail on the path itself.
 fn socket_path(field: &str, path: &Path) -> Result<(), Error> {
     let bytes = path.as_os_str().as_bytes();
     ensure(!bytes.is_empty(), || format!("{field} must not be empty"))?;
@@ -991,17 +979,8 @@ mod tests {
         };
         assert!(check(&|c| c.inbound.max_message_bytes = 256 << 10).is_ok());
         assert!(check(&|c| c.inbound.max_message_bytes = (256 << 10) + 1).is_err());
-        assert!(check(&|c| c.inbound.max_connections = 256).is_ok());
-        assert!(check(&|c| c.inbound.max_connections = 257).is_err());
-        // Each limit alone is fine; together they exceed the 16 MiB for partial messages.
-        assert!(
-            check(&|c| {
-                c.inbound.max_connections = 65;
-                c.inbound.max_message_bytes = 256 << 10;
-            })
-            .is_err()
-        );
-        // The configuration files written by earlier versions held 64 connections of 1 MiB.
+        assert!(check(&|c| c.inbound.max_message_bytes = 0).is_err());
+        // The configuration files written by earlier versions held 1 MiB.
         assert!(check(&|c| c.inbound.max_message_bytes = 1 << 20).is_err());
 
         // A message must fit into a segment together with the headers.
@@ -1073,7 +1052,14 @@ mod tests {
             )
             .is_err()
         );
-        assert!(serde_json::from_str::<Config>(r#"{"inbound":{"mode":"999"}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"api":{"mode":"999"}}"#).is_err());
+        // Inbound connects to the producer's socket: it sets no mode, and
+        // holds one connection.
+        for removed in [r#"{"mode":"0660"}"#, r#"{"max_connections":64}"#] {
+            let text = format!(r#"{{"inbound":{removed}}}"#);
+            let err = serde_json::from_str::<Config>(&text).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
     }
 
     #[test]
@@ -1312,7 +1298,7 @@ mod tests {
         let err = parse("[]").unwrap_err();
         assert_eq!(err.to_string(), "the configuration must be a JSON object");
         // A syntax error still says where it is.
-        let err = parse("{\n\"inbound\": {\"max_connections\": x}}").unwrap_err();
+        let err = parse("{\n\"inbound\": {\"max_message_bytes\": x}}").unwrap_err();
         assert!(err.to_string().contains("line 2"), "{err}");
 
         // A patch must be an object, and so must every section of what it
@@ -1478,14 +1464,14 @@ mod tests {
             s.spawn(|| {
                 for i in 1..=rounds {
                     store
-                        .patch(&serde_json::json!({"inbound": {"max_connections": 100 + i}}))
+                        .patch(&serde_json::json!({"inbound": {"max_message_bytes": 100 + i}}))
                         .unwrap();
                 }
             });
         });
         let current = store.current();
         assert_eq!(current.storage.sync_interval_ms, rounds);
-        assert_eq!(current.inbound.max_connections as u64, 100 + rounds);
+        assert_eq!(current.inbound.max_message_bytes as u64, 100 + rounds);
         assert_eq!(load(&path).unwrap(), *current);
     }
 

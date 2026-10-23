@@ -1162,9 +1162,9 @@ impl Writer {
         for message in batch {
             seq += 1;
             if message.ts < ts {
-                // Connections stamp their messages before they queue them, so
-                // messages from two of them can arrive slightly out of order.
-                // Only a clock behind the log's last timestamp has stepped back.
+                // Clamped, and counted as a step only while the clock is
+                // behind the log's last timestamp: one set forward again
+                // before the writer took the message has not stepped back.
                 let now = *now.get_or_insert_with(crate::now_us);
                 if now < ts {
                     self.note_clock_step(ts - now);

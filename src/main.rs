@@ -119,8 +119,8 @@ fn tune_allocator() {}
 
 /// Raises the soft limit on open files to the hard one. The daemon's own
 /// limits keep it well below the usual 1024; this is the margin for what
-/// they miss, since the log writer and the producers are what fail when the
-/// descriptors run out (ARCHITECTURE.md §11).
+/// they miss, since the log writer and inbound's connection are what fail
+/// when the descriptors run out (ARCHITECTURE.md §11).
 fn raise_file_limit() {
     let mut limit = libc::rlimit {
         rlim_cur: 0,

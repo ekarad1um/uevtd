@@ -3,13 +3,20 @@
 ## Unreleased
 
 Configuration files that loaded before may now be rejected at startup. The
-error names the field and its allowed range.
+error names the field, and the allowed range of a value outside it. Every file
+the daemon wrote holds `inbound.mode` and `inbound.max_connections`, which are
+gone: remove them.
 
 ### Removed
 
 - The HTTP channel. A configuration file with a `"type": "http"` channel no
   longer loads ("unknown variant `http`"); replace it with a `websocket`
   channel, whose receiver must implement the protocol in the README.
+- `inbound.mode` and `inbound.max_connections`, since inbound no longer
+  listens (below); a configuration file with either no longer loads ("unknown
+  field"). `inbound.active` and `inbound.rejected` in `/v1/status`, and the
+  metrics `uevtd_inbound_connections_active` and
+  `uevtd_inbound_connections_rejected_total`, went with them.
 - `contrib/uevtd.service`. systemd is not a supported target. Whatever starts
   the daemon must start it again after a non-zero exit, and give it write
   access to the directory of its configuration file; see the README.
@@ -26,6 +33,8 @@ error names the field and its allowed range.
   ends when no answer comes within `timeout_ms`, unless the receiver's TCP
   acknowledged data meanwhile, on Linux and macOS: a slow link keeps its
   session as long as it moves.
+- `inbound.connected` in `/v1/status`, and `uevtd_inbound_connected`: whether
+  inbound is connected to the producer.
 - `ca_file` for WebSocket and MQTT channels: a PEM file whose certificates are
   trusted instead of the platform's store.
 - `timeout_ms` for MQTT channels, 10000 by default: the time to connect, DNS,
@@ -60,11 +69,19 @@ error names the field and its allowed range.
 
 ### Changed
 
+- Inbound connects to the socket at `inbound.path`, which the producer creates
+  and listens on, and reads one connection at a time; it no longer listens
+  there itself. When the connection ends, it connects again at once if
+  anything arrived on it, and otherwise after 100 ms, doubling to 1 s, which is
+  also how it waits for a producer that is not there yet. It creates, changes
+  and removes nothing at the path, never writes to the socket, and does not
+  keep the daemon from starting. `inbound.connections` counts the connections
+  made. Before, the daemon could not start while a producer listened on the
+  path, took the socket file there for its own while the producer was down,
+  and removed it when it stopped.
 - `inbound.max_message_bytes` defaults to 65536 and is at most 262144 (before:
-  1048576 and 67108864). `inbound.max_connections` is at most 256 (before: 65536),
-  and `max_connections × max_message_bytes` is at most 16 MiB. A configuration
-  file written with the earlier defaults holds `"max_message_bytes": 1048576`;
-  set it to 65536.
+  1048576 and 67108864). A configuration file written with the earlier
+  defaults holds `"max_message_bytes": 1048576`; set it to 65536.
 - `storage.segment_bytes` is between 64 KiB and 256 MiB and at least
   `inbound.max_message_bytes + 48`. `storage.max_bytes` is at most 1 TiB, and
   `storage.sync_interval_ms` is at most 60000.
@@ -87,9 +104,9 @@ error names the field and its allowed range.
 - `inbound.path` and `api.path` are at most 107 bytes, or 103 on macOS, as a
   socket address holds, and like `storage.path` may not contain U+0000. Such a
   path was accepted before, and the next start failed on it.
-- A change may not move one socket onto the path of the other, a swap
-  included; it takes two changes. A swap was accepted before, and never
-  applied, since each new socket found the other's listener there.
+- A change may not move `inbound.path` onto the API's socket, or `api.path`
+  onto the producer's, a swap included; it takes two changes. A swap was
+  accepted before, and never applied.
 - The API serves at most 16 connections at once; more wait to be accepted. A
   connection is closed after 10 s without a request, and once a read or write
   has waited 60 s, so a client that stops reading a response is cut off.
@@ -102,9 +119,9 @@ error names the field and its allowed range.
 - `rejected` counts a record once the cursor has passed it, and only once: a
   channel restarted before then, which sends the record again, does not count
   it again.
-- A lower `inbound.max_message_bytes` applies to connected producers at once,
-  the message in progress included; a higher one applies to new connections,
-  as before.
+- A change of `inbound.max_message_bytes` applies to the connection at once,
+  the message in progress included; before, it applied to new connections
+  only.
 - MQTT channels keep fewer publishes in flight when `inflight` copies of the
   topic would exceed 1 MiB, and set TCP_NODELAY.
 - At startup the daemon raises its soft limit on open files to the hard limit.
@@ -132,7 +149,8 @@ error names the field and its allowed range.
   copies of its topic that the client keeps; queries run one at a time, each
   from its read until its response is written, also when its client has left;
   and on glibc the allocator returns large buffers to the system. Peak resident
-  size under the heaviest load is about 54 MiB, down from 144 MiB.
+  size under the heaviest load, with one producer, is about 34 MiB; with 64
+  connections it was 144 MiB.
 - A single large message could evict the whole log; segments no longer grow past
   `storage.segment_bytes`.
 - Messages evicted before a channel delivered them are counted in `lost` and
@@ -232,7 +250,6 @@ error names the field and its allowed range.
   instead of waiting for the next message.
 - A read error no longer drops the records read before it.
 - A failed socket rebind is retried by resending the configuration or `SIGHUP`.
-- Lowering `inbound.max_connections` takes effect for connections already open.
 - A startup failure is reported as itself, not as "log writer exited
   unexpectedly".
 - Stale cursor files are removed at startup; query-string secrets are redacted in

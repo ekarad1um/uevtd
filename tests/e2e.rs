@@ -1,8 +1,9 @@
 //! End-to-end: a daemon with channels pointed at a scripted WebSocket
-//! receiver and a minimal MQTT broker, driven through its inbound socket and
-//! HTTP API.
+//! receiver and a minimal MQTT broker, fed by a producer that listens on the
+//! socket it reads, and driven through its HTTP API.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -33,18 +34,32 @@ struct Env {
     config_path: PathBuf,
     inbound: PathBuf,
     api: PathBuf,
+    /// The producer, listening on `inbound` for the daemon to connect.
+    producer: Option<UnixListener>,
 }
 
 impl Env {
     fn new() -> Env {
         let dir = tempfile::Builder::new().prefix("uevtd").tempdir().unwrap();
         let path = dir.path().to_path_buf();
+        let inbound = path.join("in.sock");
         Env {
             _dir: dir,
             config_path: path.join("config.json"),
-            inbound: path.join("in.sock"),
+            producer: Some(UnixListener::bind(&inbound).unwrap()),
+            inbound,
             api: path.join("api.sock"),
         }
+    }
+
+    /// The producer stops, and removes its socket.
+    fn stop_producer(&mut self) {
+        self.producer = None;
+        std::fs::remove_file(&self.inbound).unwrap();
+    }
+
+    fn start_producer(&mut self) {
+        self.producer = Some(UnixListener::bind(&self.inbound).unwrap());
     }
 
     /// A configuration without channels.
@@ -102,12 +117,30 @@ impl Env {
         daemon
     }
 
+    /// The next connection the daemon made to the producer.
+    async fn accept(&self) -> UnixStream {
+        let producer = self.producer.as_ref().expect("the producer listens");
+        let accepted = tokio::time::timeout(Duration::from_secs(10), producer.accept());
+        accepted.await.expect("the daemon connects").unwrap().0
+    }
+
+    /// Writes `lines` on a connection of their own, which the producer then
+    /// closes; the daemon connects again at once.
     async fn send(&self, lines: &[&[u8]]) {
-        let mut stream = UnixStream::connect(&self.inbound).await.unwrap();
-        for line in lines {
-            stream.write_all(line).await.unwrap();
+        use io::ErrorKind::{BrokenPipe, ConnectionReset};
+        let data = lines.concat();
+        loop {
+            let mut stream = self.accept().await;
+            // A connection the daemon closed while it waited to be accepted,
+            // as one made just before it stopped, fails the first write.
+            let written = match stream.write(&data).await {
+                Err(e) if matches!(e.kind(), BrokenPipe | ConnectionReset) => continue,
+                written => written.unwrap(),
+            };
+            stream.write_all(&data[written..]).await.unwrap();
+            stream.shutdown().await.unwrap();
+            return;
         }
-        stream.shutdown().await.unwrap();
     }
 }
 
@@ -463,7 +496,8 @@ async fn forwards_queries_reconfigures_and_resumes() {
     assert_eq!(status, StatusCode::OK);
     daemon.stop().await;
     assert!(!env.api.exists());
-    assert!(!env.inbound.exists());
+    // The producer's socket is left alone.
+    assert!(env.inbound.exists());
 
     // Restart: sequence numbers continue and nothing is sent again.
     let daemon = env.start(config::load(&env.config_path).unwrap()).await;
@@ -733,11 +767,11 @@ async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lower_message_limit_applies_to_connections_already_open() {
+async fn a_new_message_limit_applies_to_the_open_connection() {
     let env = Env::new();
     let daemon = env.start(env.base()).await;
     let inbound = || async { daemon.get("/v1/status").await.1["inbound"].take() };
-    let mut open = UnixStream::connect(&env.inbound).await.unwrap();
+    let mut open = env.accept().await;
     open.write_all(b"{\"n\":1}\n").await.unwrap();
     wait_for(Duration::from_secs(5), || async {
         inbound().await["messages"] == 1
@@ -745,39 +779,81 @@ async fn a_lower_message_limit_applies_to_connections_already_open() {
     .await;
 
     // A message of about 100 bytes, between the limits, on the connection
-    // opened under 1024: refused once the change has reached it.
+    // made under 1024: refused once the lower limit has reached it, and
+    // taken again once the higher one has.
     let line = format!("{{\"pad\":\"{}\"}}\n", "p".repeat(100));
-    let (status, _) = daemon
-        .patch(json!({"inbound": {"max_message_bytes": 64}}))
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        open.write_all(line.as_bytes()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if inbound().await["oversized"] == 1 {
-            break;
+    for (max, counter) in [(64, "oversized"), (1024, "messages")] {
+        let before = inbound().await[counter].as_u64().unwrap();
+        let (status, _) = daemon
+            .patch(json!({"inbound": {"max_message_bytes": max}}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            open.write_all(line.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if inbound().await[counter].as_u64().unwrap() > before {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the limit {max} never applied");
         }
-        assert!(Instant::now() < deadline, "the limit never applied");
     }
+    assert_eq!(inbound().await["connections"], 1);
+    daemon.stop().await;
+}
 
-    // A higher limit applies to new connections only.
-    let (status, _) = daemon
-        .patch(json!({"inbound": {"max_message_bytes": 1024}}))
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let before = inbound().await;
-    open.write_all(line.as_bytes()).await.unwrap();
-    env.send(&[line.as_bytes()]).await;
-    let counts = |inbound: &Value| (inbound["messages"].as_u64(), inbound["oversized"].as_u64());
-    let (messages, oversized) = counts(&before);
-    let expected = (messages.map(|n| n + 1), oversized.map(|n| n + 1));
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_the_producer_once_it_listens_and_after_it_restarts() {
+    let mut env = Env::new();
+    env.stop_producer();
+    let daemon = env.start(env.base()).await;
+    let inbound = || async { daemon.get("/v1/status").await.1["inbound"].take() };
+    let head = || async { daemon.get("/v1/status").await.1["storage"]["head_seq"].take() };
+
+    // The daemon runs without its producer, and waits for it.
     wait_for(Duration::from_secs(5), || async {
-        counts(&inbound().await) == expected
+        let error = inbound().await["last_error"]["message"].take();
+        error.as_str().is_some_and(|e| e.starts_with("connect"))
     })
     .await;
+    assert_eq!(inbound().await["connected"], false);
+
+    env.start_producer();
+    env.send(&[b"{\"n\":1}\n"]).await;
+    wait_for(Duration::from_secs(5), || async { head().await == 1 }).await;
+    // `send` closed its connection, and the daemon made another at once.
+    wait_for(Duration::from_secs(5), || async {
+        let inbound = inbound().await;
+        inbound["connected"] == true && inbound["connections"] == 2
+    })
+    .await;
+    assert_eq!(inbound().await["last_error"], Value::Null);
+    let metrics = daemon
+        .client
+        .get("http://uevtd/v1/metrics")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("uevtd_inbound_connected 1"), "{metrics}");
+    assert!(
+        metrics.contains("uevtd_inbound_connections_total 2"),
+        "{metrics}"
+    );
+
+    // The producer restarts.
+    env.stop_producer();
+    wait_for(Duration::from_secs(5), || async {
+        inbound().await["connected"] == false
+    })
+    .await;
+    env.start_producer();
+    env.send(&[b"{\"n\":2}\n"]).await;
+    wait_for(Duration::from_secs(5), || async { head().await == 2 }).await;
     daemon.stop().await;
+    assert!(env.inbound.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -787,18 +863,18 @@ async fn concurrent_patches_compose() {
     let daemon = env.start(env.config(&receiver.url)).await;
     for i in 1..=10u64 {
         let a = daemon.patch(json!({"storage": {"sync_interval_ms": i}}));
-        let b = daemon.patch(json!({"inbound": {"max_connections": 100 + i}}));
+        let b = daemon.patch(json!({"inbound": {"max_message_bytes": 100 + i}}));
         let ((status_a, _), (status_b, _)) = tokio::join!(a, b);
         assert_eq!((status_a, status_b), (StatusCode::OK, StatusCode::OK));
     }
     let (_, config) = daemon.get("/v1/config").await;
     assert_eq!(config["storage"]["sync_interval_ms"], 10);
-    assert_eq!(config["inbound"]["max_connections"], 110);
+    assert_eq!(config["inbound"]["max_message_bytes"], 110);
     assert_eq!(
         config::load(&env.config_path)
             .unwrap()
             .inbound
-            .max_connections,
+            .max_message_bytes,
         110
     );
     daemon.stop().await;
@@ -844,7 +920,7 @@ async fn refuses_to_steal_a_live_socket() {
     let daemon = env.start(env.config(&receiver.url)).await;
     let other = Env::new();
     let mut config = other.config(&receiver.url);
-    config.inbound.path = env.inbound.clone();
+    config.api.path = env.api.clone();
     config::save(&other.config_path, &config).unwrap();
     let result = daemon::run(
         Options {
@@ -858,9 +934,10 @@ async fn refuses_to_steal_a_live_socket() {
     // The bind failure is the reported cause, not a consequence of it.
     let message = format!("{:#}", result.unwrap_err());
     assert!(
-        message.starts_with("inbound") && message.contains("in use"),
+        message.starts_with("api") && message.contains("in use"),
         "{message}"
     );
+    assert_eq!(daemon.get("/v1/health").await.0, StatusCode::OK);
     daemon.stop().await;
 }
 
@@ -894,7 +971,11 @@ async fn a_second_daemon_on_the_same_log_stops_before_it_changes_anything() {
         "{message}"
     );
     assert!(cursor.exists());
-    assert!(!other.inbound.exists() && !other.api.exists());
+    assert!(!other.api.exists());
+    // Nor did it read from its producer.
+    let producer = other.producer.as_ref().unwrap();
+    let accepted = tokio::time::timeout(Duration::from_millis(100), producer.accept());
+    assert!(accepted.await.is_err());
     daemon.stop().await;
 }
 
@@ -1418,7 +1499,7 @@ async fn a_client_id_shared_at_startup_is_reported_not_refused() {
     // A change elsewhere is taken; a third channel that would share the id
     // is not.
     let (status, body) = daemon
-        .patch(json!({"inbound": {"max_connections": 32}}))
+        .patch(json!({"inbound": {"max_message_bytes": 2048}}))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = daemon

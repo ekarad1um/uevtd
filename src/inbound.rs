@@ -1,32 +1,45 @@
-//! Inbound: newline-delimited messages over a Unix domain socket
-//! (ARCHITECTURE.md §4). Framing is a sans-IO state machine so its edge cases
-//! are unit-testable.
+//! Inbound: newline-delimited messages read from the producer's Unix domain
+//! socket, which inbound connects to (ARCHITECTURE.md §4). Framing is a
+//! sans-IO state machine so its edge cases are unit-testable.
 
+use std::fs;
+use std::io;
+use std::os::unix::fs::FileTypeExt;
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
-use anyhow::Context;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::JoinSet;
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::config::{self, Config};
 use crate::metrics::ErrorSlot;
+use crate::now_us;
 use crate::storage::{Message, QueueSender};
-use crate::{now_us, uds};
 
-/// Bytes read from a connection at a time.
+/// Bytes read from the connection at a time.
 const READ_BUF: usize = 8 << 10;
+/// The wait before connecting again after a failure: 100 ms, doubling to
+/// 1 s. A connection to a local socket costs little to try, and the most is
+/// how long a producer that is back may wait to be read.
+const RETRY_BASE: Duration = Duration::from_millis(100);
+const RETRY_MAX: Duration = Duration::from_secs(1);
+/// A connection the producer's side has not completed by then fails. Linux
+/// and macOS complete or refuse one at once; this is only a bound.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How a connection that ended before anything arrived on it failed.
+const CLOSED_EARLY: &str = "the producer closed the connection before sending anything";
 
 #[derive(Default)]
 pub struct Metrics {
+    pub connected: AtomicBool,
+    /// Connections made to the producer.
     pub connections: AtomicU64,
-    pub active: AtomicU64,
-    pub rejected: AtomicU64,
     pub messages: AtomicU64,
     pub bytes: AtomicU64,
     pub truncated: AtomicU64,
@@ -34,6 +47,9 @@ pub struct Metrics {
     pub last_error: ErrorSlot,
 }
 
+/// Reads the producer's socket at `inbound.path` until `shutdown`, over one
+/// connection at a time, made again whenever it ends. Nothing at the path is
+/// ever created, changed or removed, and nothing is written to the socket.
 pub async fn run(
     mut cfg: watch::Receiver<Arc<Config>>,
     sink: QueueSender,
@@ -41,215 +57,203 @@ pub async fn run(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut current = cfg.borrow_and_update().inbound.clone();
-    let mut listener = uds::bind(&current.path, current.mode.0)
-        .await
-        .with_context(|| format!("binding inbound socket {}", current.path.display()))?;
-    info!(path = %current.path.display(), "inbound listening");
-    let mut limiter = Limiter::new(current.max_connections);
-    // `max_message_bytes`, for the connections open when it changes.
-    let (max_line, _) = watch::channel(current.max_message_bytes);
-    let mut conns = JoinSet::new();
-    let mut next_id = 0u64;
-
+    info!(path = %current.path.display(), "inbound connecting to the producer");
+    let mut retry = Retry::default();
+    let mut id = 0u64;
     loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let stream = match accepted {
-                    Ok((stream, _)) => stream,
-                    Err(e) => {
-                        warn!(error = %e, "accept failed");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
+        if let Some(after) = retry.after {
+            tokio::select! {
+                _ = tokio::time::sleep_until(after) => {}
+                changed = cfg.changed() => {
+                    if changed.is_err() {
+                        break;
                     }
-                };
-                metrics.connections.fetch_add(1, Relaxed);
-                limiter.reclaim();
-                let Some(permit) = limiter.try_acquire() else {
-                    metrics.rejected.fetch_add(1, Relaxed);
-                    warn!(max = current.max_connections, "connection limit reached; closing new connection");
+                    let next = cfg.borrow_and_update().inbound.clone();
+                    // Another producer is tried at once.
+                    if next.path != current.path {
+                        retry.reset();
+                    }
+                    current = next;
                     continue;
-                };
-                next_id += 1;
-                metrics.active.fetch_add(1, Relaxed);
-                let span = tracing::info_span!("conn", id = next_id);
-                conns.spawn(
-                    serve(stream, max_line.subscribe(), sink.clone(), metrics.clone(), shutdown.clone(), permit)
-                        .instrument(span),
-                );
+                }
+                _ = shutdown.cancelled() => break,
             }
-            Some(finished) = conns.join_next() => {
-                metrics.active.fetch_sub(1, Relaxed);
-                limiter.reclaim();
-                if let Err(e) = finished {
-                    error!(error = %e, "connection task failed");
-                }
-            }
-            changed = cfg.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                let next = cfg.borrow_and_update().inbound.clone();
-                if next.max_connections != current.max_connections {
-                    limiter.resize(next.max_connections);
-                }
-                if next.max_message_bytes != *max_line.borrow() {
-                    max_line.send_replace(next.max_message_bytes);
-                }
-                if next != current {
-                    current = rebind(&mut listener, current, next.clone(), &metrics).await;
-                }
-                // A failed rebind or mode change stays to be retried by the
-                // next change; once what is in effect is what is configured,
-                // nothing has failed.
-                if current == next {
-                    metrics.last_error.clear();
-                }
-            }
+        }
+        let connected = tokio::select! {
+            connected = connect(&current.path) => connected,
             _ = shutdown.cancelled() => break,
+        };
+        let stream = match connected {
+            Ok(stream) => stream,
+            Err(e) => {
+                retry.failed(format!("connect {}: {e}", current.path.display()), &metrics);
+                continue;
+            }
+        };
+        id += 1;
+        metrics.connections.fetch_add(1, Relaxed);
+        metrics.last_error.clear();
+        metrics.connected.store(true, Relaxed);
+        let span = tracing::info_span!("conn", id);
+        // While connections end before anything arrives, the failure they
+        // end in is what is logged of each.
+        if retry.closing_early() {
+            debug!(parent: &span, path = %current.path.display(), "connected to the producer");
+        } else {
+            info!(parent: &span, path = %current.path.display(), "connected to the producer");
+        }
+        let end = serve(stream, &mut cfg, &mut current, &sink, &metrics, &shutdown)
+            .instrument(span)
+            .await;
+        metrics.connected.store(false, Relaxed);
+        let read_error = |e: io::Error| format!("read {}: {e}", current.path.display());
+        match end {
+            End::Closed {
+                received: true,
+                error: None,
+            } => {
+                info!("the producer closed the connection");
+                retry.reset();
+            }
+            End::Closed {
+                received: true,
+                error: Some(e),
+            } => {
+                warn!(error = %e, "reading from the producer failed");
+                metrics.last_error.set(read_error(e));
+                retry.reset();
+            }
+            End::Closed {
+                received: false,
+                error,
+            } => {
+                let error = error.map_or_else(|| CLOSED_EARLY.into(), read_error);
+                retry.failed(error, &metrics);
+            }
+            End::Moved => retry.reset(),
+            End::Stopped => break,
         }
     }
-
-    drop(listener);
-    uds::remove(&current.path);
-    while conns.join_next().await.is_some() {}
-    metrics.active.store(0, Relaxed);
+    metrics.connected.store(false, Relaxed);
     info!("inbound stopped");
     Ok(())
 }
 
-/// The connection limit as a semaphore that is resized in place, so
-/// connections accepted under the old limit keep counting: raising it adds
-/// permits at once; lowering it forgets permits as connections close.
-struct Limiter {
-    semaphore: Arc<Semaphore>,
-    max: usize,
-    /// Permits still to be forgotten after the limit was lowered.
-    deficit: usize,
+/// The connections that failed since data last arrived, which the wait
+/// before the next one grows with, and the failure logged last, so that one
+/// that repeats is logged at `debug`.
+#[derive(Default)]
+struct Retry {
+    failures: u32,
+    /// When the next connection may be made, after a failure. A deadline,
+    /// so that configurations published meanwhile do not put it off.
+    after: Option<Instant>,
+    logged: Option<String>,
 }
 
-impl Limiter {
-    fn new(max: usize) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(max)),
-            max,
-            deficit: 0,
-        }
-    }
-
-    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        self.semaphore.clone().try_acquire_owned().ok()
-    }
-
-    fn resize(&mut self, max: usize) {
-        if max >= self.max {
-            let grow = max - self.max;
-            let cancelled = self.deficit.min(grow);
-            self.deficit -= cancelled;
-            self.semaphore.add_permits(grow - cancelled);
+impl Retry {
+    fn failed(&mut self, error: String, metrics: &Metrics) {
+        self.failures = self.failures.saturating_add(1);
+        let doublings = (self.failures - 1).min(16);
+        let delay = RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_MAX);
+        self.after = Some(Instant::now() + delay);
+        if self.logged.as_ref() == Some(&error) {
+            debug!(%error, "cannot read from the producer; retrying");
         } else {
-            self.deficit += self.max - max;
+            warn!(%error, "cannot read from the producer; retrying");
         }
-        self.max = max;
-        self.reclaim();
+        metrics.last_error.set(&error);
+        self.logged = Some(error);
     }
 
-    /// Forgets permits owed by an earlier decrease; called whenever a permit
-    /// may have been released.
-    fn reclaim(&mut self) {
-        if self.deficit > 0 {
-            self.deficit -= self.semaphore.forget_permits(self.deficit);
-        }
+    /// Data arrived, or another producer is to be read: the next connection
+    /// is made at once, and its failure is logged.
+    fn reset(&mut self) {
+        *self = Self::default();
     }
-}
 
-/// Applies a socket path or mode change, and returns what is in effect then.
-/// On failure keeps the old socket and records the error, so producers are
-/// never left without a listener.
-async fn rebind(
-    listener: &mut tokio::net::UnixListener,
-    current: config::Inbound,
-    next: config::Inbound,
-    metrics: &Metrics,
-) -> config::Inbound {
-    if next.path != current.path {
-        match uds::bind(&next.path, next.mode.0).await {
-            Ok(fresh) => {
-                *listener = fresh;
-                uds::remove(&current.path);
-                info!(path = %next.path.display(), "inbound rebound");
-                next
-            }
-            Err(e) => {
-                error!(path = %next.path.display(), error = %e, "rebind failed; keeping current socket");
-                metrics
-                    .last_error
-                    .set(format!("bind {}: {e}", next.path.display()));
-                config::Inbound {
-                    path: current.path,
-                    mode: current.mode,
-                    ..next
-                }
-            }
-        }
-    } else if next.mode != current.mode {
-        match uds::set_mode(&next.path, next.mode.0) {
-            Ok(()) => next,
-            Err(e) => {
-                error!(error = %e, "could not change socket mode");
-                metrics
-                    .last_error
-                    .set(format!("chmod {}: {e}", next.path.display()));
-                config::Inbound {
-                    mode: current.mode,
-                    ..next
-                }
-            }
-        }
-    } else {
-        next
+    fn closing_early(&self) -> bool {
+        self.logged.as_deref() == Some(CLOSED_EARLY)
     }
 }
 
+/// Connects to the producer's socket at `path`.
+async fn connect(path: &Path) -> io::Result<UnixStream> {
+    let error = match tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(stream)) => return Ok(stream),
+        Ok(Err(e)) => e,
+        Err(_) => io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("not accepted within {CONNECT_TIMEOUT:?}"),
+        ),
+    };
+    // Linux refuses a connection to a file that is not a socket as it does
+    // one to a socket that nothing listens on; this tells them apart.
+    match fs::metadata(path) {
+        Ok(meta) if !meta.file_type().is_socket() => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "not a socket"))
+        }
+        _ => Err(error),
+    }
+}
+
+/// How a connection ended.
+enum End {
+    /// The producer closed it, or reading from it failed with `error`;
+    /// `received` tells whether anything arrived on it.
+    Closed {
+        received: bool,
+        error: Option<io::Error>,
+    },
+    /// `inbound.path` changed.
+    Moved,
+    /// The daemon is stopping.
+    Stopped,
+}
+
+/// Reads one connection, applying the configuration as it changes.
 async fn serve(
     mut stream: UnixStream,
-    mut limit: watch::Receiver<usize>,
-    sink: QueueSender,
-    metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
-    _permit: OwnedSemaphorePermit,
-) {
-    debug!("connected");
-    let mut max_line = *limit.borrow_and_update();
-    let mut framer = Framer::new(max_line);
+    cfg: &mut watch::Receiver<Arc<Config>>,
+    current: &mut config::Inbound,
+    sink: &QueueSender,
+    metrics: &Metrics,
+    shutdown: &CancellationToken,
+) -> End {
+    let mut framer = Framer::new(current.max_message_bytes);
     let mut buf = vec![0u8; READ_BUF];
-    loop {
+    let mut received = false;
+    let end = loop {
         let n = tokio::select! {
             read = stream.read(&mut buf) => match read {
-                Ok(0) => break,
+                Ok(0) => break End::Closed { received, error: None },
                 Ok(n) => n,
-                Err(e) => {
-                    debug!(error = %e, "read failed");
-                    break;
-                }
+                Err(e) => break End::Closed { received, error: Some(e) },
             },
-            // A lower limit applies at once, to the message in progress
-            // too. A higher one applies only to connections opened after
-            // it: what all connections hold is bounded for at most
-            // `max_connections` of them, and the change that raises this
-            // limit can lower that one, which leaves more open for now.
-            Ok(()) = limit.changed() => {
-                let max = *limit.borrow_and_update();
-                if max < max_line {
-                    max_line = max;
-                    framer.set_max(max);
+            changed = cfg.changed() => {
+                if changed.is_err() {
+                    return End::Stopped;
+                }
+                let next = cfg.borrow_and_update().inbound.clone();
+                // A new limit applies at once, to the message in progress
+                // too (`Framer::set_max`).
+                if next.max_message_bytes != current.max_message_bytes {
+                    framer.set_max(next.max_message_bytes);
+                }
+                let moved = next.path != current.path;
+                *current = next;
+                if moved {
+                    info!(path = %current.path.display(), "inbound path changed; closing the connection");
+                    break End::Moved;
                 }
                 continue;
             }
             _ = shutdown.cancelled() => {
                 debug!(pending = framer.pending(), "closing for shutdown");
-                return;
+                return End::Stopped;
             }
         };
+        received = true;
         framer.push(&buf[..n]);
         while let Some(frame) = framer.next_frame() {
             match frame {
@@ -258,10 +262,14 @@ async fn serve(
                     metrics.messages.fetch_add(1, Relaxed);
                     metrics.bytes.fetch_add(len as u64, Relaxed);
                     // The message is copied out of the framer only once the
-                    // queue has room for it, so a connection never holds a
-                    // message twice while it waits.
+                    // queue has room for it, so the connection never holds
+                    // a message twice while it waits. Nothing is read
+                    // meanwhile, so the producer's writes wait too.
                     let Ok(permit) = sink.reserve(len).await else {
-                        return;
+                        // The writer is gone, which stops the daemon. Ending
+                        // first would make inbound the reported cause.
+                        shutdown.cancelled().await;
+                        return End::Stopped;
                     };
                     permit.send(Message {
                         ts,
@@ -270,20 +278,24 @@ async fn serve(
                 }
                 Frame::Oversized(bytes) => {
                     metrics.oversized.fetch_add(1, Relaxed);
-                    warn!(bytes, max = max_line, "discarding oversized message");
+                    warn!(
+                        bytes,
+                        max = current.max_message_bytes,
+                        "discarding oversized message"
+                    );
                 }
             }
         }
-    }
+    };
     let pending = framer.pending();
     if pending > 0 {
         metrics.truncated.fetch_add(1, Relaxed);
         warn!(
             bytes = pending,
-            "peer closed mid-message; discarding truncated message"
+            "connection closed mid-message; discarding truncated message"
         );
     }
-    debug!("disconnected");
+    end
 }
 
 pub enum Frame {
@@ -394,9 +406,10 @@ impl Framer {
         }
     }
 
-    /// Holds what follows to the limit `max`, the line in progress included,
-    /// which is discarded if it is longer already. The buffer gives back
-    /// what it kept for a higher limit.
+    /// Holds what follows to the limit `max`, higher or lower, the line in
+    /// progress included: one that is longer already is discarded, and one
+    /// that is being discarded stays so. The buffer gives back what it kept
+    /// for a higher limit.
     pub fn set_max(&mut self, max: usize) {
         self.max = max;
         let pending = self.buf.len() - self.start;
@@ -442,8 +455,10 @@ impl Framer {
 mod tests {
     use std::time::Instant;
 
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
+
     use super::*;
-    use crate::config::Mode;
     use crate::testing::{Rng, seeds};
 
     fn collect(framer: &mut Framer) -> Vec<Result<String, usize>> {
@@ -515,80 +530,262 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn what_failed_to_apply_is_retried_until_the_configuration_is_in_effect() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("in.sock");
-        let mut config = Config::default();
-        config.inbound.path = path.clone();
-        let (cfg, rx) = watch::channel(Arc::new(config.clone()));
-        let (sink, _queue) = crate::storage::queue(16, 1 << 20);
-        let metrics = Arc::new(Metrics::default());
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run(rx, sink, metrics.clone(), shutdown.clone()));
-        until("listening", || path.exists()).await;
-        let error = || metrics.last_error.get();
-        let message = || error().map(|e| e.message).unwrap_or_default();
-
-        // Without its file the socket's mode cannot change.
-        std::fs::remove_file(&path).unwrap();
-        config.inbound.mode = Mode(0o600);
-        cfg.send_replace(Arc::new(config.clone()));
-        until("chmod failed", || message().starts_with("chmod")).await;
-        // The old mode is in effect, so the same configuration tries again.
-        let failed = error().unwrap().ts;
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        cfg.send_replace(Arc::new(config.clone()));
-        until("chmod tried again", || {
-            error().is_some_and(|e| e.ts > failed)
-        })
-        .await;
-        // Back to the mode in effect: nothing is left to apply.
-        config.inbound.mode = Mode(0o660);
-        cfg.send_replace(Arc::new(config.clone()));
-        until("chmod error cleared", || error().is_none()).await;
-
-        // Likewise for a path that cannot be bound, under a file.
-        let file = dir.path().join("file");
-        std::fs::write(&file, b"").unwrap();
-        config.inbound.path = file.join("in.sock");
-        cfg.send_replace(Arc::new(config.clone()));
-        until("bind failed", || message().starts_with("bind")).await;
-        config.inbound.path = path.clone();
-        cfg.send_replace(Arc::new(config.clone()));
-        until("bind error cleared", || error().is_none()).await;
-
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+    /// Inbound reading the producer's socket at a path, what it queues, and
+    /// its metrics.
+    struct Reader {
+        cfg: watch::Sender<Arc<Config>>,
+        config: Config,
+        queue: crate::storage::QueueReceiver,
+        metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
-    #[test]
-    fn limiter_resizes_without_losing_track_of_open_connections() {
-        let mut limiter = Limiter::new(3);
-        let held: Vec<_> = (0..3).map(|_| limiter.try_acquire().unwrap()).collect();
-        assert!(limiter.try_acquire().is_none());
-
-        // Lowering to 1 with 3 open: nothing is admitted until two close.
-        limiter.resize(1);
-        let mut held = held.into_iter();
-        for _ in 0..2 {
-            drop(held.next());
-            limiter.reclaim();
-            assert!(limiter.try_acquire().is_none());
+    impl Reader {
+        fn start(path: &Path) -> Reader {
+            let mut config = Config::default();
+            config.inbound.path = path.to_path_buf();
+            let (cfg, rx) = watch::channel(Arc::new(config.clone()));
+            let (sink, queue) = crate::storage::queue(16, 1 << 20);
+            let metrics = Arc::new(Metrics::default());
+            let shutdown = CancellationToken::new();
+            let task = tokio::spawn(run(rx, sink, metrics.clone(), shutdown.clone()));
+            Reader {
+                cfg,
+                config,
+                queue,
+                metrics,
+                shutdown,
+                task,
+            }
         }
-        drop(held.next());
-        limiter.reclaim();
-        let one = limiter.try_acquire().unwrap();
-        assert!(limiter.try_acquire().is_none());
 
-        // Raising again while permits are still owed cancels the debt first.
-        limiter.resize(3);
-        let two = limiter.try_acquire().unwrap();
-        let three = limiter.try_acquire().unwrap();
-        assert!(limiter.try_acquire().is_none());
-        drop((one, two, three));
-        limiter.reclaim();
-        assert_eq!(limiter.semaphore.available_permits(), 3);
+        async fn next(&mut self) -> Vec<u8> {
+            let message = tokio::time::timeout(Duration::from_secs(10), self.queue.recv());
+            message.await.expect("a message").unwrap().payload
+        }
+
+        fn error(&self) -> String {
+            let error = self.metrics.last_error.get();
+            error.map(|e| e.message).unwrap_or_default()
+        }
+
+        fn connected(&self) -> bool {
+            self.metrics.connected.load(Relaxed)
+        }
+
+        fn change(&mut self, change: impl FnOnce(&mut config::Inbound)) {
+            change(&mut self.config.inbound);
+            self.cfg.send_replace(Arc::new(self.config.clone()));
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), self.task);
+            stopped.await.expect("inbound stops").unwrap().unwrap();
+        }
+    }
+
+    /// The next connection inbound made to `producer`.
+    async fn accept(producer: &UnixListener) -> UnixStream {
+        let accepted = tokio::time::timeout(Duration::from_secs(10), producer.accept());
+        accepted.await.expect("inbound connects").unwrap().0
+    }
+
+    #[tokio::test]
+    async fn reads_the_producer_once_it_listens_and_again_after_it_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sock");
+        let mut reader = Reader::start(&path);
+        until("no producer", || reader.error().starts_with("connect")).await;
+        assert!(!reader.connected());
+
+        let producer = UnixListener::bind(&path).unwrap();
+        let mut conn = accept(&producer).await;
+        until("connected", || reader.connected()).await;
+        assert_eq!(reader.error(), "");
+        conn.write_all(b"one\ntwo\npart").await.unwrap();
+        assert_eq!(reader.next().await, b"one");
+        assert_eq!(reader.next().await, b"two");
+
+        // The producer stops in the middle of a message, which is discarded.
+        drop((conn, producer));
+        std::fs::remove_file(&path).unwrap();
+        until("truncated", || reader.metrics.truncated.load(Relaxed) == 1).await;
+        until("producer gone", || reader.error().starts_with("connect")).await;
+        assert!(!reader.connected());
+
+        // And starts again.
+        let producer = UnixListener::bind(&path).unwrap();
+        let mut conn = accept(&producer).await;
+        conn.write_all(b"three\n").await.unwrap();
+        assert_eq!(reader.next().await, b"three");
+        let metrics = &reader.metrics;
+        let counts = (
+            metrics.connections.load(Relaxed),
+            metrics.messages.load(Relaxed),
+        );
+        assert_eq!(counts, (2, 3));
+
+        reader.stop().await;
+        // Inbound closed its end and left the producer's socket alone.
+        assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 0);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+    }
+
+    #[tokio::test]
+    async fn a_producer_that_closes_at_once_is_tried_ever_less_often() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sock");
+        let producer = UnixListener::bind(&path).unwrap();
+        let mut reader = Reader::start(&path);
+        let mut times = Vec::new();
+        while times.len() < 8 {
+            drop(accept(&producer).await);
+            times.push(Instant::now());
+        }
+        // 100 ms after the first, doubling to a second.
+        let gaps: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        let ms: Vec<_> = gaps.iter().map(Duration::as_millis).collect();
+        assert!(ms[0] >= 90 && ms[..4].is_sorted(), "{ms:?}");
+        assert!(ms[4..].iter().all(|ms| (900..1300).contains(ms)), "{ms:?}");
+        until("closed early", || reader.error() == CLOSED_EARLY).await;
+
+        // Once a connection brings data, the next one is made at once...
+        let mut conn = accept(&producer).await;
+        conn.write_all(b"x\n").await.unwrap();
+        assert_eq!(reader.next().await, b"x");
+        drop(conn);
+        let closed = Instant::now();
+        let mut conn = accept(&producer).await;
+        let waited = closed.elapsed();
+        assert!(waited < Duration::from_millis(500), "{waited:?}");
+        // ...and the waits start over: a producer that restarts then is read
+        // again within the first of them, not a second later.
+        conn.write_all(b"y\n").await.unwrap();
+        assert_eq!(reader.next().await, b"y");
+        drop((conn, producer));
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let producer = UnixListener::bind(&path).unwrap();
+        let back = Instant::now();
+        let _conn = accept(&producer).await;
+        let waited = back.elapsed();
+        assert!(waited < Duration::from_millis(500), "{waited:?}");
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn configurations_published_meanwhile_do_not_put_off_a_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sock");
+        let mut reader = Reader::start(&path);
+        // Without the producer until the wait is at its most, a second.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let producer = UnixListener::bind(&path).unwrap();
+        let listening = Instant::now();
+        let accepted = producer.accept();
+        tokio::pin!(accepted);
+        loop {
+            tokio::select! {
+                accepted = &mut accepted => {
+                    accepted.unwrap();
+                    break;
+                }
+                // The same configuration again, as a change to another
+                // section publishes it.
+                _ = tokio::time::sleep(Duration::from_millis(50)) => reader.change(|_| {}),
+            };
+            assert!(
+                listening.elapsed() < Duration::from_secs(3),
+                "never connected"
+            );
+        }
+        let waited = listening.elapsed();
+        assert!(waited < Duration::from_millis(1500), "{waited:?}");
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_path_is_read_from_its_producer_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.sock"), dir.path().join("b.sock"));
+        let (first, second) = (
+            UnixListener::bind(&a).unwrap(),
+            UnixListener::bind(&b).unwrap(),
+        );
+        let mut reader = Reader::start(&a);
+        let mut old = accept(&first).await;
+        old.write_all(b"a\npart").await.unwrap();
+        assert_eq!(reader.next().await, b"a");
+
+        reader.change(|inbound| inbound.path = b.clone());
+        // The old connection is closed, with its partial message discarded.
+        let mut byte = [0; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), old.read(&mut byte));
+        assert_eq!(closed.await.expect("closed").unwrap(), 0);
+        let mut new = accept(&second).await;
+        new.write_all(b"b\n").await.unwrap();
+        assert_eq!(reader.next().await, b"b");
+        assert_eq!(reader.metrics.truncated.load(Relaxed), 1);
+        assert_eq!(reader.metrics.connections.load(Relaxed), 2);
+        reader.stop().await;
+        assert!(a.exists() && b.exists());
+    }
+
+    #[tokio::test]
+    async fn a_new_path_is_tried_at_once_while_the_old_one_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.sock"), dir.path().join("b.sock"));
+        let producer = UnixListener::bind(&b).unwrap();
+        let mut reader = Reader::start(&a);
+        // Nothing at `a` until the wait is at its most, a second; then the
+        // path changes just after a failure.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let failed = reader.metrics.last_error.get().unwrap().ts;
+        until("failed again", || {
+            let error = reader.metrics.last_error.get();
+            error.is_some_and(|e| e.ts > failed)
+        })
+        .await;
+        reader.change(|inbound| inbound.path = b.clone());
+        let changed = Instant::now();
+        let _conn = accept(&producer).await;
+        let waited = changed.elapsed();
+        assert!(waited < Duration::from_millis(300), "{waited:?}");
+        reader.stop().await;
+    }
+
+    #[tokio::test]
+    async fn waits_to_be_stopped_once_the_writer_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sock");
+        let producer = UnixListener::bind(&path).unwrap();
+        let mut reader = Reader::start(&path);
+        let mut conn = accept(&producer).await;
+        // The writer goes, as when it panics, and takes the queue with it.
+        let (_, other) = crate::storage::queue(1, 1);
+        drop(std::mem::replace(&mut reader.queue, other));
+        conn.write_all(b"x\n").await.unwrap();
+        until("read", || reader.metrics.messages.load(Relaxed) == 1).await;
+        // Inbound does not end by itself, so that the daemon stops for the
+        // writer and names it as the cause (daemon.rs).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!reader.task.is_finished());
+        reader.stop().await;
+        assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_a_socket_is_named_so_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sock");
+        std::fs::write(&path, b"x").unwrap();
+        let reader = Reader::start(&path);
+        until("refused", || reader.error().ends_with(": not a socket")).await;
+        reader.stop().await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
     }
 
     #[test]
@@ -615,23 +812,31 @@ mod tests {
     }
 
     #[test]
-    fn a_lower_limit_applies_to_the_line_in_progress() {
+    fn a_new_limit_applies_to_the_line_in_progress() {
         let mut f = Framer::new(100);
         f.push(b"0123456789");
         assert!(collect(&mut f).is_empty());
-        // Longer than the new limit already: discarded, and so is the rest
+        // Longer than a lower limit already: discarded, and so is the rest
         // of it, and the buffer shrinks to the new limit.
         f.set_max(5);
         assert!(f.buf.capacity() <= 6, "capacity {}", f.buf.capacity());
         assert_eq!(f.pending(), 10);
+        // A higher limit does not bring back what was discarded.
+        f.set_max(100);
         f.push(b"abc\nok\n");
         assert_eq!(collect(&mut f), vec![Err(13), Ok("ok".into())]);
-        // Within it: kept, and measured against it when it ends.
+        // Within a lower limit: kept, and measured against it when it ends.
         f.push(b"1234");
         assert!(collect(&mut f).is_empty());
         f.set_max(4);
         f.push(b"\n12345\n");
         assert_eq!(collect(&mut f), vec![Ok("1234".into()), Err(5)]);
+        // A higher limit holds the line in progress to it.
+        f.push(b"123");
+        assert!(collect(&mut f).is_empty());
+        f.set_max(8);
+        f.push(b"45678\n123456789\n");
+        assert_eq!(collect(&mut f), vec![Ok("12345678".into()), Err(9)]);
         assert_eq!(f.pending(), 0);
     }
 
@@ -641,19 +846,28 @@ mod tests {
         Over(usize),
     }
 
-    /// What the framer must make of `stream` when its limit becomes `max`
-    /// at byte `at` for each `(at, max)` in `limits`, a limit that only goes
-    /// down: complete lines with one trailing `\r` stripped, empty ones
-    /// ignored, and those over the limit where they end reported by their
-    /// length on the wire; and the bytes of the unterminated tail.
-    fn reference(stream: &[u8], limits: &[(usize, usize)]) -> (Vec<Out>, usize) {
+    /// What the framer must make of `stream`, pushed in pieces that end at
+    /// `ends`, when its limit becomes `max` after the piece that ends at
+    /// `at` for each `(at, max)` in `limits`: complete lines with one
+    /// trailing `\r` stripped, empty ones ignored, and those over the limit
+    /// reported by their length on the wire; and the bytes of the
+    /// unterminated tail. A line is over the limit if it is longer when its
+    /// newline arrives, or if what had arrived of it at the end of a piece
+    /// before then was longer than the limit and a byte for a `\r`, the
+    /// limit as that piece was framed or as it became after.
+    fn reference(stream: &[u8], ends: &[usize], limits: &[(usize, usize)]) -> (Vec<Out>, usize) {
+        // The limit that the byte at `i` is framed under.
+        let limit = |i: usize| limits.iter().rev().find(|(at, _)| *at <= i).unwrap().1;
         let mut out = Vec::new();
         let mut start = 0;
         for (i, _) in stream.iter().enumerate().filter(|(_, b)| **b == b'\n') {
-            let (_, max) = limits.iter().rev().find(|(at, _)| *at <= i).unwrap();
             let raw = &stream[start..i];
             let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-            if line.len() > *max {
+            let cut = ends
+                .iter()
+                .filter(|&&end| start < end && end <= i)
+                .any(|&end| end - start > limit(end - 1).min(limit(end)) + 1);
+            if cut || line.len() > limit(i) {
                 out.push(Out::Over(raw.len()));
             } else if !line.is_empty() {
                 out.push(Out::Line(line.to_vec()));
@@ -706,6 +920,7 @@ mod tests {
             }
             let mut f = Framer::new(first);
             let mut limits = vec![(0, first)];
+            let mut ends = Vec::new();
             let mut got = Vec::new();
             let (mut i, mut biggest) = (0, 0);
             while i < stream.len() {
@@ -713,6 +928,7 @@ mod tests {
                 biggest = biggest.max(n);
                 f.push(&stream[i..i + n]);
                 i += n;
+                ends.push(i);
                 while let Some(frame) = f.next_frame() {
                     match frame {
                         Frame::Line(len) => {
@@ -725,11 +941,11 @@ mod tests {
                         Frame::Oversized(n) => got.push(Out::Over(n)),
                     }
                 }
-                let (_, max) = *limits.last().unwrap();
                 if rng.chance(15) {
-                    let lower = 1 + rng.below(max as u64) as usize;
-                    f.set_max(lower);
-                    limits.push((i, lower));
+                    // Higher or lower.
+                    let max = 1 + rng.below(3 * first as u64 + 3) as usize;
+                    f.set_max(max);
+                    limits.push((i, max));
                 }
                 let (_, max) = *limits.last().unwrap();
                 assert!(
@@ -738,7 +954,7 @@ mod tests {
                     f.buf.capacity()
                 );
             }
-            let (expected, tail) = reference(&stream, &limits);
+            let (expected, tail) = reference(&stream, &ends, &limits);
             let text = String::from_utf8_lossy(&stream);
             assert_eq!(
                 got, expected,

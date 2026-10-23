@@ -16,8 +16,8 @@ use crate::outbound::Registry;
 use crate::storage::{self, Limits, Storage};
 use crate::{api, inbound, logging, outbound};
 
-/// Bounded queue between connection tasks and the log writer: whichever of
-/// the message count and the payload bytes is reached first applies.
+/// Bounded queue between inbound and the log writer: whichever of the
+/// message count and the payload bytes is reached first applies.
 const QUEUE_DEPTH: usize = 8192;
 const QUEUE_BYTES: u32 = 8 << 20;
 
@@ -68,8 +68,9 @@ pub async fn run(opts: Options, shutdown: CancellationToken) -> anyhow::Result<(
     };
     // The thread ends once every sender is gone. This function keeps one
     // until inbound has stopped, so an earlier end can only be a panic, which
-    // must stop the daemon. Without it, inbound failing at startup would drop
-    // the last sender and the writer's exit could be reported as the cause.
+    // must stop the daemon. Without it, inbound ending early, which only a
+    // panic does, would drop the last sender and the writer's exit could be
+    // reported as the cause.
     let mut writer = Component::spawn("log writer", async move {
         match tokio::task::spawn_blocking(move || thread.join()).await {
             Ok(Ok(())) => Ok(()),

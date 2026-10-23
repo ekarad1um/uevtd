@@ -1,4 +1,5 @@
-//! Unix domain socket binding shared by the inbound and API listeners.
+//! Binding the API's Unix domain socket. Inbound binds nothing: it connects
+//! to the producer's socket.
 
 use std::fs;
 use std::io;

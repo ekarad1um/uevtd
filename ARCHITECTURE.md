@@ -1,9 +1,10 @@
 # uevtd — Architecture
 
-`uevtd` is a message forwarding daemon. It accepts newline-delimited messages on a
-Unix domain socket, appends them to a bounded on-disk log, and forwards them to
-configured WebSocket and MQTT channels. A second Unix domain socket serves an HTTP
-API for configuration, time-range queries over the log, status and metrics.
+`uevtd` is a message forwarding daemon. It connects to the Unix domain socket of
+a producer and reads newline-delimited messages from it, appends them to a
+bounded on-disk log, and forwards them to configured WebSocket and MQTT
+channels. A second Unix domain socket, its own, serves an HTTP API for
+configuration, time-range queries over the log, status and metrics.
 
 This document is the design plan for the module: what it does, how it is put
 together, the invariants each part relies on, and the trade-offs that were made.
@@ -33,12 +34,12 @@ defined behaviour.
 ## 2. System overview
 
 ```
- producers                       uevtd                                        targets
- ─────────                ─────────────────────────────────────────────       ───────
-                          ┌──────────┐  mpsc   ┌────────────┐
- ──NDJSON over UDS──────▶ │ inbound  │ ──────▶ │ log writer │──▶ segments on disk
-                          └──────────┘         │  (thread)  │     (append-only)
-                                               └─────┬──────┘
+ producer                        uevtd                                        targets
+ ────────                 ─────────────────────────────────────────────       ───────
+ listens on a UDS         ┌──────────┐  mpsc   ┌────────────┐
+ ◀──────connect────────── │ inbound  │ ──────▶ │ log writer │──▶ segments on disk
+ ───────NDJSON──────────▶ │          │         │  (thread)  │     (append-only)
+                          └──────────┘         └─────┬──────┘
                                                      │ head_seq (watch)
                                    ┌─────────────────┼─────────────────┐
                                    ▼                 ▼                 ▼
@@ -56,8 +57,9 @@ outbound. Inbound appends; every outbound channel is an independent reader with
 its own durable cursor into the log. There are no in-memory queues to size, no
 per-channel overflow policies, and a channel that is down simply falls behind
 and catches up when it recovers. Backpressure is natural at both ends: a full
-writer queue slows producers (socket flow control); a slow target shows up as
-channel lag, bounded by the log's eviction horizon.
+writer queue stops inbound reading, so the producer's writes wait (socket flow
+control); a slow target shows up as channel lag, bounded by the log's eviction
+horizon.
 
 ## 3. Module layout
 
@@ -67,7 +69,8 @@ src/
   daemon.rs        composition root: wires components, owns shutdown order
   config.rs        schema, defaults, validation, atomic persistence, live updates (watch)
   logging.rs       tracing subscriber with reloadable filter
-  inbound.rs       UDS listener, connection tasks, line framing (sans-IO `Framer`)
+  inbound.rs       UDS client of the producer's socket, reconnects, line framing
+                   (sans-IO `Framer`)
   storage/
     mod.rs         Storage: segment index, Writer (group commit, rotation, eviction),
                    Reader (tailing cursor), Tail (loss accounting), time-range query,
@@ -94,56 +97,70 @@ only place that knows about all of them.
 
 ## 4. Inbound
 
-**Transport.** `SOCK_STREAM` Unix domain socket at `inbound.path`, created with
-`inbound.mode` permissions. A stale socket file is removed only after a connect
-attempt is refused, so a second instance fails fast instead of stealing the path;
-anything at the path that is not a socket is an error, never removed. The probe
-is bounded to one second, and a socket that does not answer counts as live.
+**Transport.** The producer creates a `SOCK_STREAM` Unix domain socket at
+`inbound.path` and listens on it; inbound connects to it and reads. It holds one
+connection at a time and never writes to it. It creates, changes and removes
+nothing at the path: the socket and its permissions are the producer's, and the
+daemon's user needs write permission on the socket to connect. When the daemon
+closes the connection, at a stop or a change of path, the producer's next write
+fails with `EPIPE`, or raises `SIGPIPE` in a producer that neither ignores it
+nor writes with `MSG_NOSIGNAL`. That includes a connection the daemon made just
+before it stopped, still waiting to be accepted.
+
+**Connecting.** A connection that cannot be made, because nothing is at the
+path yet, nothing listens on the socket there, permission is missing, or the
+file is not a socket or a socket of another type, is tried again after 100 ms,
+doubling to 1 s. Trying costs a system call, and the cap is how long a producer
+that comes back may wait to be read. When a connection ends, inbound connects
+again at once if anything arrived on it. One that ended before anything arrived
+counts as a failure, so a producer that accepts and closes at once is tried at
+most once a second. The wait is a deadline, which configurations published
+meanwhile do not put off. `/v1/status` shows `inbound.connected`, and in
+`last_error` the failure until a connection is made; a failure is logged at
+`warn` when it starts or changes and at `debug` while it repeats. Inbound never
+stops the daemon: it waits for a producer that starts later, and for one that
+restarts.
 
 **Framing.** One message per line, terminated by `\n` (an optional trailing
 `\r` is stripped; empty lines are ignored). Newline framing was chosen because
 it is what every producer can emit from any language and what JSON payloads
 satisfy when serialised compactly: compact JSON never contains a raw newline,
-since newlines inside strings are escaped. Producers must therefore send
+since newlines inside strings are escaped. The producer must therefore send
 compact JSON, one message to a line; pretty-printed JSON is split at its line
 breaks into fragments that are stored and forwarded as separate messages. The
 payload is stored verbatim; no parsing is attempted.
 
-**Where the guarantees start.** Producers get no acknowledgement; none of
-them needs one. The daemon is responsible for a message once it is committed to
+**Where the guarantees start.** The producer gets no acknowledgement and
+needs none. The daemon is responsible for a message once it is committed to
 the log (§5.4), and from then on delivers it at least once or counts it as
 lost. Before that it can be lost without the producer learning of it: by a
 crash while the message waits in the writer queue or for its sync, by a stop
-before the daemon has read it from the socket, and by a failed write, which is
-counted in `dropped` (§5.4).
+or a change of `inbound.path` before the daemon has read it from the socket,
+and by a failed write, which is counted in `dropped` (§5.4). While the daemon
+is not connected, what becomes of the producer's messages is up to the
+producer.
 
-Edge cases, all handled by the sans-IO `Framer` so they are unit-testable:
+Edge cases; those of framing are handled by the sans-IO `Framer`, so that they
+are unit-testable:
 
 | Situation                                   | Behaviour                                                            |
 |---------------------------------------------|----------------------------------------------------------------------|
-| Peer closes with an unterminated final line | Line discarded, `warn` with byte count, `inbound_truncated_total`+1 |
+| Connection ends within a line               | Line discarded, `warn` with byte count, `inbound_truncated_total`+1 |
 | Line longer than `max_message_bytes`        | Bytes discarded up to the next `\n`, `warn`, `inbound_oversized_total`+1 |
-| More than `max_connections` clients         | Extra connection closed immediately, `warn`, counter                 |
-| Writer queue full (8 192 messages or 8 MiB) | Connection task awaits (socket flow control); nothing is dropped     |
-| Daemon shutdown                             | Accept stops; connection tasks stop reading; buffered complete lines already handed to the writer are kept |
+| Writer queue full (8 192 messages or 8 MiB) | Inbound stops reading, so the producer's writes wait (socket flow control); nothing is dropped |
+| Daemon shutdown                             | Inbound stops reading and closes the connection; complete lines already handed to the writer are kept |
 
 **Timestamps.** Every message receives a timestamp at receipt (microseconds
 since the Unix epoch). This is the only time the daemon knows; nothing inside
 the payload is inspected.
 
-**Reconfiguration.** A change of `path` or `mode` binds the new socket before
-the old listener is dropped; connections accepted on the old socket keep being
-served until the peer closes. If the new bind fails the old listener stays and
-the error is logged and reported in `/v1/status`. So is a mode that cannot be
-set, and the old mode counts as in effect. The next change tries again, and the
-error is cleared once what is in effect is what is configured, also by changing
-back. `max_connections` is resized in place, so after lowering it no new
-connection is admitted until enough open ones close. A lower
-`max_message_bytes` applies at once, to open connections as well, including the
-message in progress: one already longer is discarded as oversized. A higher one
-applies to connections accepted after the change. The bound on what connections
-hold (§11.1) assumes no more of them than `max_connections`, and a change that
-raises one limit can lower the other, while more connections are still open.
+**Reconfiguration.** A change of `path` closes the connection and connects to
+the new path at once. What the old producer had sent and inbound had not read
+yet is lost with the connection, as at a stop, and a line in progress counts as
+truncated. A change of `max_message_bytes` applies to the connection at once,
+the line in progress included: one already longer than a lower limit is
+discarded as oversized, and one that is being discarded stays so under a
+higher limit.
 
 ## 5. Storage
 
@@ -198,11 +215,10 @@ a corrupted payload.
 2. `ts` is non-decreasing in `seq` order. The writer clamps each receipt time to
    `max(receipt time, previous ts)`, so a backwards clock step never produces an
    out-of-order timestamp. This is what makes time-range queries a contiguous
-   scan. Connections stamp messages before they queue them, so messages from
-   two connections can reach the writer slightly out of order and are clamped
-   as well. Only a clock that is behind the previous `ts` when the writer
-   clamps counts as stepped back: `clock_steps` counts those messages, and a
-   step of more than one second is logged.
+   scan. Inbound stamps messages in the order it reads them, before it queues
+   them. A clock that is behind the previous `ts` when the writer clamps counts
+   as stepped back: `clock_steps` counts those messages, and a step of more
+   than one second is logged.
 3. For consecutive segments `S_i`, `S_{i+1}`: every record in `S_i` has
    `ts <= S_{i+1}.base_ts` and every record in `S_{i+1}` has `ts >= S_{i+1}.base_ts`.
    A query from time `t` therefore starts at the last segment whose
@@ -219,10 +235,10 @@ a corrupted payload.
 
 ### 5.4 Write path
 
-Inbound connection tasks send `Message { ts, payload }` into a bounded queue
-of at most 8 192 messages and 8 MiB of payload, whichever comes first; a
-message counts against the bytes until it has been written. A dedicated writer
-**thread** drains it with group commit:
+Inbound sends `Message { ts, payload }` into a bounded queue of at most 8 192
+messages and 8 MiB of payload, whichever comes first; a message counts against
+the bytes until it has been written. A dedicated writer **thread** drains it
+with group commit:
 
 1. Block for the first message, then take whatever else is already queued, up to
    1 024 messages or 1 MiB of encoded records, and never more than an empty
@@ -515,7 +531,7 @@ acknowledgement. Semantics:
   it stands for only once it is acknowledged, so it is delivered at least once
   and in order. MQTT never retains a notice, since it would replace the topic's
   last message for new subscribers, and MQTT receivers tell notices apart by
-  the top-level `notice` key, which a producer's own messages should therefore
+  the top-level `notice` key, which the producer's own messages should therefore
   not use. Every notice is at most 256 bytes, as a payload or as a frame.
 - **New channels start at the head.** A channel without a cursor file forwards
   messages received after it was configured; it does not replay the backlog.
@@ -696,9 +712,7 @@ certificates are not supported.
 {
   "inbound": {
     "path": "/run/uevtd/in.sock",
-    "mode": "0660",
-    "max_message_bytes": 65536,
-    "max_connections": 64
+    "max_message_bytes": 65536
   },
   "storage": {
     "path": "/var/lib/uevtd",
@@ -756,11 +770,10 @@ struct from an array too, element by element, so `[]` would read as the
 defaults and `{"outbound": []}` as no channels. Then: socket paths non-empty,
 distinct, without U+0000, and at most 107 bytes, or 103 on macOS, as a socket
 address holds; `storage.path` without U+0000; `max_message_bytes` in 1..=256
-KiB and `max_connections` in 1..=256,
-with `max_connections × max_message_bytes` at most 16 MiB; `segment_bytes` in
-64 KiB..=256 MiB and at least `max_message_bytes + 48`, `max_bytes >= 2 *
-segment_bytes` and at most 1 TiB, `sync_interval_ms <= 60 000`; at most 8
-channels, named `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they become file names);
+KiB; `segment_bytes` in 64 KiB..=256 MiB and at least `max_message_bytes + 48`,
+`max_bytes >= 2 * segment_bytes` and at most 1 TiB, `sync_interval_ms <=
+60 000`; at most 8 channels, named `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` (they
+become file names);
 WebSocket URL parses with scheme `ws` or `wss`, no credentials (they belong in
 `headers`) and no fragment, header names and values parse and leave the
 handshake's own headers alone, `ca_file` only with `wss`, `timeout_ms` at least
@@ -783,9 +796,11 @@ validation; a missing file shows when the channel connects (§6.5).
 Two checks are made against the configuration in effect, on a change (`PUT`,
 `PATCH`, `SIGHUP`) and not at startup, when nothing is in effect yet:
 
-- A socket may not move onto the path of the other one. Its listener is live
-  there, so the bind fails, and in a swap neither move ever applies; it takes
-  two changes.
+- A socket may not move onto the path of the other one, a swap included; it
+  takes two changes. Inbound and the API apply a change each on its own, so
+  for a while inbound could connect to the API's socket, and the API's bind
+  could take the producer's path while the producer is down, since it
+  replaces a socket that nothing listens on as stale.
 - Client ids are checked with the host name as it is at the check. A change is
   refused if it makes two channels share an id that they do not share already;
   a change elsewhere is not, so a conflict that a renamed host brought blocks
@@ -815,8 +830,8 @@ earlier, such as a rebind. Components react to the fields they own:
 
 | Field                           | Applied                                                    |
 |---------------------------------|------------------------------------------------------------|
-| `inbound.path`, `inbound.mode`  | live: rebind, old connections drain                        |
-| `inbound.max_*`                 | live: a lower `max_message_bytes` at once, a higher one for new connections; `max_connections` as they close (section 4) |
+| `inbound.path`                  | live: the connection is closed, and one made to the new path at once |
+| `inbound.max_message_bytes`     | live: at once, the line in progress included (section 4)   |
 | `storage.max_bytes`             | live: immediate eviction if needed                         |
 | `storage.segment_bytes`         | live: next rotation                                        |
 | `storage.sync_interval_ms`      | live: next batch                                           |
@@ -832,8 +847,8 @@ undelivered backlog or require copying the directory. It is therefore the one
 functional field that needs a restart, and the API makes that visible rather
 than silently half-applying it.
 
-A runtime failure to apply a validated configuration (for example the new
-socket directory is not writable) keeps the previous runtime state, logs, and
+A runtime failure to apply a validated configuration (for example the new API
+socket's directory is not writable) keeps the previous runtime state, logs, and
 is surfaced in `/v1/status`; the file still holds the new configuration, so the
 operator sees exactly what will be in effect after the cause is fixed.
 
@@ -864,9 +879,9 @@ which covers one left idle between requests. It is also closed once a read or
 write has waited 60 s with no byte passing either way. That cuts off a client
 that stops sending its request or reading its response, and also a request
 that takes longer to answer, as on a stalled disk. Leaked connections thus
-cannot use up the descriptors that the log and the producers need; the daemon
-also raises its soft limit on open files to the hard one at startup, as a
-margin for what these bounds miss. A query holds its slot from its read until
+cannot use up the descriptors that the log and inbound's connection need; the
+daemon also raises its soft limit on open files to the hard one at startup, as
+a margin for what these bounds miss. A query holds its slot from its read until
 its response has been written, also when its client leaves first, so only one
 page at a time is held in memory. When the daemon stops, or the API moves to a
 new path, requests in progress have 5 s to finish.
@@ -876,23 +891,24 @@ Example: `curl --unix-socket /run/uevtd/api.sock http://uevtd/v1/status`.
 ## 9. Observability
 
 **Logs** go to stderr through `tracing`, text or JSON, with a filter that is
-reloadable at runtime. Every connection task carries a `conn` id and every
-channel task a `channel` name as span fields. Startup logs the effective
-configuration (secrets redacted); configuration changes log the changed
-sections; bind, rebind, segment rotation, eviction, recovery truncation,
-reconnects and rejections are logged at the appropriate level; per-message
-events are `debug`/`trace`.
+reloadable at runtime. Inbound's connection carries a `conn` id, which counts
+the connections made, and every channel task a `channel` name as span fields.
+Startup logs the effective configuration (secrets redacted); configuration
+changes log the changed sections; connections to the producer, bind, rebind,
+segment rotation, eviction, recovery truncation, reconnects and rejections are
+logged at the appropriate level; per-message events are `debug`/`trace`.
 
 **Metrics** are plain atomic counters owned by each component, rendered on
-demand. Gauges: active connections; storage bytes and segments, the first and
-head sequence numbers and receipt times, and the messages and payload bytes in
-the writer queue; per channel the cursor, lag, the receipt time of the oldest
-waiting record, and connected state. Counters: messages, bytes, truncated,
-oversized, rejected connections; batches written, records and bytes committed,
-syncs and the time spent in them, write errors, dropped records, evictions,
-corrupt segments, clock steps; per channel delivered and the time from receipt
-to acknowledgement summed over them, rejected, retries, restarts, lost,
-notices. Means come from pairs: sync time over syncs, records over syncs (what
+demand. Gauges: whether inbound is connected to the producer; storage bytes
+and segments, the first and head sequence numbers and receipt times, and the
+messages and payload bytes in the writer queue; per channel the cursor, lag,
+the receipt time of the oldest waiting record, and connected state. Counters:
+connections made to the producer, messages, bytes, truncated, oversized;
+batches written, records and bytes committed, syncs and the time spent in them,
+write errors, dropped records, evictions, corrupt segments, clock steps; per
+channel delivered and the time from receipt to acknowledgement summed over
+them, rejected, retries, restarts, lost, notices. Means come from pairs: sync
+time over syncs, records over syncs (what
 a sync commits), delivery time over deliveries. `lost` grows when records are
 evicted, not when the channel next reads (§5.9), and `lag` counts only records
 still in the log. `/v1/status` adds the last error per component with its
@@ -925,8 +941,12 @@ itself carries on.
 | Crash between delivery and cursor save    | Up to ~1 s of messages redelivered                                        |
 | Disk full / write error                   | Batch dropped, counted in `dropped`; file rolled back to its previous length; health fails until a batch is committed |
 | fsync error                               | Unsynced tail discarded, counted in `dropped`; segment sealed; nothing visible lost; health fails until a batch is committed |
-| A write, sync or eviction hangs (stalled disk) | Producers block once the writer queue is full; health fails after 30 s; status and metrics still answer |
-| Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
+| A write, sync or eviction hangs (stalled disk) | Inbound stops reading once the writer queue is full, and the producer's writes wait; health fails after 30 s; status and metrics still answer |
+| Producer not running, or its socket not there yet | Inbound tries again after 100 ms, doubling to 1 s; `connected: false` and `last_error` say why; the daemon runs on and delivers what the log holds |
+| Producer closes the connection or restarts | A line in progress is discarded as truncated; inbound connects again at once if anything arrived on it, and otherwise after 100 ms |
+| Producer accepts and closes at once, again and again | Tried at most once a second; logged once, then at `debug`         |
+| `inbound.path` holds a file that is not a socket | Connections fail with "not a socket" and are tried again; the file is left alone |
+| `api.path` holds a file that is not a socket | Startup or rebind fails; the file is left alone                       |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1); the process supervisor, which a deployment must provide (README), starts it again |
 | Channel task panics                       | Reported in `last_error`; started again from its cursor after 1 s, doubling to 60 s while it makes no progress; `restarts` counts it |
 | Read error or damage in the active segment at startup | The segment is kept as it is, and numbering continues past every record the rest could hold; readers retry a read error, as during delivery, and skip from a corrupt record, and what they pass over counts as lost |
@@ -945,22 +965,22 @@ itself carries on.
 | Receiver stops answering, and its TCP acknowledges nothing | Session ends within twice `timeout_ms` of a ping; reconnect with backoff |
 | A slow link: frames take longer to send than `timeout_ms` | The WebSocket session stays while the receiver answers or its TCP acknowledges data; MQTT needs `timeout_ms` and `keep_alive_s` to cover them (§6.3) |
 | MQTT broker slow to accept a connection   | Connecting may take `timeout_ms`, 10 s by default                          |
-| `max_message_bytes` lowered while producers are connected | Their next bytes are held to it; a message in progress that is longer already is discarded as oversized |
+| `max_message_bytes` changed while connected | Applies at once: a line in progress longer than a lower limit is discarded as oversized |
 | A change swaps the socket paths, or moves one onto the other's | Refused; it takes two changes                                    |
 | TLS verification fails, e.g. a wrong clock | Connection fails, reported in `last_error`, retried with backoff          |
 | Another instance on the same log          | Startup fails at the log's lock, naming the holder's process id, before anything is changed |
-| Another instance already listening        | Startup fails; the socket file is not stolen                              |
+| Another instance listening on `api.path`  | Startup fails; the socket file is not stolen                              |
 | Config file invalid at startup            | Startup fails with the validation error                                   |
 | Nothing at the config path at startup     | Defaults are used and written there                                       |
 | Config path is a link to a missing file   | Startup fails; the link is left alone, not replaced by defaults           |
 | Two channels share a client id in the config, as after the host was renamed | Loaded; both run, take turns on the broker and show it in `last_error`; a change that makes two share one is refused |
 | API clients leak connections or stop reading | At most 16 are served and the rest wait to be accepted; idle ones are closed after 10 s, stalled ones after 60 s |
-| Producer floods beyond disk bandwidth     | Writer queue fills, producers block on the socket; nothing dropped        |
+| Producer floods beyond disk bandwidth     | Writer queue fills, inbound stops reading and the producer's writes wait; nothing dropped |
 | Backwards clock step                      | Timestamps clamp to the previous value and are counted in `clock_steps`; logged if > 1 s |
 
 ## 11. Concurrency and lifecycle
 
-Tokio multi-thread runtime. Tasks: inbound acceptor + one task per connection;
+Tokio multi-thread runtime. Tasks: inbound, with one connection at a time;
 one supervisor + one task per channel (+ one event-loop task per MQTT
 channel, one frame writer per WebSocket session); API acceptor + one task per
 connection, at most 16 (§8), and its receipt-time lookup (§9); config applier;
@@ -974,11 +994,11 @@ metrics take on the runtime's threads (§5.5), nor under the channel registry's
 lock, which they take as well. A stalled disk under the log thus holds up
 what waits for it, but not the runtime: `/v1/health` keeps answering.
 
-Shutdown (SIGTERM/SIGINT): stop the inbound acceptor and cancel connection
-tasks; drop the writer's senders so it drains and syncs the queue, then join
-it; cancel channels, which abandon what awaits acknowledgement (the cursor has
-not passed it, so it is sent again later), close their WebSocket sessions and
-persist their cursors; stop the API. A second signal exits immediately without
+Shutdown (SIGTERM/SIGINT): stop inbound, which closes its connection; drop
+the writer's senders so it drains and syncs the queue, then join it; cancel
+channels, which abandon what awaits acknowledgement (the cursor has not passed
+it, so it is sent again later), close their WebSocket sessions and persist
+their cursors; stop the API. A second signal exits immediately without
 waiting.
 
 ### 11.1 Memory
@@ -989,8 +1009,8 @@ Every buffer that holds messages has a byte bound:
 
 | Holder | Bound | With the defaults |
 |--------|-------|-------------------|
-| Inbound connections | each holds at most one message and an 8 KiB read buffer; a complete message is copied out only once the queue has room for it; `max_connections × max_message_bytes` ≤ 16 MiB | 64 × 72 KiB |
-| Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when producers outrun the disk |
+| Inbound | one connection, which holds at most one message and an 8 KiB read buffer; a complete message is copied out only once the queue has room for it | 72 KiB |
+| Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when the producer outruns the disk |
 | Write batch | 1 MiB of encoded records, or one record | 1 MiB |
 | Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc, and a copy of the topic with each publish, at most 1 MiB of them (§6.3); WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
 | Each log reader, and the API's receipt-time lookup | a 64 KiB read buffer, or one record if larger; a frame claiming more than 1 MiB is checked a chunk at a time, so a corrupt length costs no more | 64 KiB |
@@ -1005,19 +1025,18 @@ On glibc the binary fixes the allocator's mmap threshold at 128 KiB and limits
 it to two arenas (`src/main.rs`). By default glibc raises the threshold after
 every large free and keeps a heap per thread, so the buffers of large messages
 stayed with the process after use: without the setting, the heaviest load below
-reached more than twice its peak, 122 MiB.
+reached more than twice its peak, 77 MiB.
 
 Resident size of the release binary, measured on Linux (glibc, 7 cores) while
-48 connections send messages of the maximum size as fast as they can, 16 more
-hold a partial message each, and queries run in a loop. The WebSocket
-receivers acknowledge each frame 2 s late, so their channels' windows stay
-full:
+the producer sends messages of the maximum size as fast as it can and queries
+run in a loop, the highest of three runs under load. The WebSocket receivers
+acknowledge each frame 2 s late, so their channels' windows stay full:
 
 | Configuration | Peak |
 |---------------|------|
 | Idle, one MQTT and one WebSocket channel | 6 MiB |
-| Defaults (64 KiB messages); one MQTT channel and one slow WebSocket receiver | 31 MiB |
-| Every limit at its maximum (256 KiB messages); four MQTT channels and four slow WebSocket receivers | 53 MiB |
+| Defaults (64 KiB messages); one MQTT channel and one slow WebSocket receiver | 32 MiB |
+| Every limit at its maximum (256 KiB messages); four MQTT channels and four slow WebSocket receivers | 34 MiB |
 
 ## 12. Decisions to confirm
 

@@ -1388,6 +1388,96 @@ Residual:
 - The socket check compares with the configuration in effect. After a failed rebind the socket bound
   is the old one, and a change can still move the other socket onto its path.
 
+**Step 12, inbound connects to the producer (2026-10-22).** A change of design, not a finding: the
+producer creates the socket and listens on it, and there is one producer. Inbound listened at
+`inbound.path`, so with the producer running the daemon did not start ("in use by another process"),
+with the producer down it took the producer's socket file for its own as a stale one, and it removed
+the file when it stopped.
+
+- Inbound connects to `inbound.path` and reads one connection at a time. It never writes to it, and
+  creates, changes or removes nothing at the path, so it never stops the daemon from starting. A failed
+  connection is tried again after 100 ms, doubling to 1 s; one that ends before anything arrives counts
+  as failed, and one that brought data starts the waits over. The wait is a deadline set at the
+  failure. `inbound.connected` in `/v1/status` and `uevtd_inbound_connected` show the state, and
+  `last_error` the failure until a connection is made. A failure is logged at `warn` when it starts or
+  changes and at `debug` while it repeats, and a file at the path that is not a socket is named so,
+  since Linux refuses a connection to one as to a socket that nothing listens on.
+- Removed: `inbound.mode`, `inbound.max_connections`, the limiter and the check of the connections
+  times the message size, with `active`, `rejected` and their metrics. A configuration file with
+  either field no longer loads, and every file the daemon wrote has both; the CHANGELOG says so.
+- A change of `max_message_bytes` applies to the connection at once, either way. `Framer::set_max`
+  holds a line in progress to a higher limit too, and one being discarded stays discarded. This
+  settles step 11's residual about raising it.
+- A change of `inbound.path` closes the connection and connects to the new path at once, also in
+  the middle of a wait.
+- The refusal of a change that moves one socket onto the other's path stays, with a new reason: the
+  API's bind would take the producer's path while the producer is down.
+
+Found while implementing, and fixed:
+
+- The first version waited again from the start whenever a configuration was published, which every
+  `PUT`, `PATCH` and `SIGHUP` does, changed or not. A client that patched often enough would have kept
+  inbound from connecting at all. The wait is a deadline now.
+- With the deadline, the connection after one that brought data is made at once whether the waits
+  start over or not, so the first test of starting them over passed without it. It now restarts the
+  producer after data, and expects it read again within the first wait, not a second later.
+
+Found in a review before the commit, and fixed:
+
+- With the writer gone, as after a panic, inbound ended at the next message, where the old acceptor
+  ended only that connection's task. The daemon stops when either ends, and the one it noticed first
+  was the cause it reported: often "inbound exited unexpectedly", since a waiting inbound learns of
+  the closed queue while the writer's thread is still unwinding. Inbound now waits to be stopped.
+- A test read the last error right after the producer closed, and passed only because the
+  single-threaded test runtime polls the test before the task it woke; it now waits for the error.
+- Two comments still described inbound as listening: the reason for the socket path's length bound,
+  and the failure table, which promised a connection at once after any close.
+
+Verified with unit tests, end-to-end tests and probes of the release binary:
+
+- Each change's test fails when its old behaviour is put back: 17 reverts, each applied alone.
+- New unit tests connect before and after the producer listens and after it restarts, time the waits
+  against a producer that closes at once, publish configurations during a wait, change the path
+  while connected and while waiting, put a file that is not a socket at the path, and close the
+  queue under a connection. The framer's model test changes the limit up and down at random; its
+  reference cuts a line short where the framer measures it, at the end of each read, against the
+  limit before and after a change.
+- The end-to-end tests' producer listens, and skips a connection that the daemon closed while it
+  waited to be accepted, as one made just before a stop, which fails the first write. New: the daemon
+  started before its producer, which then restarts. The limit test raises the limit on the open
+  connection too. The test of a socket in use moved to the API's.
+- macOS: 145 unit and 20 end-to-end tests pass; Linux: 146 and 20, and the framer's model test at
+  2 000 000 seeds. On Linux 20 of 20 repeated runs of the inbound tests and 10 of 10 of the
+  end-to-end tests pass.
+
+Against the release binary on Linux, before (step 11, `e3641c8`) and after:
+
+| Probe | Before | After |
+|-------|--------|-------|
+| The producer listens at `inbound.path` when the daemon starts | exits 1: "in use by another process" | connects, commits the 3 messages; the producer's socket untouched |
+| The producer is down and left its socket file there | replaces the file with its own socket and removes that at stop | leaves the file; `last_error` "Connection refused", tried again |
+| The producer restarts 5 times, down 0.5 s each, sending 1 000 messages and a partial one each time | — | 5 000 committed, 5 truncated; read again 0.09 to 0.21 s after it listens |
+| A producer that accepts and closes every connection at once, for 20 s | — | 23 connections; one warning, the reason in `last_error` |
+| The producer sends 40 000 messages while every fdatasync takes 2 s | — | its writes wait at 8 303 sent, with 8 207 waiting for the writer; all 40 000 committed once syncs are fast again, none dropped |
+| SIGTERM while connected, and while waiting for the producer | — | stopped in 4 ms both times; the producer saw EOF; its socket untouched |
+| A `PATCH` moves `inbound.path` to another producer | — | connected to it 11 ms later; the old producer saw EOF; its partial message counted as truncated |
+
+Memory, measured as for ARCHITECTURE.md §11.1 but with one producer sending messages of the maximum
+size, the highest of three runs: 6 MiB idle, 32 MiB with the defaults, 34 MiB with every limit at its
+maximum, against 6, 31 and 53 MiB with 64 connections. Without the allocator setting the last peaked at
+77 MiB.
+
+Residual:
+
+- What becomes of the producer's messages while the daemon is not connected is up to the producer.
+  One that drops them without a reader loses those of a daemon restart, and up to a second's worth
+  after it restarts itself.
+- An idle producer looks like a hung one, and like one that never accepts: a connection waiting in
+  its backlog counts as connected.
+- A change of `inbound.path` loses what the old producer had sent and inbound had not read, as a stop
+  does.
+- Two daemons on two logs can read one producer; what each gets is up to the producer.
+
 ## 9. Second review (2026-10-22)
 
 Reviewed at `407be9d`, after steps 1–8, for defects that the fixes introduced or left, with the
