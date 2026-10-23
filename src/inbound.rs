@@ -46,6 +46,8 @@ pub async fn run(
         .with_context(|| format!("binding inbound socket {}", current.path.display()))?;
     info!(path = %current.path.display(), "inbound listening");
     let mut limiter = Limiter::new(current.max_connections);
+    // `max_message_bytes`, for the connections open when it changes.
+    let (max_line, _) = watch::channel(current.max_message_bytes);
     let mut conns = JoinSet::new();
     let mut next_id = 0u64;
 
@@ -71,7 +73,7 @@ pub async fn run(
                 metrics.active.fetch_add(1, Relaxed);
                 let span = tracing::info_span!("conn", id = next_id);
                 conns.spawn(
-                    serve(stream, current.max_message_bytes, sink.clone(), metrics.clone(), shutdown.clone(), permit)
+                    serve(stream, max_line.subscribe(), sink.clone(), metrics.clone(), shutdown.clone(), permit)
                         .instrument(span),
                 );
             }
@@ -87,13 +89,21 @@ pub async fn run(
                     break;
                 }
                 let next = cfg.borrow_and_update().inbound.clone();
-                if next == current {
-                    continue;
-                }
                 if next.max_connections != current.max_connections {
                     limiter.resize(next.max_connections);
                 }
-                current = rebind(&mut listener, current, next, &metrics).await;
+                if next.max_message_bytes != *max_line.borrow() {
+                    max_line.send_replace(next.max_message_bytes);
+                }
+                if next != current {
+                    current = rebind(&mut listener, current, next.clone(), &metrics).await;
+                }
+                // A failed rebind or mode change stays to be retried by the
+                // next change; once what is in effect is what is configured,
+                // nothing has failed.
+                if current == next {
+                    metrics.last_error.clear();
+                }
             }
             _ = shutdown.cancelled() => break,
         }
@@ -152,8 +162,9 @@ impl Limiter {
     }
 }
 
-/// Applies a socket path or mode change; on failure keeps the old socket and
-/// records the error, so producers are never left without a listener.
+/// Applies a socket path or mode change, and returns what is in effect then.
+/// On failure keeps the old socket and records the error, so producers are
+/// never left without a listener.
 async fn rebind(
     listener: &mut tokio::net::UnixListener,
     current: config::Inbound,
@@ -165,7 +176,6 @@ async fn rebind(
             Ok(fresh) => {
                 *listener = fresh;
                 uds::remove(&current.path);
-                metrics.last_error.clear();
                 info!(path = %next.path.display(), "inbound rebound");
                 next
             }
@@ -181,28 +191,35 @@ async fn rebind(
                 }
             }
         }
-    } else {
-        if next.mode != current.mode {
-            if let Err(e) = uds::set_mode(&next.path, next.mode.0) {
+    } else if next.mode != current.mode {
+        match uds::set_mode(&next.path, next.mode.0) {
+            Ok(()) => next,
+            Err(e) => {
                 error!(error = %e, "could not change socket mode");
                 metrics
                     .last_error
                     .set(format!("chmod {}: {e}", next.path.display()));
+                config::Inbound {
+                    mode: current.mode,
+                    ..next
+                }
             }
         }
+    } else {
         next
     }
 }
 
 async fn serve(
     mut stream: UnixStream,
-    max_line: usize,
+    mut limit: watch::Receiver<usize>,
     sink: QueueSender,
     metrics: Arc<Metrics>,
     shutdown: CancellationToken,
     _permit: OwnedSemaphorePermit,
 ) {
     debug!("connected");
+    let mut max_line = *limit.borrow_and_update();
     let mut framer = Framer::new(max_line);
     let mut buf = vec![0u8; READ_BUF];
     loop {
@@ -215,6 +232,19 @@ async fn serve(
                     break;
                 }
             },
+            // A lower limit applies at once, to the message in progress
+            // too. A higher one applies only to connections opened after
+            // it: what all connections hold is bounded for at most
+            // `max_connections` of them, and the change that raises this
+            // limit can lower that one, which leaves more open for now.
+            Ok(()) = limit.changed() => {
+                let max = *limit.borrow_and_update();
+                if max < max_line {
+                    max_line = max;
+                    framer.set_max(max);
+                }
+                continue;
+            }
             _ = shutdown.cancelled() => {
                 debug!(pending = framer.pending(), "closing for shutdown");
                 return;
@@ -364,6 +394,25 @@ impl Framer {
         }
     }
 
+    /// Holds what follows to the limit `max`, the line in progress included,
+    /// which is discarded if it is longer already. The buffer gives back
+    /// what it kept for a higher limit.
+    pub fn set_max(&mut self, max: usize) {
+        self.max = max;
+        let pending = self.buf.len() - self.start;
+        // Only a line known to have no end yet; one that ends in what is
+        // still to be scanned is measured when it is.
+        if self.ready.is_none() && !self.discarding && self.scanned == pending && pending > max + 1
+        {
+            self.discarded = pending;
+            self.discarding = true;
+            self.clear();
+        }
+        self.buf.drain(..self.start);
+        self.start = 0;
+        self.buf.shrink_to(max + 1);
+    }
+
     /// Copies out the line announced by [`Framer::next_frame`] and consumes it.
     pub fn take_line(&mut self) -> Vec<u8> {
         let (len, consumed) = self.ready.take().expect("a line was announced");
@@ -391,7 +440,11 @@ impl Framer {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+    use crate::config::Mode;
+    use crate::testing::{Rng, seeds};
 
     fn collect(framer: &mut Framer) -> Vec<Result<String, usize>> {
         let mut out = Vec::new();
@@ -454,6 +507,61 @@ mod tests {
         assert_eq!(collect(&mut f), vec![Err(7), Ok("x".into())]);
     }
 
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn what_failed_to_apply_is_retried_until_the_configuration_is_in_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.sock");
+        let mut config = Config::default();
+        config.inbound.path = path.clone();
+        let (cfg, rx) = watch::channel(Arc::new(config.clone()));
+        let (sink, _queue) = crate::storage::queue(16, 1 << 20);
+        let metrics = Arc::new(Metrics::default());
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(rx, sink, metrics.clone(), shutdown.clone()));
+        until("listening", || path.exists()).await;
+        let error = || metrics.last_error.get();
+        let message = || error().map(|e| e.message).unwrap_or_default();
+
+        // Without its file the socket's mode cannot change.
+        std::fs::remove_file(&path).unwrap();
+        config.inbound.mode = Mode(0o600);
+        cfg.send_replace(Arc::new(config.clone()));
+        until("chmod failed", || message().starts_with("chmod")).await;
+        // The old mode is in effect, so the same configuration tries again.
+        let failed = error().unwrap().ts;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        cfg.send_replace(Arc::new(config.clone()));
+        until("chmod tried again", || {
+            error().is_some_and(|e| e.ts > failed)
+        })
+        .await;
+        // Back to the mode in effect: nothing is left to apply.
+        config.inbound.mode = Mode(0o660);
+        cfg.send_replace(Arc::new(config.clone()));
+        until("chmod error cleared", || error().is_none()).await;
+
+        // Likewise for a path that cannot be bound, under a file.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        config.inbound.path = file.join("in.sock");
+        cfg.send_replace(Arc::new(config.clone()));
+        until("bind failed", || message().starts_with("bind")).await;
+        config.inbound.path = path.clone();
+        cfg.send_replace(Arc::new(config.clone()));
+        until("bind error cleared", || error().is_none()).await;
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     #[test]
     fn limiter_resizes_without_losing_track_of_open_connections() {
         let mut limiter = Limiter::new(3);
@@ -504,6 +612,140 @@ mod tests {
             );
         }
         assert_eq!(frames, 9);
+    }
+
+    #[test]
+    fn a_lower_limit_applies_to_the_line_in_progress() {
+        let mut f = Framer::new(100);
+        f.push(b"0123456789");
+        assert!(collect(&mut f).is_empty());
+        // Longer than the new limit already: discarded, and so is the rest
+        // of it, and the buffer shrinks to the new limit.
+        f.set_max(5);
+        assert!(f.buf.capacity() <= 6, "capacity {}", f.buf.capacity());
+        assert_eq!(f.pending(), 10);
+        f.push(b"abc\nok\n");
+        assert_eq!(collect(&mut f), vec![Err(13), Ok("ok".into())]);
+        // Within it: kept, and measured against it when it ends.
+        f.push(b"1234");
+        assert!(collect(&mut f).is_empty());
+        f.set_max(4);
+        f.push(b"\n12345\n");
+        assert_eq!(collect(&mut f), vec![Ok("1234".into()), Err(5)]);
+        assert_eq!(f.pending(), 0);
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Out {
+        Line(Vec<u8>),
+        Over(usize),
+    }
+
+    /// What the framer must make of `stream` when its limit becomes `max`
+    /// at byte `at` for each `(at, max)` in `limits`, a limit that only goes
+    /// down: complete lines with one trailing `\r` stripped, empty ones
+    /// ignored, and those over the limit where they end reported by their
+    /// length on the wire; and the bytes of the unterminated tail.
+    fn reference(stream: &[u8], limits: &[(usize, usize)]) -> (Vec<Out>, usize) {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, _) in stream.iter().enumerate().filter(|(_, b)| **b == b'\n') {
+            let (_, max) = limits.iter().rev().find(|(at, _)| *at <= i).unwrap();
+            let raw = &stream[start..i];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if line.len() > *max {
+                out.push(Out::Over(raw.len()));
+            } else if !line.is_empty() {
+                out.push(Out::Line(line.to_vec()));
+            }
+            start = i + 1;
+        }
+        (out, stream.len() - start)
+    }
+
+    #[test]
+    fn the_framer_matches_a_reference_at_every_chunking() {
+        for seed in 0..seeds(20_000) {
+            let mut rng = Rng::new(seed);
+            let first = rng.pick(&[1usize, 2, 3, 4, 5, 8, 31, 64]);
+            let mut stream = Vec::new();
+            for _ in 0..rng.below(16) {
+                let len = match rng.below(9) {
+                    0 => 0,
+                    1 => first.saturating_sub(1),
+                    2 => first,
+                    3 => first + 1,
+                    4 => first + 2,
+                    5 => 2 * first + rng.below(3) as usize,
+                    6 => rng.below(3 * first as u64 + 3) as usize,
+                    7 => 1,
+                    _ => first + rng.below(2) as usize,
+                };
+                for _ in 0..len {
+                    let byte = if rng.chance(15) {
+                        b'\r'
+                    } else {
+                        b'a' + rng.below(26) as u8
+                    };
+                    stream.push(byte);
+                }
+                if rng.chance(40) {
+                    stream.extend_from_slice(b"\r\n");
+                } else {
+                    stream.push(b'\n');
+                }
+            }
+            if rng.chance(50) {
+                stream.extend(std::iter::repeat_n(
+                    b'x',
+                    rng.below(3 * first as u64 + 3) as usize,
+                ));
+                if rng.chance(30) {
+                    stream.push(b'\r');
+                }
+            }
+            let mut f = Framer::new(first);
+            let mut limits = vec![(0, first)];
+            let mut got = Vec::new();
+            let (mut i, mut biggest) = (0, 0);
+            while i < stream.len() {
+                let n = (1 + rng.below(3 * first as u64 + 4) as usize).min(stream.len() - i);
+                biggest = biggest.max(n);
+                f.push(&stream[i..i + n]);
+                i += n;
+                while let Some(frame) = f.next_frame() {
+                    match frame {
+                        Frame::Line(len) => {
+                            // Announced again until taken.
+                            assert!(matches!(f.next_frame(), Some(Frame::Line(l)) if l == len));
+                            let line = f.take_line();
+                            assert_eq!(line.len(), len);
+                            got.push(Out::Line(line));
+                        }
+                        Frame::Oversized(n) => got.push(Out::Over(n)),
+                    }
+                }
+                let (_, max) = *limits.last().unwrap();
+                if rng.chance(15) {
+                    let lower = 1 + rng.below(max as u64) as usize;
+                    f.set_max(lower);
+                    limits.push((i, lower));
+                }
+                let (_, max) = *limits.last().unwrap();
+                assert!(
+                    f.buf.capacity() <= max + 1 + biggest,
+                    "seed {seed}: capacity {} for max {max} and chunks up to {biggest}",
+                    f.buf.capacity()
+                );
+            }
+            let (expected, tail) = reference(&stream, &limits);
+            let text = String::from_utf8_lossy(&stream);
+            assert_eq!(
+                got, expected,
+                "seed {seed} limits {limits:?} stream {text:?}"
+            );
+            assert_eq!(f.pending(), tail, "seed {seed} limits {limits:?}");
+        }
     }
 
     #[test]

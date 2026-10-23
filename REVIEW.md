@@ -1270,6 +1270,124 @@ Residual:
   directories are usually on a tmpfs.
 - On macOS the soft limit on open files is not raised.
 
+**Step 11, the channels (2026-10-22).** Fixed M13, M14, L20, L21, L22, L23 and the rest of L29 of §9,
+and settled the design note on a persistent read error as recommended.
+
+- M13: anything the receiver sends answers a ping, and an unanswered ping ends the session only if the
+  receiver's TCP has acknowledged nothing either: each time it has, within `timeout_ms`, the ping gets
+  another `timeout_ms`. A dead link or a stopped receiver thus still ends the session, within twice
+  `timeout_ms` of a ping, since the ping's own bytes count once. The channel counts what it writes,
+  under TLS, and asks the socket what it holds unacknowledged (`TIOCOUTQ` on Linux, `SO_NWRITE` on
+  macOS); elsewhere only an answer counts. The review's other half, starting the deadline once the
+  writer has written the ping, was not taken. A ping in the socket still waits behind what the socket
+  holds, up to its send buffer. And a writer that cannot write it, towards a receiver that stopped
+  reading, would never start the deadline.
+- M14: MQTT channels have `timeout_ms`, 10 000 by default, passed to rumqttc's `NetworkOptions`
+  rounded up to whole seconds, which is how rumqttc counts it, and set `TCP_NODELAY`.
+- L20: only a cursor file that holds no number replays the log. That is `InvalidData`, a kind that no
+  system error has. After any other error the file stays as it is. The channel waits, with the error in
+  `last_error`, and the supervisor tries its start again after 1 s, doubling to 60 s, as for a task
+  that ended; such a wait counts in `restarts` only after a task ended. A failure of the blocking task,
+  which started the channel at the head before, waits the same way.
+- L21: an MQTT channel's `connect`, which reads the CA file on the blocking pool, is raced with
+  cancellation, as WebSocket's is. The read itself goes on; at exit the runtime's shutdown timeout of
+  5 s bounds what it holds up.
+- L22: not the proposed cap on the topic, which would refuse configurations that load now. A topic
+  whose copies, one per publish in flight, would exceed 1 MiB lowers the publishes in flight to 1 MiB
+  divided by its length instead: 16 for 65 535 bytes. The channel logs the number it uses.
+- L23: a lower `max_message_bytes` reaches open connections at once, through a watch, and not only
+  between messages: `Framer::set_max` discards a line in progress that is longer already, and gives
+  back what the buffer kept beyond the new limit. A higher one still applies only to new connections,
+  unlike the proposal. The 16 MiB bound assumes no more connections than `max_connections`, and a
+  change that raises the message limit and lowers the connection limit leaves more open until they
+  close; raising the limit for those would exceed the bound.
+- L29:
+  - `rejected` is counted when the cursor passes the record, and once. Window and tracker entries
+    remember a rejection and report the ones the cursor passes, and a mark per channel, kept across
+    restarts of its task, counts each sequence number once. A record that a restarted channel's
+    receiver accepts after all is not counted.
+  - A mode that cannot be set leaves the old one in effect, so the next change, an unchanged one
+    included, tries again. Inbound and the API clear their error once what is in effect is what is
+    configured, which also covers changing a failed path back.
+  - A change that moves a socket onto the path of the other one in effect is refused, a swap included.
+    It is checked against the configuration in effect, as client ids are, in what is now
+    `Config::check_change`.
+  - The 32-bit item was done in step 9.
+- Design note: a reader keeps the position whose data could not be read back, and since when. An
+  error that says so, EIO, EBADMSG or, on Linux, EUCLEAN, at the same position for ten minutes makes it
+  skip the rest of the segment as from corruption. The records count as lost, a notice takes their
+  place, the segment counts once in `corrupt_segments`, and the skip is logged. Every other error is
+  retried as before, so that a cause that can be fixed, a permission or the descriptors, costs nothing.
+  This covers read errors found at startup too. A query does not retry. The channel warns of a failed
+  read when the error starts or changes, and logs the other retries at debug; ten minutes of retries
+  were 600 warnings.
+
+Found while implementing, and fixed:
+
+- After skipping the rest of the active segment, a reader positioned itself in it from the start for
+  the records written later. Damage that positioning cannot pass, a damaged length or sequence number
+  or a read error, then made it skip those as well, at every read, until the segment was sealed. The
+  reader now waits at the committed length, where a reader that had read up to the head would be.
+- The tests' pipe guard (step 10) opened its pipe from a thread that raced the removal of the test's
+  directory. When the thread lost, the blocked read was never let go, and the runtime's shutdown
+  waited for it: a test that passed alone hung in the whole suite on Linux. The guard now lets a
+  waiting reader go at once, before the directory is removed.
+
+Verified with unit tests, end-to-end tests and probes of the release binary:
+
+- Each fix's test fails when its old behaviour is put back: 22 reverts, each applied alone, one of them
+  on Linux only, where a link to `/proc/self/mem` makes every read of a segment fail with EIO.
+- The model tests of the framer, the window and the tracker joined the suite, with a generator in
+  `src/testing.rs` that the log's share. The framer's lowers the limit at random between reads, the
+  window's and the tracker's check the rejections the cursor passes.
+- New unit tests: acknowledgements that answer a ping waiting behind frames, a frame that takes four
+  times the timeout to send through a throttled link, rejections counted once across restarts, the
+  configured MQTT timeout against a broker that answers late, a channel stopped while its CA file is a
+  pipe, the topic's limit on publishes in flight, a cursor that cannot be read, the retries of
+  unreadable data and the skip after them, records written after damage in the active segment, lower
+  limits for a line in progress, retries of a failed rebind or mode, sockets that would take each
+  other's path. A new end-to-end test lowers and raises the message limit under an open connection.
+- macOS: 140 unit and 19 end-to-end tests pass; Linux: 141 and 19. On Linux 25 of 25 repeated
+  end-to-end runs and 15 of 15 unit runs pass, as do all model tests at 200 000 seeds and the writer
+  race at 20 000; after the last change, which only lowered the level of a log line, three more runs
+  of both.
+
+Against the release binary on Linux, before (step 10, `ea39bc9`) and after. The receiver, the throttled
+link and the broker are small Python peers; the link passes its bytes on through a socket with a small
+receive buffer, so that the daemon's TCP sees them acknowledged about as fast as they pass:
+
+| Probe | Before | After |
+|-------|--------|-------|
+| p22: 190 messages of 1 kB over a link passing 32 KiB/s, `keep_alive_s` 1, `timeout_ms` 2 000, for 20 s | 3 sessions; 195 frames for 190 messages | 1 session, 190 frames |
+| One message of 65 000 control bytes, 390 kB of JSON, over 8 KiB/s, with the defaults | not delivered in 150 s: 4 sessions, each ended before the receiver's answer | delivered after 53 s, in 1 session |
+| p23: a broker that answers CONNECT after 6 s, for 20 s | never connected: 3 attempts, "Network timeout" | connected at the first attempt, after 6 s |
+| A sealed segment whose reads fail with EIO (a link to `/proc/self/mem`), from the start of the log | after 11 minutes still in front of it | after 10 minutes its 41 records skipped: `lost` 41, 1 notice, `corrupt_segments` 1; the 359 others delivered |
+| L20: a cursor file that links to itself at startup | the 5 messages sent again, the link replaced by a file | waits, the error in `last_error`, the link kept; once fixed, starts at the cursor, sends nothing again |
+| L21: an MQTT channel whose CA file is a pipe nothing writes; disabled, then SIGTERM | not disabled; still running 10 s after SIGTERM | disabled at once; exits 5.1 s after SIGTERM, the runtime's shutdown timeout |
+| L22: a topic of 65 535 bytes, `inflight` 1 024, a broker that never acknowledges, 1 000 messages | 1 000 publishes in flight, 103 MiB resident | 16 in flight, 7 MiB |
+| L23: a producer connected under a limit of 65 536 bytes sends 2 000 bytes after it is lowered to 1 024 | accepted | refused as oversized |
+| L29: one `PUT` that swaps the socket paths | 200; neither applies, both rebinds fail | 400 |
+| L29: a notice for a message too large, unanswered across three restarts of the channel, then answered | `rejected` 4 | `rejected` 1 |
+
+Residual:
+
+- MQTT liveness is rumqttc's: it ends a session when the PINGRESP has not come by the next keep-alive,
+  whatever else arrived, and times each flush with `timeout_ms`. Over a slow link both must be raised
+  to cover what waits ahead of a ping and the largest publish.
+- What the receiver's TCP acknowledges shows only the first hop. A TCP proxy acknowledges what it
+  buffers, and passes it on unseen; the unit test's throttle did so on macOS, which buffered about
+  130 kB for any small size asked for, and the test allows for it.
+- Elsewhere than Linux and macOS only an answer counts.
+- A persistent read error in the active segment costs the intact records written after it, up to the
+  skip. A reader positions itself in a segment from its start, so every restart of a channel, or of
+  the daemon, waits another ten minutes at it.
+- At exit, a CA-file read that hangs holds the process for the runtime's shutdown timeout of 5 s.
+- A higher `max_message_bytes` reaches an open connection only when the producer reconnects.
+- `delivered` still counts a record again when a restart sends it again before the cursor was saved,
+  as after a panic; the receiver gets it twice too, which at-least-once allows.
+- The socket check compares with the configuration in effect. After a failed rebind the socket bound
+  is the old one, and a change can still move the other socket onto its path.
+
 ## 9. Second review (2026-10-22)
 
 Reviewed at `407be9d`, after steps 1–8, for defects that the fixes introduced or left, with the
@@ -1646,7 +1764,8 @@ M9 chose to stay at a failing position. H3 currently turns that into a skip afte
 fixed, a persistent EIO in a sealed segment will hold a channel until the segment is evicted: days at
 low traffic, with only `last_error` and `lag` showing it. A worn sector on SD cards and eMMC is the
 likeliest lasting fault of this kind. Recommended: retry for a bounded time, about ten minutes, then
-skip the rest of the segment with a `lost` notice and an error log, as for corruption.
+skip the rest of the segment with a `lost` notice and an error log, as for corruption. Decided so,
+for errors that say the data cannot be read back; see §8, step 11.
 
 ### Verified correct
 
@@ -1689,6 +1808,7 @@ Three steps, in order of risk; each fix gets a regression test that fails withou
 - **Step 10, the API and configuration:** M10, M11, L13, L14, L15, L16, L19, L26 and L28. Done; see §8,
   step 10.
 - **Step 11, the channels:** M13, M14, L20, L21, L22, L23 and L29, and the decision on the design note.
+  Done; see §8, step 11.
 
 ## Appendix: probes
 

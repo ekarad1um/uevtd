@@ -106,6 +106,7 @@ delivery cursor, so renaming a channel starts it afresh at the current head.
         "password": "secret",
         "qos": 1,
         "retain": false,
+        "timeout_ms": 10000,
         "keep_alive_s": 30,
         "inflight": 32,
         "max_packet_bytes": 1048576
@@ -135,10 +136,14 @@ Notes:
   record that was already seen.
 - At startup the newest segment is checked and synced before its records are
   forwarded. A read error in it, such as a bad sector, does not stop the
-  startup: the segment is kept, the channels retry the part that fails, with
-  the error in `last_error`, and new messages are numbered past anything that
-  part could hold. An older segment that cannot be read is retried the same
-  way.
+  startup: the segment is kept, the channels retry the part that fails, as
+  below, and new messages are numbered past anything that part could hold.
+- A channel that cannot read a part of the log tries again every second, with
+  the error in `last_error`. When the device cannot read the data back (EIO),
+  as from a worn sector on an SD card or eMMC, the channel gives up after ten
+  minutes and skips the rest of that segment: those messages count as lost,
+  and a notice takes their place. Other errors, such as a missing permission,
+  are retried until they are fixed, and then cost nothing.
 - WebSocket: one long-lived connection (`ws://` or `wss://`); `headers` go with
   the handshake. Every message is a text frame in the shape `/v1/messages`
   returns, `{"seq": 7, "ts": 1760928000123456, "data": {...}}`, or `"text"`
@@ -147,18 +152,25 @@ Notes:
   `{"nack": n, "reason": "..."}` for a frame it will never accept, which is
   counted as rejected and skipped. At most `inflight` frames and 1 MiB of payload
   wait for an answer, so a receiver slows the stream by answering later. The
-  daemon pings every `keep_alive_s` and gives up on a session without a pong
-  within `timeout_ms`, the same limit as for connecting. Unanswered frames are
-  sent again after a reconnect, so receivers deduplicate by `seq`. A message
-  whose frame would exceed `max_frame_bytes` (at least 256) is replaced by a
-  notice.
+  daemon pings every `keep_alive_s`, and anything the receiver sends answers
+  the ping. A session ends when no answer comes within `timeout_ms` of a ping,
+  the same limit as for connecting, and the receiver's TCP has acknowledged
+  nothing sent meanwhile either (on Linux and macOS), so a slow link keeps its
+  session as long as it moves. Unanswered frames are sent again after a
+  reconnect, so receivers deduplicate by `seq`. A message whose frame would
+  exceed `max_frame_bytes` (at least 256) is replaced by a notice.
 - MQTT: MQTT 3.1.1, `clean_session`, `inflight` publishes pipelined; the cursor
   advances on `PUBACK`/`PUBCOMP` (QoS 1/2) or when written (QoS 0). On a lost
   connection the daemon reconnects and republishes unacknowledged messages in
   order, so duplicates are possible. Payloads above `max_packet_bytes` (at least
   256) are rejected: a notice is published in their place. Keep it below the
   broker's packet limit, since MQTT 3.1.1 cannot tell an oversized packet from a
-  lost connection.
+  lost connection. `timeout_ms` bounds connecting, DNS, TCP, TLS and the
+  broker's answer together, and writing out each publish, in whole seconds,
+  rounded up. Over a slow link, raise it to cover the largest publish, and
+  `keep_alive_s` to cover what waits to be sent ahead of a ping. A topic so
+  long that `inflight` copies of it would exceed 1 MiB lowers `inflight`
+  accordingly, since the client keeps one in each publish.
 - MQTT `client_id`: without one, a channel connects with the host name, so
   devices that share a broker need host names of their own. The id is logged
   when the channel starts. A configured `client_id` is used exactly as given,
@@ -201,9 +213,16 @@ Notes:
   and logged when they are evicted, also while the target is down. `lag`
   counts only messages still in the log.
 - A new channel starts at the current head; disabling a channel keeps its
-  cursor; removing it deletes the cursor.
+  cursor; removing it deletes the cursor. A cursor file that holds no number
+  replays the log from its oldest message. One that cannot be read is left as
+  it is, and the channel waits, with the error in `last_error`, until it can
+  read it.
 - All fields apply live except `storage.path` and `log.format`, which are
-  reported in `/v1/status` under `restart_required`.
+  reported in `/v1/status` under `restart_required`. A lower
+  `inbound.max_message_bytes` holds connected producers to it at once, the
+  message in progress included; a higher one applies to new connections. A
+  change cannot move one socket onto the other's path, a swap included; that
+  takes two changes.
 
 ## HTTP API
 
@@ -254,6 +273,9 @@ counters they show:
   delivery, and when the oldest of them was received; `delivery_us /
   delivered` is the mean time from receipt to acknowledgement. A channel that
   has been disabled since it was added has no `cursor` yet, and `lag` 0.
+- Per channel, `rejected`: messages passed undelivered, refused by the
+  receiver or too large, each counted once the cursor has passed it, however
+  often a restart sent it again.
 
 ### `GET /v1/messages`
 

@@ -152,6 +152,9 @@ pub struct Mqtt {
     pub password: Option<String>,
     pub qos: u8,
     pub retain: bool,
+    /// For connecting, and for writing out each request; rounded up to whole
+    /// seconds.
+    pub timeout_ms: u64,
     pub keep_alive_s: u64,
     /// Maximum unacknowledged publishes in flight.
     pub inflight: u16,
@@ -173,6 +176,7 @@ impl Default for Mqtt {
             password: None,
             qos: 1,
             retain: false,
+            timeout_ms: 10_000,
             keep_alive_s: 30,
             inflight: 32,
             max_packet_bytes: 1 << 20,
@@ -303,8 +307,9 @@ fn ensure(ok: bool, message: impl FnOnce() -> String) -> Result<(), Error> {
 }
 
 impl Config {
-    /// Checks every field. Client ids that two channels share are checked
-    /// against the configuration in effect instead ([`Store`]).
+    /// Checks every field. Client ids that two channels share, and sockets
+    /// that take each other's path, are checked against the configuration
+    /// in effect instead ([`Store`]).
     pub fn validate(&self) -> Result<(), Error> {
         let inbound = &self.inbound;
         socket_path("inbound.path", &inbound.path)?;
@@ -379,12 +384,24 @@ impl Config {
         Ok(())
     }
 
-    /// Refuses a client id that two channels of this configuration would
-    /// share, unless they share it in `current` already. The host name is
-    /// read now, so a host renamed since `current` was applied can make
-    /// channels share one; a change that leaves them alone need not resolve
-    /// that, and outbound reports it ([`client_id_conflicts`]).
-    fn check_client_ids(&self, current: &Config) -> Result<(), Error> {
+    /// Refuses what this configuration cannot change in `current`, the one in
+    /// effect:
+    /// - A socket moved onto the path of the other one: its listener is live
+    ///   there, so binding fails, and in a swap neither move ever applies.
+    /// - A client id that two channels would share, unless they share it in
+    ///   `current` already. The host name is read now, so a host renamed
+    ///   since `current` was applied can make channels share one; a change
+    ///   that leaves them alone need not resolve that, and outbound reports
+    ///   it ([`client_id_conflicts`]).
+    fn check_change(&self, current: &Config) -> Result<(), Error> {
+        ensure(self.inbound.path != current.api.path, || {
+            "inbound.path is the API's socket in effect; move that one first, in a change of its own"
+                .into()
+        })?;
+        ensure(self.api.path != current.inbound.path, || {
+            "api.path is the inbound socket in effect; move that one first, in a change of its own"
+                .into()
+        })?;
         check_client_ids(
             &self.outbound.channels,
             &current.outbound.channels,
@@ -702,6 +719,9 @@ fn validate_mqtt(name: &str, c: &Mqtt) -> Result<(), Error> {
     ensure(c.qos <= 2, || {
         format!("channel {name}: qos must be 0, 1 or 2")
     })?;
+    ensure(c.timeout_ms >= 1, || {
+        format!("channel {name}: timeout_ms must be at least 1")
+    })?;
     ensure((1..=65_535).contains(&c.keep_alive_s), || {
         format!("channel {name}: keep_alive_s must be between 1 and 65535")
     })?;
@@ -907,13 +927,13 @@ impl Store {
     pub fn reload(&self) -> Result<Arc<Config>, Error> {
         let _guard = self.write.lock().unwrap();
         let config = load(&self.path)?;
-        config.check_client_ids(&self.current())?;
+        config.check_change(&self.current())?;
         Ok(self.publish(config))
     }
 
     fn commit(&self, config: Config) -> Result<Arc<Config>, Error> {
         config.validate()?;
-        config.check_client_ids(&self.current())?;
+        config.check_change(&self.current())?;
         if *self.current() != config {
             save(&self.path, &config)?;
         }
@@ -1228,6 +1248,8 @@ mod tests {
         assert!(field(&|c| c.username = Some("a\0".into())).is_err());
         assert!(field(&|c| c.password = Some("a\0".into())).is_ok());
         assert!(field(&|c| c.password = Some(long.clone())).is_err());
+        assert!(field(&|c| c.timeout_ms = 1).is_ok());
+        assert!(field(&|c| c.timeout_ms = 0).is_err());
     }
 
     fn mqtt_channels(channels: &[(&str, &Mqtt)]) -> BTreeMap<String, Channel> {
@@ -1507,6 +1529,34 @@ mod tests {
         assert_eq!(**rx.borrow_and_update(), next);
         assert_eq!(load(&path).unwrap(), next);
         assert_eq!(store.redacted_for_test(), next.redacted());
+    }
+
+    #[test]
+    fn a_socket_cannot_move_onto_the_other_in_one_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.json"), Config::default());
+        let defaults = Config::default();
+        let (inbound, api) = (defaults.inbound.path.as_path(), defaults.api.path.as_path());
+        let with = |inbound: &Path, api: &Path| {
+            let mut config = Config::default();
+            config.inbound.path = inbound.to_path_buf();
+            config.api.path = api.to_path_buf();
+            config
+        };
+        // A swap, or a move onto the other's path, which is in use until
+        // that one has moved.
+        let other = Path::new("/run/uevtd/other.sock");
+        for (a, b, refused) in [
+            (api, inbound, "inbound.path"),
+            (api, other, "inbound.path"),
+            (other, inbound, "api.path"),
+        ] {
+            let err = store.update(with(a, b)).unwrap_err();
+            assert!(err.to_string().starts_with(refused), "{err}");
+        }
+        // In two changes it is fine.
+        store.update(with(inbound, other)).unwrap();
+        store.update(with(api, other)).unwrap();
     }
 
     impl Store {

@@ -733,6 +733,54 @@ async fn positive_sync_interval_commits_on_the_timer_and_on_stop() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_lower_message_limit_applies_to_connections_already_open() {
+    let env = Env::new();
+    let daemon = env.start(env.base()).await;
+    let inbound = || async { daemon.get("/v1/status").await.1["inbound"].take() };
+    let mut open = UnixStream::connect(&env.inbound).await.unwrap();
+    open.write_all(b"{\"n\":1}\n").await.unwrap();
+    wait_for(Duration::from_secs(5), || async {
+        inbound().await["messages"] == 1
+    })
+    .await;
+
+    // A message of about 100 bytes, between the limits, on the connection
+    // opened under 1024: refused once the change has reached it.
+    let line = format!("{{\"pad\":\"{}\"}}\n", "p".repeat(100));
+    let (status, _) = daemon
+        .patch(json!({"inbound": {"max_message_bytes": 64}}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        open.write_all(line.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if inbound().await["oversized"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the limit never applied");
+    }
+
+    // A higher limit applies to new connections only.
+    let (status, _) = daemon
+        .patch(json!({"inbound": {"max_message_bytes": 1024}}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = inbound().await;
+    open.write_all(line.as_bytes()).await.unwrap();
+    env.send(&[line.as_bytes()]).await;
+    let counts = |inbound: &Value| (inbound["messages"].as_u64(), inbound["oversized"].as_u64());
+    let (messages, oversized) = counts(&before);
+    let expected = (messages.map(|n| n + 1), oversized.map(|n| n + 1));
+    wait_for(Duration::from_secs(5), || async {
+        counts(&inbound().await) == expected
+    })
+    .await;
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_patches_compose() {
     let receiver = Receiver::start(listen().await, None);
     let env = Env::new();

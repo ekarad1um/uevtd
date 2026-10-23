@@ -5,41 +5,7 @@
 
 use super::tests::frames;
 use super::*;
-
-/// A small deterministic generator (xorshift*).
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03);
-        rng.next();
-        rng
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0 | 1;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next() % n }
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.below(100) < percent
-    }
-}
-
-fn seeds(default: u64) -> u64 {
-    std::env::var("UEVTD_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use crate::testing::{Rng, seeds};
 
 fn limits(max_bytes: u64, segment_bytes: u64) -> Limits {
     Limits {

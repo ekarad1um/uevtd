@@ -134,9 +134,16 @@ the payload is inspected.
 **Reconfiguration.** A change of `path` or `mode` binds the new socket before
 the old listener is dropped; connections accepted on the old socket keep being
 served until the peer closes. If the new bind fails the old listener stays and
-the error is logged and reported in `/v1/status`. `max_message_bytes` applies to
-connections accepted after the change; `max_connections` is resized in place, so
-after lowering it no new connection is admitted until enough open ones close.
+the error is logged and reported in `/v1/status`. So is a mode that cannot be
+set, and the old mode counts as in effect. The next change tries again, and the
+error is cleared once what is in effect is what is configured, also by changing
+back. `max_connections` is resized in place, so after lowering it no new
+connection is admitted until enough open ones close. A lower
+`max_message_bytes` applies at once, to open connections as well, including the
+message in progress: one already longer is discarded as oversized. A higher one
+applies to connections accepted after the change. The bound on what connections
+hold (§11.1) assumes no more of them than `max_connections`, and a change that
+raises one limit can lower the other, while more connections are still open.
 
 ## 5. Storage
 
@@ -328,8 +335,9 @@ segment). What ends the valid records decides what happens to the rest:
   file could hold: one per 24-byte frame header after the last intact record
   found. A search finds those records, frames whose checksum holds and whose
   number fits the bytes before them; they only bound the numbering. Readers read
-  the segment up to the damage as any other: they retry a read error (§5.7) and
-  skip the rest of the segment from a corrupt record. What they pass over counts
+  the segment up to the damage as any other: they retry a read error, for ten
+  minutes if it says the data cannot be read back (§5.7), and skip the rest of
+  the segment from a corrupt record. What they pass over counts
   as lost, with a notice in its place, and the count is an upper bound. The
   segment counts in `corrupt_segments`. Creating the new segment is the only
   change, so a crash at any point is recovered the same way again.
@@ -377,6 +385,22 @@ records read before it have been returned, so a failing segment never costs
 the records in front of it; a channel then retries the failing position every
 second and shows the error in `last_error`.
 
+How long it retries depends on the error. One that says the data cannot be
+read back is retried for ten minutes: EIO, which the device reports for a worn
+sector of an SD card or eMMC, or the error of a file system that found its own
+structures damaged (EBADMSG, or EUCLEAN on Linux). A lasting one would otherwise
+hold the channel until eviction removes the segment, days at low traffic. Then the rest
+of the segment is skipped as from a corrupt record: the records count as lost,
+a notice takes their place, the segment counts in `corrupt_segments`, and the
+error is logged. Every other error, such as a missing permission or no
+descriptor left, is retried until it goes away, since it can be fixed and then
+costs nothing. A query does not retry; it reports the error, as below.
+
+After a skip in the active segment, the reader waits at its committed length,
+where a reader that had read up to the head would be. It reads the records
+written later from there, rather than from the start of the segment, which
+would meet the damage again and skip them too. The same holds after corruption.
+
 Readers wait for new data with `watch::Receiver<u64>::wait_for(head >= next)`,
 which is free of lost wake-ups and cancel-safe.
 
@@ -406,8 +430,12 @@ continues past the highest one (§5.6); one written past it by hand later is
 reset to the head so that new records are not skipped. A cursor
 file that cannot be parsed restarts the channel at the oldest retained record:
 the position is unknown, and at-least-once means replaying rather than
-skipping. Cursor files of channels that are no longer configured are removed at
-startup, as they are when a channel is removed at runtime.
+skipping. One that cannot be read, for a missing permission or a device error,
+says nothing of the position: it is left as it is, and the channel waits, with
+the error in `last_error`. Its start is tried again after 1 s, doubling to
+60 s, as a task that ended is started again (§6.4). Cursor files of channels
+that are no longer configured are removed at startup, as they are when a
+channel is removed at runtime.
 
 ### 5.9 Loss accounting
 
@@ -463,9 +491,12 @@ acknowledgement. Semantics:
   messages are lost, counted and logged as they are evicted (§5.9).
 - **Permanent rejections are skipped.** A payload too large for the channel
   (`max_frame_bytes`, `max_packet_bytes`) or a record the WebSocket receiver
-  refuses with a `nack` is logged with the sequence number, counted in
-  `rejected`, and passed. Retrying forever would stall the channel on one bad
-  message. The record stays in the log and can be queried until it is evicted.
+  refuses with a `nack` is logged with the sequence number and passed.
+  Retrying forever would stall the channel on one bad message. It counts in
+  `rejected` once the cursor has passed it, and only once: a channel restarted
+  before then sends the record again, and it can be refused again, or
+  accepted. The record stays in the log and can be queried until it is
+  evicted.
 - **A skipped record leaves a notice.** A channel sends a *drop notice* in place
   of the records it will not deliver, so that the receiver learns of the gap.
   MQTT publishes it on the channel's own topic:
@@ -519,11 +550,21 @@ notice, so that a receiver's frame limit cannot turn into a reconnect loop.
 
 **Session.** TCP, TLS for `wss://` (§6.5), and the handshake with the
 configured `headers` must complete within `timeout_ms`. The channel pings every
-`keep_alive_s` and ends the session if no pong arrives within `timeout_ms`.
-After a session ends, the unanswered frames are sent again in order in the
-next one. A channel that stops, for a configuration change or at shutdown,
-sends a close frame (1001, going away), waits at most a second for it to be
-written, and persists its cursor.
+`keep_alive_s`, and anything the receiver sends answers a ping: on a slow link
+the pong comes only after the frames sent before the ping, while
+acknowledgements come all along. A ping still unanswered after `timeout_ms`
+ends the session, unless the receiver's TCP has acknowledged data meanwhile;
+the ping then has another `timeout_ms`, and so on. A link that moves, however
+slowly, keeps its session, also while one frame takes longer to send than the
+timeout. A receiver that stops, or a link that does, loses it within twice
+`timeout_ms` of a ping. What the TCP acknowledged is what the channel wrote
+less what the socket still holds (`TIOCOUTQ` on Linux, `SO_NWRITE` on macOS;
+elsewhere only an answer counts). A proxy in between acknowledges what it
+buffers before it passes it on, so behind one, `timeout_ms` must cover what
+the proxy holds of a frame. After a session ends, the unanswered frames are
+sent again in order in the next one. A channel that stops, for a
+configuration change or at shutdown, sends a close frame (1001, going away),
+waits at most a second for it to be written, and persists its cursor.
 
 **Structure.** The socket is split. A writer task owns the sending half and
 drains a queue of frames, so the channel task's `select!` can never abandon a
@@ -536,8 +577,8 @@ frames it has received in some session, so a fuller queue means a broken
 receiver, and the session ends.
 
 `connected` reflects a live session, `delivered` counts acknowledged records,
-`rejected` refused and oversized ones, and `retries` sessions that failed or
-ended, as for MQTT.
+`rejected` refused and oversized ones once they are passed (§6.1), and
+`retries` sessions that failed or ended, as for MQTT.
 
 ### 6.3 MQTT channel
 
@@ -569,10 +610,25 @@ library's own in-flight window is set to `2 * inflight + 1` so packet ids do not
 collide under normal acknowledgement order. They are also capped at 1 MiB of
 payload plus one message, because the channel and the library each keep a copy
 of a publish until it is acknowledged; an acknowledged payload is released at
-once, even while an earlier publish is still outstanding.
+once, even while an earlier publish is still outstanding. The library also
+keeps a copy of the topic with each publish. So that those copies hold at most
+1 MiB, a long topic lowers the cap to 1 MiB divided by the topic's length, when
+that is less than `inflight`: a topic of 64 KiB, about the most MQTT carries,
+leaves 16.
 
 With `tls` the connection uses the TLS configuration of §6.5. Username and
 password, client id, keep-alive, QoS and retain are configurable.
+
+`timeout_ms`, 10 000 by default, bounds connecting, DNS, TCP, TLS and
+CONNECT/CONNACK together, and writing out each request; rumqttc counts it in
+whole seconds, so it is rounded up. With rumqttc's own 5 s, a broker behind a
+slow or distant link was never reached, and a publish that took longer to
+write ended the session. Nagle's algorithm is off, as for WebSocket. Liveness is
+rumqttc's: it sends a PINGREQ every `keep_alive_s` and ends the session when
+the PINGRESP has not come by the next one, whatever else arrived. On a slow
+link, `keep_alive_s` must therefore exceed the time to send what the socket
+holds ahead of a ping, and `timeout_ms` the time to write out the largest
+publish.
 
 A broker disconnects a client when another connects with its client id, so two
 clients sharing one take turns. Without a configured id, a channel connects
@@ -616,7 +672,9 @@ cursor past the highest position reached before: the persisted cursor can
 lag by up to a second, and sending those records again proves nothing. A
 record that makes the channel panic is thus retried once a minute, not in a
 loop, and holds back only that channel. `restarts` counts these starts. A
-new definition for the channel ends the wait at once.
+new definition for the channel ends the wait at once. A channel whose cursor
+file cannot be read (§5.8) waits the same way before its start is tried
+again, which counts in `restarts` only after a task that ended.
 
 ### 6.5 TLS
 
@@ -626,7 +684,9 @@ all channels and reconnects. With `ca_file`, a PEM file of one or more
 certificates, only those certificates are trusted. The file is read again for
 every connection, so a replaced file applies from the next reconnect, and a
 missing or empty one is reported in `last_error` and retried like a
-connection failure. Client certificates are not supported.
+connection failure. The read runs on the blocking pool, and a channel can be
+stopped while it waits for it, as on a hung network mount. Client
+certificates are not supported.
 
 ## 7. Configuration
 
@@ -672,6 +732,7 @@ connection failure. Client certificates are not supported.
         "password": null,
         "qos": 1,
         "retain": false,
+        "timeout_ms": 10000,
         "keep_alive_s": 30,
         "inflight": 32,
         "max_packet_bytes": 1048576
@@ -711,20 +772,26 @@ without case), unless they share it already (below), topic, `client_id` and
 `username` at
 most 65535 bytes and without U+0000, `password` at most 65535 bytes (MQTT
 strings have 16-bit lengths, which the library would truncate, and only the
-password is binary), `ca_file` only with `tls`, QoS in 0..=2, `keep_alive_s` in
-1..=65535 (the protocol field is 16 bits), `inflight` in 1..=1024,
+password is binary), `ca_file` only with `tls`, QoS in 0..=2, `timeout_ms` at
+least 1, `keep_alive_s` in 1..=65535 (the protocol field is 16 bits),
+`inflight` in 1..=1024,
 `max_packet_bytes` at least 256; log filter parses as a `tracing` directive.
 The minimum sizes make room for a drop notice, and the bounds on sizes and
 counts are what bounds memory (section 11.1). A `ca_file` is not read at
 validation; a missing file shows when the channel connects (§6.5).
 
-Client ids are checked against the configuration in effect, and with the host
-name as it is at the check. A change (`PUT`, `PATCH`, `SIGHUP`) is refused if
-it makes two channels share an id that they do not share already; a change
-elsewhere is not, so a conflict that a renamed host brought blocks no other
-change. At startup nothing is in effect yet, and a conflict is reported
-instead of refused (§6.3): refusing would stop the daemon, and a supervisor
-would restart it in a loop.
+Two checks are made against the configuration in effect, on a change (`PUT`,
+`PATCH`, `SIGHUP`) and not at startup, when nothing is in effect yet:
+
+- A socket may not move onto the path of the other one. Its listener is live
+  there, so the bind fails, and in a swap neither move ever applies; it takes
+  two changes.
+- Client ids are checked with the host name as it is at the check. A change is
+  refused if it makes two channels share an id that they do not share already;
+  a change elsewhere is not, so a conflict that a renamed host brought blocks
+  no other change. At startup a conflict is reported instead of refused
+  (§6.3): refusing would stop the daemon, and a supervisor would restart it in
+  a loop.
 
 ### 7.3 Persistence and live update
 
@@ -749,7 +816,7 @@ earlier, such as a rebind. Components react to the fields they own:
 | Field                           | Applied                                                    |
 |---------------------------------|------------------------------------------------------------|
 | `inbound.path`, `inbound.mode`  | live: rebind, old connections drain                        |
-| `inbound.max_*`                 | live: new connections                                      |
+| `inbound.max_*`                 | live: a lower `max_message_bytes` at once, a higher one for new connections; `max_connections` as they close (section 4) |
 | `storage.max_bytes`             | live: immediate eviction if needed                         |
 | `storage.segment_bytes`         | live: next rotation                                        |
 | `storage.sync_interval_ms`      | live: next batch                                           |
@@ -862,18 +929,24 @@ itself carries on.
 | Socket path points at a non-socket file   | Startup or rebind fails; the file is left alone                           |
 | Log writer thread panics                  | Daemon stops with an error (exit code 1); the process supervisor, which a deployment must provide (README), starts it again |
 | Channel task panics                       | Reported in `last_error`; started again from its cursor after 1 s, doubling to 60 s while it makes no progress; `restarts` counts it |
-| Read error or damage in the active segment at startup | The segment is kept as it is, and numbering continues past every record the rest could hold; readers retry a read error and skip from a corrupt record, and what they pass over counts as lost |
+| Read error or damage in the active segment at startup | The segment is kept as it is, and numbering continues past every record the rest could hold; readers retry a read error, as during delivery, and skip from a corrupt record, and what they pass over counts as lost |
 | A channel's cursor past the head at startup, as after a disk lost synced data | Numbering continues at the cursor; channels behind it count the records in between as lost |
 | Sealed segment cannot be opened or its size read at startup | Startup continues; readers retry it and report `last_error`         |
 | A segment cannot be removed by eviction   | Eviction stops there and the log grows past `max_bytes`; health fails and the error is logged once a minute until it can be removed |
 | Bit rot in a sealed segment               | Remainder of that segment skipped, counted as lost, a notice in its place; others unaffected |
-| Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error` |
-| Cursor file unreadable                    | Channel replays from the oldest retained record                            |
+| Segment unreadable during delivery        | Records before it are delivered; the channel retries every second and reports `last_error`. A device error (EIO) still there after ten minutes skips the rest of the segment, counted as lost, a notice in its place; other errors are retried until fixed |
+| Corruption in the active segment found while reading | The rest of it up to the head is skipped, counted as lost; records written after it are read |
+| Cursor file that holds no cursor          | Channel replays from the oldest retained record                            |
+| Cursor file that cannot be read           | File left as it is; the channel waits, with `last_error`, and its start is tried again after 1 s, doubling to 60 s |
 | Target down for longer than retention     | Evicted messages counted as lost and logged as they are evicted; once the target is back, the channel sends a notice in their place and continues at the oldest available |
 | Broker or receiver drops the session      | Unacknowledged messages sent again (duplicates possible), order preserved |
 | Another client connects with the MQTT client id | The broker drops the older session, so the two take turns; validation refuses one id, the host name included, on two channels to a host, and devices on one broker need distinct host names (§6.3) |
 | Target accepts connections but takes nothing | Reconnects back off to once a minute; the cursor stays; `retries` and `last_error` show it |
-| Receiver stops answering pings            | Session ends after `timeout_ms`; reconnect with backoff                   |
+| Receiver stops answering, and its TCP acknowledges nothing | Session ends within twice `timeout_ms` of a ping; reconnect with backoff |
+| A slow link: frames take longer to send than `timeout_ms` | The WebSocket session stays while the receiver answers or its TCP acknowledges data; MQTT needs `timeout_ms` and `keep_alive_s` to cover them (§6.3) |
+| MQTT broker slow to accept a connection   | Connecting may take `timeout_ms`, 10 s by default                          |
+| `max_message_bytes` lowered while producers are connected | Their next bytes are held to it; a message in progress that is longer already is discarded as oversized |
+| A change swaps the socket paths, or moves one onto the other's | Refused; it takes two changes                                    |
 | TLS verification fails, e.g. a wrong clock | Connection fails, reported in `last_error`, retried with backoff          |
 | Another instance on the same log          | Startup fails at the log's lock, naming the holder's process id, before anything is changed |
 | Another instance already listening        | Startup fails; the socket file is not stolen                              |
@@ -919,7 +992,7 @@ Every buffer that holds messages has a byte bound:
 | Inbound connections | each holds at most one message and an 8 KiB read buffer; a complete message is copied out only once the queue has room for it; `max_connections × max_message_bytes` ≤ 16 MiB | 64 × 72 KiB |
 | Writer queue | 8 192 messages and 8 MiB of payload, counted until written | 8 MiB, reached only when producers outrun the disk |
 | Write batch | 1 MiB of encoded records, or one record | 1 MiB |
-| Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc; WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
+| Each channel | 1 MiB of payload awaiting acknowledgement, plus one message. MQTT keeps a second copy inside rumqttc, and a copy of the topic with each publish, at most 1 MiB of them (§6.3); WebSocket shares the payload with its frame queue and encodes one frame at a time, and its incoming messages are limited to 64 KiB | about 2 MiB |
 | Each log reader, and the API's receipt-time lookup | a 64 KiB read buffer, or one record if larger; a frame claiming more than 1 MiB is checked a chunk at a time, so a corrupt length costs no more | 64 KiB |
 | A query | one at a time, from its read until its response is written, also when its client has left: a 1 MiB page plus one record, its JSON, and a 256 KiB read batch | about 3 MiB |
 | API connections | at most 16 (§8), each with hyper's read buffer of at most 408 KiB and a request body of at most 256 KiB | 11 MiB, with 16 large requests at once |

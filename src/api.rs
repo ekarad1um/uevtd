@@ -126,30 +126,33 @@ pub async fn run(
                     break;
                 }
                 let next = cfg.borrow_and_update().api.clone();
-                if next == current {
-                    continue;
-                }
                 if next.path != current.path {
                     match uds::bind(&next.path, next.mode.0).await {
                         Ok(fresh) => {
                             let old = std::mem::replace(&mut server, Server::spawn(fresh, app.clone(), SERVE));
                             old.stop().await;
                             uds::remove(&current.path);
-                            state.last_error.clear();
                             info!(path = %next.path.display(), "api rebound");
-                            current = next;
+                            current = next.clone();
                         }
                         Err(e) => {
                             error!(path = %next.path.display(), error = %e, "rebind failed; keeping current socket");
                             state.last_error.set(format!("bind {}: {e}", next.path.display()));
                         }
                     }
-                } else {
-                    if let Err(e) = uds::set_mode(&next.path, next.mode.0) {
-                        error!(error = %e, "could not change socket mode");
-                        state.last_error.set(format!("chmod {}: {e}", next.path.display()));
+                } else if next.mode != current.mode {
+                    match uds::set_mode(&next.path, next.mode.0) {
+                        Ok(()) => current = next.clone(),
+                        Err(e) => {
+                            error!(error = %e, "could not change socket mode");
+                            state.last_error.set(format!("chmod {}: {e}", next.path.display()));
+                        }
                     }
-                    current = next;
+                }
+                // What failed stays to be retried by the next change; once
+                // what is in effect is what is configured, nothing has.
+                if current == next {
+                    state.last_error.clear();
                 }
             }
             _ = shutdown.cancelled() => break,
@@ -1036,9 +1039,7 @@ async fn get_metrics(State(state): State<Shared>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
     use std::fs;
-    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
     use axum::routing::put;
@@ -1046,6 +1047,7 @@ mod tests {
 
     use super::*;
     use crate::storage::{Limits, Message, Writer};
+    use crate::testing::Pipe;
 
     /// A state whose log holds `records` messages of 1 000 bytes, received
     /// at 0, 1, 2 and so on, in segments of 64 KiB.
@@ -1131,28 +1133,6 @@ mod tests {
         assert!(body.len() > 100_000, "{}", body.len());
         drop(body);
         assert_eq!(state.queries.available_permits(), 1);
-    }
-
-    /// A pipe in place of a file, which a read waits on until it is opened
-    /// for writing; dropping this does that, also when a test fails, so
-    /// that the runtime, which waits for its blocking reads, can stop.
-    struct Pipe(PathBuf);
-
-    impl Pipe {
-        fn new(path: &Path) -> Pipe {
-            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-            // SAFETY: a valid path.
-            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-            Pipe(path.to_path_buf())
-        }
-    }
-
-    impl Drop for Pipe {
-        fn drop(&mut self) {
-            let path = self.0.clone();
-            // Waits for a reader on a thread of its own, which nothing joins.
-            std::thread::spawn(move || fs::OpenOptions::new().write(true).open(path));
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1300,5 +1280,58 @@ mod tests {
             assert!(until_closed(&mut stuck).await < 4 << 20);
         }
         server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_failed_to_apply_is_retried_until_the_configuration_is_in_effect() {
+        async fn until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path(), 0);
+        let path = dir.path().join("api.sock");
+        let mut config = Config::default();
+        config.api.path = path.clone();
+        let (cfg, rx) = watch::channel(Arc::new(config.clone()));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(rx, state.clone(), shutdown.clone()));
+        until("listening", || path.exists()).await;
+        let error = || state.last_error.get();
+        let message = || error().map(|e| e.message).unwrap_or_default();
+
+        // Without its file the socket's mode cannot change. The old mode is
+        // in effect, so the same configuration tries again, and going back
+        // to that mode leaves nothing to apply.
+        fs::remove_file(&path).unwrap();
+        config.api.mode = config::Mode(0o600);
+        cfg.send_replace(Arc::new(config.clone()));
+        until("chmod failed", || message().starts_with("chmod")).await;
+        let failed = error().unwrap().ts;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        cfg.send_replace(Arc::new(config.clone()));
+        until("chmod tried again", || {
+            error().is_some_and(|e| e.ts > failed)
+        })
+        .await;
+        config.api.mode = config::Mode(0o660);
+        cfg.send_replace(Arc::new(config.clone()));
+        until("chmod error cleared", || error().is_none()).await;
+
+        // Likewise for a path that cannot be bound, under a file.
+        let file = dir.path().join("file");
+        fs::write(&file, b"").unwrap();
+        config.api.path = file.join("api.sock");
+        cfg.send_replace(Arc::new(config.clone()));
+        until("bind failed", || message().starts_with("bind")).await;
+        config.api.path = path.clone();
+        cfg.send_replace(Arc::new(config.clone()));
+        until("bind error cleared", || error().is_none()).await;
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
     }
 }

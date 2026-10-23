@@ -22,9 +22,15 @@ error names the field and its allowed range.
   `{"ack":n}` for every frame up to `n`, or `{"nack":n,"reason":"..."}` for one
   it will never accept. Up to `inflight` frames await an answer; unanswered
   ones are sent again after a reconnect; pings every `keep_alive_s` detect a
-  dead connection.
+  dead connection. Anything the receiver sends answers a ping, and a session
+  ends when no answer comes within `timeout_ms`, unless the receiver's TCP
+  acknowledged data meanwhile, on Linux and macOS: a slow link keeps its
+  session as long as it moves.
 - `ca_file` for WebSocket and MQTT channels: a PEM file whose certificates are
   trusted instead of the platform's store.
+- `timeout_ms` for MQTT channels, 10000 by default: the time to connect, DNS,
+  TCP, TLS and the broker's CONNACK together, and to write out each publish,
+  in whole seconds, rounded up. It was rumqttc's fixed 5 s.
 - Drop notices: a channel sends a notice in place of the messages it will not
   deliver, `{"notice":{"event":"lost","from_seq":a,"to_seq":b,"count":n}}` for
   messages evicted before delivery and
@@ -81,9 +87,26 @@ error names the field and its allowed range.
 - `inbound.path` and `api.path` are at most 107 bytes, or 103 on macOS, as a
   socket address holds, and like `storage.path` may not contain U+0000. Such a
   path was accepted before, and the next start failed on it.
+- A change may not move one socket onto the path of the other, a swap
+  included; it takes two changes. A swap was accepted before, and never
+  applied, since each new socket found the other's listener there.
 - The API serves at most 16 connections at once; more wait to be accepted. A
   connection is closed after 10 s without a request, and once a read or write
   has waited 60 s, so a client that stops reading a response is cut off.
+- A channel that cannot read part of the log because the device cannot read
+  the data back (EIO; or EBADMSG, or EUCLEAN on Linux, from a file system that
+  found itself damaged) retries for ten minutes, then skips the rest of the
+  segment as corrupt: the messages count in `lost`, with a notice in their
+  place, and the segment in `corrupt_segments`. Before, it retried until the
+  segment was evicted. Other read errors are retried until they go away.
+- `rejected` counts a record once the cursor has passed it, and only once: a
+  channel restarted before then, which sends the record again, does not count
+  it again.
+- A lower `inbound.max_message_bytes` applies to connected producers at once,
+  the message in progress included; a higher one applies to new connections,
+  as before.
+- MQTT channels keep fewer publishes in flight when `inflight` copies of the
+  topic would exceed 1 MiB, and set TCP_NODELAY.
 - At startup the daemon raises its soft limit on open files to the hard limit.
 - An MQTT message above `max_packet_bytes` stays rejected, but the cursor now
   passes it once its notice is acknowledged, not at once. A channel passes
@@ -95,18 +118,21 @@ error names the field and its allowed range.
   `data`. A page holds at most 1 MiB of payload, and `next` is `null` on the last
   page.
 - API request bodies are limited to 256 KiB.
-- A cursor file that cannot be read restarts its channel at the oldest retained
-  record instead of the head.
+- A cursor file that holds no cursor restarts its channel at the oldest
+  retained record instead of the head. One that cannot be read, for a missing
+  permission or a device error, is left as it is, and the channel waits for
+  it, with the error in `last_error`, trying again after 1 s, doubling to 60 s.
 - Segment and cursor files are created with mode 0640, the log directories with
   0750.
 
 ### Fixed
 
-- Memory is bounded under any load: the writer queue holds at most 8 MiB, each
-  channel at most 1 MiB in flight, queries run one at a time, each from its
-  read until its response is written, also when its client has left, and on
-  glibc the allocator returns large buffers to the system. Peak resident size
-  under the heaviest load is about 54 MiB, down from 144 MiB.
+- Memory is bounded under any load: the writer queue holds at most 8 MiB; each
+  channel at most 1 MiB in flight, and an MQTT channel as much again in the
+  copies of its topic that the client keeps; queries run one at a time, each
+  from its read until its response is written, also when its client has left;
+  and on glibc the allocator returns large buffers to the system. Peak resident
+  size under the heaviest load is about 54 MiB, down from 144 MiB.
 - A single large message could evict the whole log; segments no longer grow past
   `storage.segment_bytes`.
 - Messages evicted before a channel delivered them are counted in `lost` and
@@ -191,6 +217,16 @@ error names the field and its allowed range.
 - A configuration save whose directory sync failed after the file was replaced
   answered 500, and the configuration was not applied, though the file held it
   and the next start applied it. The save succeeds with a warning now.
+- MQTT channels never reached a broker that takes more than 5 s to accept a
+  connection, as behind a slow or distant link ("Network timeout"), and a
+  publish that took longer to write out ended the session.
+- A socket mode that could not be set was taken as applied, so sending the
+  configuration again did not try again; and the error of a failed rebind
+  stayed in `last_error` after the path was changed back.
+- Damage in the active segment that a reader cannot pass, a damaged length or
+  sequence number, or a read error, made it skip every message written to the
+  segment after that as well, again and again, until the writer moved on to a
+  new segment.
 - Concurrent `PATCH /v1/config` requests no longer lose each other's changes.
 - Setting `storage.sync_interval_ms` to 0 commits pending data within a second
   instead of waiting for the next message.

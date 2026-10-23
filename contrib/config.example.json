@@ -37,6 +37,7 @@
         "password": null,
         "qos": 1,
         "retain": false,
+        "timeout_ms": 10000,
         "keep_alive_s": 30,
         "inflight": 32,
         "max_packet_bytes": 1048576

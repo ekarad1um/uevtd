@@ -57,6 +57,9 @@ const DIR_MODE: u32 = 0o750;
 const LOSS_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// A write or sync that takes longer makes the log unhealthy.
 pub const STALLED: Duration = Duration::from_secs(30);
+/// How long a reader retries a position whose data cannot be read back, as
+/// from a worn sector, before it skips the rest of the segment (§5.7).
+const UNREADABLE_RETRY: Duration = Duration::from_secs(600);
 
 /// A message as handed to the writer: receipt time and verbatim payload.
 #[derive(Clone, Debug)]
@@ -498,6 +501,9 @@ impl Storage {
         Ok(page)
     }
 
+    /// The cursor saved for channel `name`; `None` without a file. A file
+    /// that holds no cursor fails with `InvalidData`, a kind that no error of
+    /// the system has.
     pub fn load_cursor(&self, name: &str) -> io::Result<Option<u64>> {
         match fs::read_to_string(self.cursor_path(name)) {
             Ok(text) => text.trim().parse().map(Some).map_err(|e| {
@@ -1512,6 +1518,13 @@ struct Open {
     cursor: SegmentCursor,
 }
 
+/// Why a reader skips the rest of a segment.
+enum Damage<'a> {
+    Corrupt(Corrupt),
+    /// Reads failed with this error for [`UNREADABLE_RETRY`].
+    Unreadable(&'a io::Error),
+}
+
 /// A tailing cursor over the log. Cheap to advance; re-positioning to an
 /// arbitrary sequence number scans from the start of its segment once.
 pub struct Reader {
@@ -1520,6 +1533,11 @@ pub struct Reader {
     current: Option<Open>,
     /// The [`Tail`] this reader moves, if it reads for a channel.
     tail: Option<u64>,
+    /// The position whose data could not be read back, and since when. A
+    /// reader only moves forward, so a read that works moves past it.
+    unreadable: Option<(u64, Instant)>,
+    /// How long such a position is retried; [`UNREADABLE_RETRY`].
+    retry_for: Duration,
 }
 
 impl Reader {
@@ -1529,6 +1547,8 @@ impl Reader {
             next_seq: next_seq.max(1),
             current: None,
             tail: None,
+            unreadable: None,
+            retry_for: UNREADABLE_RETRY,
         }
     }
 
@@ -1542,7 +1562,10 @@ impl Reader {
     /// An empty batch with nothing skipped means the reader has caught up.
     /// An I/O error is returned only if nothing was read before it;
     /// otherwise the records are returned and the error surfaces on the next
-    /// call, which starts at the failing position with nothing to lose.
+    /// call, which starts at the failing position with nothing to lose. An
+    /// error that says the data cannot be read back, at the same position
+    /// for [`UNREADABLE_RETRY`], skips the rest of the segment instead, as
+    /// corruption does.
     pub fn read(&mut self, max_records: usize, max_bytes: usize) -> io::Result<Batch> {
         let start = self.next_seq;
         if self.begin() {
@@ -1552,8 +1575,51 @@ impl Reader {
             });
         }
         let batch = self.fill(max_records, max_bytes);
+        self.settle(batch)
+    }
+
+    /// Ends a read that [`Reader::begin`] started, with what it found.
+    fn settle(&mut self, batch: io::Result<Batch>) -> io::Result<Batch> {
+        let batch = match batch {
+            Err(e) if self.gives_up(&e) => Ok(self.skip_unreadable(&e)),
+            batch => batch,
+        };
         self.end(batch.as_ref().map_or(0, |b| b.skipped));
         batch
+    }
+
+    /// Whether a read that failed at `next_seq` with `e` has failed for
+    /// long enough to skip the rest of the segment. Only an error that says
+    /// the data cannot be read back counts. Others, such as a missing
+    /// permission or no descriptor left, can be fixed, and then cost nothing.
+    fn gives_up(&mut self, e: &io::Error) -> bool {
+        if !unreadable(e) {
+            return false;
+        }
+        match self.unreadable {
+            Some((seq, since)) if seq == self.next_seq => since.elapsed() >= self.retry_for,
+            _ => {
+                self.unreadable = Some((self.next_seq, Instant::now()));
+                false
+            }
+        }
+    }
+
+    /// Skips the rest of the segment that holds `next_seq`, which reads could
+    /// not get past with `e` for [`UNREADABLE_RETRY`].
+    fn skip_unreadable(&mut self, e: &io::Error) -> Batch {
+        let step = match self.find() {
+            Located::At(view) => self.skip_segment(&view, Damage::Unreadable(e), true),
+            Located::Evicted(first) => self.skip_to(first, true),
+            Located::CaughtUp => Step::Stop,
+        };
+        match step {
+            Step::Skipped(missing) => Batch {
+                records: Vec::new(),
+                skipped: missing,
+            },
+            Step::Record(_) | Step::Stop => Batch::default(),
+        }
     }
 
     fn fill(&mut self, max_records: usize, max_bytes: usize) -> io::Result<Batch> {
@@ -1598,7 +1664,7 @@ impl Reader {
                     return Ok(Step::Record(record));
                 }
                 Next::Record(_) => {
-                    let cause = Corrupt::Invalid("sequence mismatch");
+                    let cause = Damage::Corrupt(Corrupt::Invalid("sequence mismatch"));
                     return Ok(self.skip_segment(&view, cause, may_skip));
                 }
                 Next::End => match view.next_first_seq {
@@ -1606,7 +1672,9 @@ impl Reader {
                     Some(_) => self.current = None,
                     None => return Ok(Step::Stop),
                 },
-                Next::Corrupt(c) => return Ok(self.skip_segment(&view, c, may_skip)),
+                Next::Corrupt(c) => {
+                    return Ok(self.skip_segment(&view, Damage::Corrupt(c), may_skip));
+                }
             }
         }
     }
@@ -1623,7 +1691,7 @@ impl Reader {
         Step::Skipped(missing)
     }
 
-    fn skip_segment(&mut self, view: &View, cause: Corrupt, may_skip: bool) -> Step {
+    fn skip_segment(&mut self, view: &View, damage: Damage<'_>, may_skip: bool) -> Step {
         if !may_skip {
             // The next read reopens the segment and finds the record again.
             self.current = None;
@@ -1637,13 +1705,41 @@ impl Reader {
             let segment = index.segments.get_mut(&view.first_seq);
             segment.is_some_and(|s| !std::mem::replace(&mut s.damaged, true))
         };
-        if first {
-            error!(segment = view.first_seq, offset, error = %cause, "corrupt record; skipping the rest of the segment");
-            self.storage.metrics.corrupt_segments.fetch_add(1, Relaxed);
-        } else {
-            debug!(segment = view.first_seq, offset, error = %cause, "corrupt record; skipping the rest of the segment");
+        let (segment, seq) = (view.first_seq, self.next_seq);
+        match damage {
+            Damage::Corrupt(cause) if first => {
+                error!(segment, offset, error = %cause, "corrupt record; skipping the rest of the segment");
+            }
+            Damage::Corrupt(cause) => {
+                debug!(segment, offset, error = %cause, "corrupt record; skipping the rest of the segment");
+            }
+            Damage::Unreadable(e) if first => {
+                error!(segment, seq, error = %e, retried_s = self.retry_for.as_secs(),
+                    "segment unreadable; skipping the rest of it");
+            }
+            Damage::Unreadable(e) => {
+                debug!(segment, seq, error = %e, "segment unreadable; skipping the rest of it");
+            }
         }
-        self.skip_to(view.next_first_seq.unwrap_or(view.head_seq + 1), true)
+        if first {
+            self.storage.metrics.corrupt_segments.fetch_add(1, Relaxed);
+        }
+        let Some(next) = view.next_first_seq else {
+            // The active segment. The records written after the head will
+            // start at its committed length, where a reader that had read up
+            // to the head would stand. Waiting there, the reader never reads
+            // the damaged part again, which positioning in the segment would,
+            // and then skip what was written meanwhile.
+            let step = self.skip_to(view.head_seq + 1, true);
+            if let Ok(file) = File::open(self.storage.segment_path(segment)) {
+                self.current = Some(Open {
+                    first_seq: segment,
+                    cursor: SegmentCursor::new(file, view.bound),
+                });
+            }
+            return step;
+        };
+        self.skip_to(next, true)
     }
 
     /// Starts a read for a tail. Returns true, with no read to follow, if the
@@ -1687,33 +1783,38 @@ impl Reader {
         tail.claim(first);
     }
 
+    /// Where `next_seq` is in the index.
+    fn find(&self) -> Located {
+        let index = self.storage.index.lock().unwrap();
+        if self.next_seq > index.head_seq {
+            return Located::CaughtUp;
+        }
+        let Some((&first_seq, segment)) = index.segments.range(..=self.next_seq).next_back() else {
+            // Evicted; or the index is momentarily empty while the writer
+            // replaces a segment file.
+            return match index.segments.keys().next() {
+                Some(&first) => Located::Evicted(first),
+                None => Located::CaughtUp,
+            };
+        };
+        Located::At(View {
+            first_seq,
+            bound: segment.len,
+            next_first_seq: index
+                .segments
+                .range(first_seq + 1..)
+                .next()
+                .map(|(k, _)| *k),
+            head_seq: index.head_seq,
+            evicting: first_seq < index.evicting_below,
+        })
+    }
+
     /// Positions the cursor at `next_seq`.
     fn locate(&mut self) -> io::Result<Located> {
-        let view = {
-            let index = self.storage.index.lock().unwrap();
-            if self.next_seq > index.head_seq {
-                return Ok(Located::CaughtUp);
-            }
-            let Some((&first_seq, segment)) = index.segments.range(..=self.next_seq).next_back()
-            else {
-                // Evicted; or the index is momentarily empty while the
-                // writer replaces a segment file.
-                return Ok(match index.segments.keys().next() {
-                    Some(&first) => Located::Evicted(first),
-                    None => Located::CaughtUp,
-                });
-            };
-            View {
-                first_seq,
-                bound: segment.len,
-                next_first_seq: index
-                    .segments
-                    .range(first_seq + 1..)
-                    .next()
-                    .map(|(k, _)| *k),
-                head_seq: index.head_seq,
-                evicting: first_seq < index.evicting_below,
-            }
+        let view = match self.find() {
+            Located::At(view) => view,
+            other => return Ok(other),
         };
         if self.current.as_ref().map(|o| o.first_seq) != Some(view.first_seq) {
             let file = match File::open(self.storage.segment_path(view.first_seq)) {
@@ -1739,6 +1840,24 @@ impl Reader {
             });
         }
         Ok(Located::At(view))
+    }
+
+    /// Retries data that cannot be read back for `retry_for` instead.
+    #[cfg(test)]
+    pub(crate) fn retry_unreadable_for(&mut self, retry_for: Duration) {
+        self.retry_for = retry_for;
+    }
+}
+
+/// Whether `e` says that the data cannot be read back: an I/O error of the
+/// device, as from a worn sector, or a file system that found its own
+/// structures damaged.
+fn unreadable(e: &io::Error) -> bool {
+    match e.raw_os_error() {
+        Some(libc::EIO | libc::EBADMSG) => true,
+        #[cfg(target_os = "linux")]
+        Some(libc::EUCLEAN) => true,
+        _ => false,
     }
 }
 
@@ -2828,6 +2947,132 @@ mod tests {
         assert_eq!((got, skipped), ((1..=3000).collect(), 0));
         assert_eq!(lost.records(), 0);
         assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 0);
+    }
+
+    fn segment_starts(storage: &Storage) -> Vec<u64> {
+        storage
+            .index
+            .lock()
+            .unwrap()
+            .segments
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn data_that_cannot_be_read_back_is_retried_then_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        write_records(&mut writer, 150);
+        let firsts = segment_starts(&storage);
+        assert!(firsts.len() >= 3, "{firsts:?}");
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+        reader.retry_unreadable_for(Duration::from_millis(200));
+        let middle = (firsts[1] + firsts[2]) / 2;
+        reader.read((middle - 1) as usize, 1 << 30).unwrap();
+        assert_eq!(reader.next_seq(), middle);
+        // A read at the reader's position fails with `e`.
+        let fail = |reader: &mut Reader, e: i32| {
+            assert!(!reader.begin());
+            reader.settle(Err(io::Error::from_raw_os_error(e)))
+        };
+        let wait = || std::thread::sleep(Duration::from_millis(250));
+
+        // A read that works again ends the retries.
+        assert!(fail(&mut reader, libc::EIO).is_err());
+        wait();
+        assert_eq!(seqs(&reader.read(1, 1 << 30).unwrap()), [middle]);
+        assert!(fail(&mut reader, libc::EIO).is_err());
+        // Other errors can be fixed and are retried however long they last.
+        wait();
+        assert!(fail(&mut reader, libc::EACCES).is_err());
+        assert!(fail(&mut reader, libc::EMFILE).is_err());
+        assert_eq!(lost.records(), 0);
+        // Data that does not read back for that long is skipped with the
+        // rest of its segment, as corruption is.
+        let batch = fail(&mut reader, libc::EIO).unwrap();
+        assert_eq!(
+            (batch.records.len(), batch.skipped),
+            (0, firsts[2] - middle - 1)
+        );
+        assert_eq!(reader.next_seq(), firsts[2]);
+        assert_eq!(lost.records(), firsts[2] - middle - 1);
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
+        let (rest, skipped) = read_to_end(&mut reader);
+        assert_eq!((rest, skipped), ((firsts[2]..=150).collect(), 0));
+    }
+
+    /// On Linux a read of `/proc/self/mem` at a low offset fails with EIO,
+    /// as a worn sector does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_segment_that_does_not_read_back_is_skipped_once_retried_long_enough() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        write_records(&mut writer, 150);
+        let firsts = segment_starts(&storage);
+        let second = storage.segment_path(firsts[1]);
+        fs::remove_file(&second).unwrap();
+        std::os::unix::fs::symlink("/proc/self/mem", &second).unwrap();
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+        let retry_for = Duration::from_millis(300);
+        reader.retry_unreadable_for(retry_for);
+        let first = reader.read(1000, 1 << 30).unwrap();
+        assert_eq!(first.records.len() as u64, firsts[1] - 1);
+
+        let failing = Instant::now();
+        let batch = loop {
+            match reader.read(1000, 1 << 30) {
+                Ok(batch) => break batch,
+                Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO), "{e}"),
+            }
+            assert!(failing.elapsed() < Duration::from_secs(10), "never skipped");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(failing.elapsed() >= retry_for);
+        assert_eq!(
+            (batch.records.len(), batch.skipped),
+            (0, firsts[2] - firsts[1])
+        );
+        assert_eq!(lost.records(), firsts[2] - firsts[1]);
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
+        let (rest, skipped) = read_to_end(&mut reader);
+        assert_eq!((rest, skipped), ((firsts[2]..=150).collect(), 0));
+    }
+
+    #[test]
+    fn records_written_after_damage_in_the_active_segment_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, mut writer) = open(dir.path(), limits(1 << 20, 64 << 10));
+        for ts in 1..=10 {
+            writer.append(&[msg(ts, "abc")], true).unwrap();
+        }
+        // A damaged length in record 5: a reader stops there, and so does
+        // one that positions itself past it.
+        let path = storage.segment_path(1);
+        let mut bytes = fs::read(&path).unwrap();
+        let (seq, start, _) = frames(&bytes)[4];
+        assert_eq!(seq, 5);
+        bytes[start + 4..start + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let lost = Arc::new(Loss::default());
+        let tail = storage.tail("c", 1, lost.clone());
+        let mut reader = tail.reader(1);
+        assert_eq!(read_to_end(&mut reader), (vec![1, 2, 3, 4], 6));
+
+        // What is written after the damage, in the same segment, is read.
+        for ts in 11..=15 {
+            writer.append(&[msg(ts, "def")], true).unwrap();
+        }
+        assert_eq!(storage.status().segments, 1);
+        assert_eq!(read_to_end(&mut reader), ((11..=15).collect(), 0));
+        assert_eq!(lost.records(), 6);
+        assert_eq!(storage.metrics().corrupt_segments.load(Relaxed), 1);
     }
 
     #[test]

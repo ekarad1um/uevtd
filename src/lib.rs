@@ -16,6 +16,9 @@ pub mod tls;
 pub mod uds;
 pub mod view;
 
+#[cfg(test)]
+mod testing;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current wall-clock time in microseconds since the Unix epoch.

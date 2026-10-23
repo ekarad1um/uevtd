@@ -40,7 +40,11 @@ pub struct ChannelMetrics {
     pub delivered: AtomicU64,
     /// Microseconds from receipt to acknowledgement, summed over `delivered`.
     pub delivery_us: AtomicU64,
+    /// Records passed undelivered, as refused or too large; see
+    /// [`ChannelMetrics::rejected_passed`].
     pub rejected: AtomicU64,
+    /// Rejections below this sequence number are counted.
+    rejected_until: AtomicU64,
     pub retries: AtomicU64,
     /// Starts after the channel's task ended on its own.
     pub restarts: AtomicU64,
@@ -67,6 +71,7 @@ impl ChannelMetrics {
             delivered: AtomicU64::new(0),
             delivery_us: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            rejected_until: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
             lost: Arc::default(),
@@ -107,6 +112,16 @@ impl ChannelMetrics {
         }
     }
 
+    /// Counts a rejection once the cursor has passed record `seq`, and only
+    /// once. Until then a restarted channel sends the record again, and it
+    /// can be refused again, or accepted. The cursor passes records in order,
+    /// so what was counted is what lies below the highest one.
+    pub fn rejected_passed(&self, seq: u64) {
+        if self.rejected_until.fetch_max(seq + 1, Relaxed) <= seq {
+            self.rejected.fetch_add(1, Relaxed);
+        }
+    }
+
     /// Counts the delivery, completed at `now`, of a record received at `ts`.
     pub fn delivered_at(&self, ts: i64, now: i64) {
         self.delivered.fetch_add(1, Relaxed);
@@ -131,12 +146,15 @@ struct Running {
     failures: u32,
 }
 
-/// A channel whose task ended on its own, until it starts again.
+/// A channel waiting to start again: its task ended on its own, or its
+/// cursor could not be read.
 struct Waiting {
     config: Channel,
     failures: u32,
     best: u64,
     until: tokio::time::Instant,
+    /// A task ended, so the next start counts in `restarts`.
+    ended: bool,
 }
 
 /// Starts the task of a channel.
@@ -257,6 +275,7 @@ fn ended(name: &str, channel: Running, outcome: Result<(), JoinError>) -> Waitin
         failures,
         best: channel.best.max(cursor),
         until: tokio::time::Instant::now() + delay,
+        ended: true,
     }
 }
 
@@ -346,13 +365,37 @@ async fn reconcile(
         if running.contains_key(name) {
             continue;
         }
-        let (failures, best) = match waiting.get(name) {
+        let (failures, best, ended) = match waiting.get(name) {
             Some(w) if w.until > now => continue,
-            Some(w) => (w.failures, w.best),
-            None => (0, 0),
+            Some(w) => (w.failures, w.best, w.ended),
+            None => (0, 0, false),
         };
         waiting.remove(name);
-        let start_seq = initial_cursor(storage, name).await;
+        let start_seq = match initial_cursor(storage, name).await {
+            Ok(seq) => seq,
+            // The file is kept and read again after a backoff, as a task
+            // that ended is started again.
+            Err(e) => {
+                let failures = failures + 1;
+                let delay = backoff(failures - 1, RECONNECT_BASE, RECONNECT_MAX);
+                error!(channel = %name, error = %e, delay_s = delay.as_secs(),
+                    "cannot read the channel's cursor; starting it later");
+                metrics.last_error.set(format!("cursor: {e}"));
+                let until = tokio::time::Instant::now() + delay;
+                let config = channel.clone();
+                waiting.insert(
+                    name.clone(),
+                    Waiting {
+                        config,
+                        failures,
+                        best,
+                        until,
+                        ended,
+                    },
+                );
+                continue;
+            }
+        };
         let feed = Feed::new(storage, name, start_seq, metrics.clone());
         let cursor = CursorStore::new(storage.clone(), name.clone(), start_seq, metrics.clone());
         let token = CancellationToken::new();
@@ -365,7 +408,7 @@ async fn reconcile(
             token.clone(),
         );
         metrics.running.store(true, Relaxed);
-        if failures > 0 {
+        if ended {
             metrics.restarts.fetch_add(1, Relaxed);
         }
         info!(channel = %name, kind = channel.kind(), start_seq, "channel started");
@@ -416,36 +459,34 @@ async fn saved_cursor(storage: &Arc<Storage>, name: &str) -> Option<u64> {
 /// The persisted cursor, or the current head for a channel without one. A
 /// fresh start is persisted immediately so the backlog that accumulates before
 /// the first delivery survives a restart. A cursor past the head (the log was
-/// repaired by hand) is reset to the head, so new records are not skipped. An
-/// unreadable cursor restarts at the oldest retained record: the position is
-/// unknown, and at-least-once means replaying rather than skipping.
-async fn initial_cursor(storage: &Arc<Storage>, name: &str) -> u64 {
-    let fallback = storage.head_seq() + 1;
+/// repaired by hand) is reset to the head, so new records are not skipped. A
+/// cursor file that holds no cursor restarts at the oldest retained record:
+/// the position is unknown, and at-least-once means replaying rather than
+/// skipping. A file that cannot be read is an error, and stays as it is.
+async fn initial_cursor(storage: &Arc<Storage>, name: &str) -> io::Result<u64> {
     let (storage, name) = (storage.clone(), name.to_string());
     let task = tokio::task::spawn_blocking(move || {
         let status = storage.status();
         let head = status.head_seq;
         let start = match storage.load_cursor(&name) {
-            Ok(Some(seq)) if seq <= head + 1 => return seq,
+            Ok(Some(seq)) if seq <= head + 1 => return Ok(seq),
             Ok(Some(seq)) => {
                 warn!(channel = %name, cursor = seq, head, "cursor is past the head; starting at head");
                 head + 1
             }
             Ok(None) => head + 1,
-            Err(e) => {
-                warn!(channel = %name, error = %e, start_seq = status.first_seq, "unreadable cursor; replaying from the oldest retained record");
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                warn!(channel = %name, error = %e, start_seq = status.first_seq, "unparsable cursor; replaying from the oldest retained record");
                 status.first_seq
             }
+            Err(e) => return Err(e),
         };
         if let Err(e) = storage.save_cursor(&name, start) {
             warn!(channel = %name, error = %e, "could not persist initial cursor");
         }
-        start
+        Ok(start)
     });
-    task.await.unwrap_or_else(|e| {
-        error!(error = %e, "cursor task failed");
-        fallback
-    })
+    task.await.unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
 /// Exponential backoff: `base * 2^attempt`, capped.
@@ -487,8 +528,8 @@ pub struct Feed {
     next_seq: u64,
     pending: Option<JoinHandle<(Reader, io::Result<Batch>)>>,
     metrics: Arc<ChannelMetrics>,
-    /// The last read failed and `last_error` holds its message.
-    read_failed: bool,
+    /// The error of the last read, if it failed; `last_error` holds it too.
+    read_error: Option<String>,
 }
 
 impl Feed {
@@ -501,7 +542,7 @@ impl Feed {
             next_seq: start,
             pending: None,
             metrics,
-            read_failed: false,
+            read_error: None,
         }
     }
 
@@ -519,8 +560,7 @@ impl Feed {
                         self.reader = Some(reader);
                         match result {
                             Ok(batch) => {
-                                if self.read_failed {
-                                    self.read_failed = false;
+                                if self.read_error.take().is_some() {
                                     self.metrics
                                         .last_error
                                         .clear_if(|m| m.starts_with("log read: "));
@@ -536,9 +576,17 @@ impl Feed {
                                 }
                             }
                             Err(e) => {
-                                warn!(error = %e, "log read failed; retrying");
-                                self.metrics.last_error.set(format!("log read: {e}"));
-                                self.read_failed = true;
+                                // Logged when it starts or changes, not at
+                                // every retry: data that cannot be read back
+                                // is retried for ten minutes.
+                                let message = format!("log read: {e}");
+                                if self.read_error.as_ref() != Some(&message) {
+                                    warn!(error = %e, "log read failed; retrying every second");
+                                } else {
+                                    debug!(error = %e, "log read failed again");
+                                }
+                                self.metrics.last_error.set(&message);
+                                self.read_error = Some(message);
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                             }
                         }
@@ -641,15 +689,15 @@ mod tests {
             sync_interval: Duration::ZERO,
         };
         let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
-        assert_eq!(initial_cursor(&storage, "fresh").await, 1);
+        assert_eq!(initial_cursor(&storage, "fresh").await.unwrap(), 1);
         assert_eq!(storage.load_cursor("fresh").unwrap(), Some(1));
         storage.save_cursor("ahead", 50).unwrap();
-        assert_eq!(initial_cursor(&storage, "ahead").await, 1);
+        assert_eq!(initial_cursor(&storage, "ahead").await.unwrap(), 1);
         assert_eq!(storage.load_cursor("ahead").unwrap(), Some(1));
     }
 
     #[tokio::test]
-    async fn unreadable_cursor_replays_from_the_oldest_retained_record() {
+    async fn an_unparsable_cursor_replays_from_the_oldest_retained_record() {
         let dir = tempfile::tempdir().unwrap();
         let limits = Limits {
             max_bytes: 1 << 20,
@@ -669,9 +717,95 @@ mod tests {
                 )
                 .unwrap();
         }
-        std::fs::write(dir.path().join("cursors").join("bad"), b"garbage\n").unwrap();
-        assert_eq!(initial_cursor(&storage, "bad").await, 1);
+        let cursors = dir.path().join("cursors");
+        std::fs::write(cursors.join("bad"), b"garbage\n").unwrap();
+        assert_eq!(initial_cursor(&storage, "bad").await.unwrap(), 1);
         assert_eq!(storage.load_cursor("bad").unwrap(), Some(1));
+        std::fs::write(cursors.join("binary"), b"\xff\xfe\n").unwrap();
+        assert_eq!(initial_cursor(&storage, "binary").await.unwrap(), 1);
+    }
+
+    /// Where `starts_at_its_cursor` started the channel; 0 before.
+    static STARTED_AT: AtomicU64 = AtomicU64::new(0);
+
+    fn starts_at_its_cursor(
+        _: &str,
+        _: Channel,
+        feed: Feed,
+        cursor: CursorStore,
+        _: Arc<ChannelMetrics>,
+        token: CancellationToken,
+    ) -> JoinHandle<()> {
+        STARTED_AT.store(cursor.current(), Relaxed);
+        tokio::spawn(async move {
+            let _feed = feed;
+            token.cancelled().await;
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cursor_that_cannot_be_read_is_kept_and_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            segment_bytes: 64 << 10,
+            sync_interval: Duration::ZERO,
+        };
+        let storage = Arc::new(Storage::open(dir.path(), limits).unwrap());
+        let mut writer = crate::storage::Writer::new(storage.clone());
+        for ts in 1..=5 {
+            let message = crate::storage::Message {
+                ts,
+                payload: b"x".to_vec(),
+            };
+            writer.append(&[message], true).unwrap();
+        }
+        // A link to itself in place of the cursor file: reading it fails, as
+        // an I/O error would, whoever runs the test.
+        let file = dir.path().join("cursors").join("w");
+        std::os::unix::fs::symlink("w", &file).unwrap();
+        let mut config = Config::default();
+        let channel = Channel::WebSocket(crate::config::WebSocket::default());
+        config.outbound.channels.insert("w".into(), channel);
+        let (_cfg, rx) = watch::channel(Arc::new(config));
+        let registry = Arc::new(Registry::default());
+        let shutdown = CancellationToken::new();
+        let supervisor = tokio::spawn(supervise(
+            rx,
+            storage,
+            registry.clone(),
+            shutdown.clone(),
+            starts_at_its_cursor,
+        ));
+        async fn until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        until("registered", || registry.lock().unwrap().contains_key("w")).await;
+        let metrics = registry.lock().unwrap()["w"].clone();
+        let error = || metrics.last_error.get().map(|e| e.message);
+
+        // The channel does not start, rather than replay the log, and the
+        // file is left alone.
+        until("error", || {
+            error().is_some_and(|m| m.starts_with("cursor: "))
+        })
+        .await;
+        assert_eq!(STARTED_AT.load(Relaxed), 0);
+        assert!(!metrics.running.load(Relaxed));
+        assert!(file.symlink_metadata().unwrap().is_symlink());
+        // Once the file reads, the channel starts where it says.
+        let fixed = dir.path().join("fixed");
+        std::fs::write(&fixed, b"4\n").unwrap();
+        std::fs::rename(&fixed, &file).unwrap();
+        until("started", || STARTED_AT.load(Relaxed) == 4).await;
+        until("running", || metrics.running.load(Relaxed)).await;
+        assert_eq!(metrics.restarts.load(Relaxed), 0);
+        shutdown.cancel();
+        supervisor.await.unwrap();
     }
 
     #[tokio::test]
