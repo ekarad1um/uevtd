@@ -1,5 +1,5 @@
 //! Drop notices: what a channel sends in place of records it will never
-//! deliver, so that the receiver learns of the gap (ARCHITECTURE.md §6.1).
+//! deliver, so that the receiver learns of the gap.
 
 use serde::Serialize;
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Message forwarding daemon: Unix socket in, durable log, WebSocket/MQTT out"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

@@ -1,5 +1,5 @@
 //! Bounded append-only log: segment index, group-commit writer, tailing
-//! readers, time-range queries and channel cursors (ARCHITECTURE.md §5).
+//! readers, time-range queries and channel cursors.
 //!
 //! Concurrency model: one writer (a dedicated thread) mutates files and the
 //! index; readers hold their own file handles and only read below the
@@ -58,7 +58,7 @@ const LOSS_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// A write or sync that takes longer makes the log unhealthy.
 pub const STALLED: Duration = Duration::from_secs(30);
 /// How long a reader retries a position whose data cannot be read back, as
-/// from a worn sector, before it skips the rest of the segment (§5.7).
+/// from a worn sector, before it skips the rest of the segment.
 const UNREADABLE_RETRY: Duration = Duration::from_secs(600);
 
 /// A message as handed to the writer: receipt time and verbatim payload.
@@ -162,12 +162,12 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Opens or creates the log (§5.6), after taking its lock. The active
-    /// segment is validated and synced before its records become visible: a
-    /// torn tail is cut off, and after damage of any other kind, a read error
-    /// included, the log continues in a new segment past every sequence
-    /// number the damaged part could hold. Numbering also continues past the
-    /// highest channel cursor.
+    /// Opens or creates the log, after taking its lock. The active segment is
+    /// validated and synced before its records become visible: a torn tail is
+    /// cut off, and after damage of any other kind, a read error included, the
+    /// log continues in a new segment past every sequence number the damaged
+    /// part could hold. Numbering also continues past the highest channel
+    /// cursor.
     pub fn open(dir: &Path, limits: Limits) -> io::Result<Storage> {
         let mut builder = DirBuilder::new();
         builder.recursive(true).mode(DIR_MODE);
@@ -215,7 +215,7 @@ impl Storage {
         // Sealed segments are trusted structurally, and only their headers
         // are read now; every record is verified when it is read. A segment
         // that cannot be opened is left to the readers, which retry it and
-        // report the error (§5.7).
+        // report the error.
         for first_seq in names {
             let path = dir.join(segment::file_name(first_seq));
             let (file_len, unknown) = match fs::metadata(&path) {
@@ -693,10 +693,10 @@ impl Loss {
 }
 
 /// A channel's position in the log, kept for loss accounting: records that
-/// leave the log before the channel has read them are counted in its
-/// [`Loss`] and logged as soon as that happens, whether or not the channel is
-/// reading, and only once (ARCHITECTURE.md §5.9). Readers made from it move
-/// the position as they read; dropping it ends the accounting.
+/// leave the log before the channel has read them are counted in its [`Loss`]
+/// and logged as soon as that happens, whether or not the channel is reading,
+/// and only once. Readers made from it move the position as they read; dropping
+/// it ends the accounting.
 pub struct Tail {
     storage: Arc<Storage>,
     id: u64,
@@ -1564,7 +1564,7 @@ impl Reader {
     /// otherwise the records are returned and the error surfaces on the next
     /// call, which starts at the failing position with nothing to lose. An
     /// error that says the data cannot be read back, at the same position
-    /// for [`UNREADABLE_RETRY`], skips the rest of the segment instead, as
+    /// for `UNREADABLE_RETRY`, skips the rest of the segment instead, as
     /// corruption does.
     pub fn read(&mut self, max_records: usize, max_bytes: usize) -> io::Result<Batch> {
         let start = self.next_seq;

@@ -1,7 +1,7 @@
 //! MQTT channel: pipelined publishes with packet-id tracking so the cursor
 //! only advances on acknowledgement, daemon-managed reconnection that
 //! republishes unacknowledged messages in order, and drop notices in place of
-//! records that are skipped (ARCHITECTURE.md §6.3).
+//! records that are skipped.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

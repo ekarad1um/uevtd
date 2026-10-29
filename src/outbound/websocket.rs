@@ -1,7 +1,6 @@
 //! WebSocket channel: records stream as text frames to a receiver that
 //! acknowledges them by sequence number. The cursor follows the answered
-//! prefix, and unanswered frames are sent again after a reconnect
-//! (ARCHITECTURE.md §6.2).
+//! prefix, and unanswered frames are sent again after a reconnect.
 
 use std::collections::VecDeque;
 use std::io;

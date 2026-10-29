@@ -1,5 +1,5 @@
-//! On-disk encoding of segments and records (ARCHITECTURE.md §5.2), plus a
-//! positioned decoder used by readers and recovery.
+//! On-disk encoding of segments and records, plus a positioned decoder used by
+//! readers and recovery.
 //!
 //! Segment header (24 bytes): magic, version, first_seq, base_ts.
 //! Record frame: crc32 | len | seq | ts | payload, with the CRC covering

@@ -1,5 +1,5 @@
 //! Outbound: a supervisor that keeps one task per enabled channel, each an
-//! independent reader of the log with a durable cursor (ARCHITECTURE.md §6).
+//! independent reader of the log with a durable cursor.
 
 pub mod mqtt;
 pub mod notice;
@@ -191,7 +191,7 @@ fn spawn_channel(
 
 /// Keeps one task per enabled channel, started and stopped as the
 /// configuration changes. A task that ends on its own, which only a panic
-/// should cause, is started again after a backoff (§6.4).
+/// should cause, is started again after a backoff.
 async fn supervise(
     mut cfg: watch::Receiver<Arc<Config>>,
     storage: Arc<Storage>,
@@ -246,8 +246,8 @@ async fn exited(running: &mut BTreeMap<String, Running>) -> (String, Result<(), 
 
 /// Reports a task that ended on its own, and schedules the next start: 1 s
 /// later, doubling to 60 s while the channel ends again without progress, as
-/// reconnects do (§6.1). A record that makes the channel panic is retried
-/// once a minute, not in a loop.
+/// reconnects do. A record that makes the channel panic is retried once a
+/// minute, not in a loop.
 fn ended(name: &str, channel: Running, outcome: Result<(), JoinError>) -> Waiting {
     let how = match outcome {
         Ok(()) => "ended on its own".to_string(),

@@ -1,6 +1,6 @@
 //! Inbound: newline-delimited messages read from the producer's Unix domain
-//! socket, which inbound connects to (ARCHITECTURE.md §4). Framing is a
-//! sans-IO state machine so its edge cases are unit-testable.
+//! socket, which inbound connects to. Framing is a sans-IO state machine so its
+//! edge cases are unit-testable.
 
 use std::fs;
 use std::io;

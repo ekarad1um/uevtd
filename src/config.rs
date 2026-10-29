@@ -183,7 +183,7 @@ impl Default for Mqtt {
 
 impl Mqtt {
     /// The client id the channel `name` connects with: the configured one
-    /// as given, or else the host name (ARCHITECTURE.md §6.3).
+    /// as given, or else the host name.
     pub fn client_id(&self, name: &str) -> String {
         self.client_id_on(host_name().as_deref(), name)
     }
@@ -315,7 +315,7 @@ impl Config {
             "inbound.path and api.path must differ".into()
         })?;
         // Every buffer that holds messages is sized from this one, so its
-        // bound is what keeps memory bounded (ARCHITECTURE.md §11.1).
+        // bound is what keeps memory bounded.
         ensure((1..=256 << 10).contains(&inbound.max_message_bytes), || {
             "inbound.max_message_bytes must be between 1 and 262144".into()
         })?;
@@ -657,7 +657,7 @@ fn check_client_ids(
 /// For every channel that shares its client id with another, the message
 /// that names the two. Validation refuses a change that makes two channels
 /// share one, but a configuration loaded at startup may, as can one saved
-/// before the host was renamed (§6.3).
+/// before the host was renamed.
 pub fn client_id_conflicts(channels: &BTreeMap<String, Channel>) -> BTreeMap<String, String> {
     let mut by_channel = BTreeMap::new();
     for Conflict { channels, message } in conflicts(channels, host_name().as_deref()) {
@@ -761,7 +761,7 @@ fn parse(text: &str) -> Result<Config, Error> {
 }
 
 /// Reads a configuration document, which must have the shape of one
-/// ([`check_shape`]). It is not validated.
+/// (`check_shape`). It is not validated.
 pub fn read(text: &[u8]) -> Result<Config, Error> {
     check_shape(&serde_json::from_slice(text)?)?;
     Ok(serde_json::from_slice(text)?)

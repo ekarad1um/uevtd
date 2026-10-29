@@ -1,5 +1,5 @@
 //! HTTP API over a Unix domain socket: configuration, time-range queries,
-//! status, metrics and health (ARCHITECTURE.md §8).
+//! status, metrics and health.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
@@ -47,7 +47,7 @@ const BODY_BYTES: usize = 256 << 10;
 pub const CONCURRENT_QUERIES: usize = 1;
 /// How often [`Times`] is brought up to date.
 const TIMES_INTERVAL: Duration = Duration::from_secs(1);
-/// How the API serves its connections (§8).
+/// How the API serves its connections.
 const SERVE: Serve = Serve {
     connections: 16,
     idle: Duration::from_secs(10),

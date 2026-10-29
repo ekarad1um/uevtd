@@ -103,7 +103,7 @@ fn main() -> ExitCode {
 /// after every large free and gives each thread its own heap, so a burst of
 /// large messages would leave the process far above what it uses. A fixed
 /// threshold hands large buffers back to the system when they are freed, and
-/// two arenas bound the rest (ARCHITECTURE.md §11.1).
+/// two arenas bound the rest.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn tune_allocator() {
     // SAFETY: mallopt only changes allocator parameters, and no other thread
@@ -120,7 +120,7 @@ fn tune_allocator() {}
 /// Raises the soft limit on open files to the hard one. The daemon's own
 /// limits keep it well below the usual 1024; this is the margin for what
 /// they miss, since the log writer and inbound's connection are what fail
-/// when the descriptors run out (ARCHITECTURE.md §11).
+/// when the descriptors run out.
 fn raise_file_limit() {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
