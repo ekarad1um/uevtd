@@ -731,12 +731,13 @@ pub fn load(path: &Path) -> Result<Config, Error> {
 
 /// Like [`load`], but when nothing at all is at the path, the defaults are
 /// used and written there, so the effective configuration is visible on
-/// disk. Any other failure to read the file is an error, never a reason to
-/// overwrite it. That includes a link to a file that does not exist: its
-/// target may only be missing for now, as on a partition not mounted yet.
-pub fn load_or_init(path: &Path) -> Result<Config, Error> {
+/// disk; true says so, for the caller to log once logging is up. Any other
+/// failure to read the file is an error, never a reason to overwrite it.
+/// That includes a link to a file that does not exist: its target may only
+/// be missing for now, as on a partition not mounted yet.
+pub fn load_or_init(path: &Path) -> Result<(Config, bool), Error> {
     match fs::read_to_string(path) {
-        Ok(text) => parse(&text),
+        Ok(text) => Ok((parse(&text)?, false)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if let Ok(target) = fs::read_link(path) {
                 return Err(Error::Io(io::Error::new(
@@ -747,8 +748,7 @@ pub fn load_or_init(path: &Path) -> Result<Config, Error> {
             let config = Config::default();
             config.validate()?;
             save(path, &config)?;
-            info!(path = %path.display(), "configuration file not found; wrote defaults");
-            Ok(config)
+            Ok((config, true))
         }
         Err(e) => Err(e.into()),
     }
@@ -1371,7 +1371,9 @@ mod tests {
         // and the link stays.
         fs::create_dir(target.parent().unwrap()).unwrap();
         save(&target, &Config::default()).unwrap();
-        let store = Store::new(link.clone(), load_or_init(&link).unwrap());
+        let (config, written) = load_or_init(&link).unwrap();
+        assert!(!written, "the file was read, not written");
+        let store = Store::new(link.clone(), config);
         store
             .patch(&serde_json::json!({"storage": {"sync_interval_ms": 7}}))
             .unwrap();
@@ -1479,7 +1481,8 @@ mod tests {
     fn unchanged_configuration_is_republished() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let config = load_or_init(&path).unwrap();
+        let (config, written) = load_or_init(&path).unwrap();
+        assert!(written, "nothing was at the path");
         let store = Store::new(path, config.clone());
         let mut rx = store.subscribe();
         rx.borrow_and_update();
@@ -1504,7 +1507,7 @@ mod tests {
     fn store_persists_and_publishes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let store = Store::new(path.clone(), load_or_init(&path).unwrap());
+        let store = Store::new(path.clone(), load_or_init(&path).unwrap().0);
         let mut rx = store.subscribe();
         let mut next = Config::default();
         next.outbound

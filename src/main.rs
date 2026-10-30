@@ -41,8 +41,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let config = match config::load_or_init(&config_path) {
-        Ok(config) => config,
+    let (config, wrote_defaults) = match config::load_or_init(&config_path) {
+        Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("uevtd: {}: {e}", config_path.display());
             return ExitCode::FAILURE;
@@ -55,6 +55,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Only now: until here nothing takes a log line.
+    if wrote_defaults {
+        info!(path = %config_path.display(), "configuration file not found; wrote defaults");
+    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         error!(%info, "panic");
